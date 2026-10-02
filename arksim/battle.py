@@ -278,6 +278,7 @@ class _Enemy:
     block_shift_elapsed: float = 0.0
     block_shift_remaining: float = 0.0
     pause_until: float = -1.0
+    attack_move_resume_frame: int | None = None
     attack_target: "_Operator | None" = None
     target_search_ticker: FramePeriodicTicker = field(
         default_factory=lambda: FramePeriodicTicker(
@@ -1982,6 +1983,10 @@ class Battle:
             self._release_enemy_block(enemy)
         if spawn_move_locked:
             return
+        if enemy.attack_move_resume_frame is not None:
+            if self.frame_index < enemy.attack_move_resume_frame:
+                return
+            enemy.attack_move_resume_frame = None
         if enemy.pause_until > self.time:
             return
         if not enemy.statuses.can_move:
@@ -3937,6 +3942,24 @@ class Battle:
             + _fixed_delay_frames(hit_delay, self.dt)
         )
         enemy.pause_until = self.time + enemy.attack_duration
+        enemy.attack_move_resume_frame = None
+        if (
+            enemy.apply_way == ApplyWay.RANGED.value
+            and enemy.attack_duration > 0.0
+        ):
+            # Model Attack completion -> Move entry -> first displacement.
+            # Integer deadlines avoid absolute-time drift around whole frames.
+            # The transition offset is a replaceable normal-ranged model;
+            # special actions and interrupted attacks need separate validation.
+            transition_frames = max(
+                0, int(self.assumptions.ranged_attack_move_transition_frames)
+            )
+            enemy.attack_move_resume_frame = (
+                self.frame_index
+                + _fixed_delay_frames(enemy.attack_duration, self.dt)
+                + transition_frames
+            )
+            self.used_assumptions.add("RANGED_ATTACK_MOVE_TRANSITION")
 
     def _effective_attack_interval(
         self, unit: _Enemy | _Operator | None = None

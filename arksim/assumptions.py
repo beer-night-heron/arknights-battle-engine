@@ -27,6 +27,7 @@ class SimulationAssumptions:
     operator_block_scan_from_deploy_frame: bool = True
     mortar_first_attack_extra_frames: int = 2
     retime_enemy_attack_cooldown: bool = True
+    ranged_attack_move_transition_frames: int = 2
     # Highland echo is committed after the current frame's movement.  When
     # the receiving frame has already consumed its movement, two extra
     # logical frames cover the native one-frame extension plus that phase
@@ -58,6 +59,7 @@ ASSUMPTION_NOTES = {
     "OPERATOR_SELECTOR_PRE_MOVEMENT_SEARCH": "可选分组模式在全部敌人移动前搜索；默认创建序模式中，查询可见位置取决于双方更新顺序。",
     "MORTAR_FIRST_ATTACK_EXTRA_FRAMES": "部分炮兵首轮攻击后的冷却比后续节奏额外跨2个逻辑帧；适用范围有限，不是通用敌人规则。",
     "ENEMY_ATTACK_COOLDOWN_RETIME": "有效攻击间隔变化时，活动冷却按新旧间隔比例缩放；不同敌人或效果的适用性仍需完善。",
+    "RANGED_ATTACK_MOVE_TRANSITION": "普通远程敌人的攻击动画时长转换为整数逻辑帧，随后跨2帧状态衔接才恢复自主位移；多单位观察支持该候选模型，特殊动作、打断和不同攻速仍待验证。",
     "HEADB2_ECHO_TARGET_AT_EXECUTION": "高台回响保存触发格，0.1秒后按执行帧的敌人当前位置查询影响格并结算；不预缓存受击目标。",
     "SLUGGISH_DURATION_EXTRA_FRAME": "移动后提交的高台停顿若未在接收帧消费，时长补入2个逻辑帧以表达当前状态阶段模型；不可直接推广到其他控制效果。",
     "PORTAL_WAIT_EXTRA_FRAMES": "传送门隐藏等待使用严格浮点计时；出口追加1帧可受击停顿，归零帧消费后恢复移动；其他传送动作仍待完善。",
