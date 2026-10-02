@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ARKSIM / 战术回放</title>
+  <style>
+    :root {
+      --ink: #d8e0dd;
+      --muted: #83908c;
+      --panel: #101715;
+      --panel-2: #141d1a;
+      --line: #2b3733;
+      --black: #080c0b;
+      --amber: #f4b942;
+      --amber-dim: #7f6127;
+      --cyan: #54d9d1;
+      --red: #ff665e;
+      --green: #8ecb64;
+      --cell: 52px;
+    }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; }
+    body {
+      margin: 0;
+      overflow: hidden;
+      color: var(--ink);
+      background: var(--black);
+      font-family: "Bahnschrift", "Microsoft YaHei UI", sans-serif;
+      letter-spacing: .02em;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: .16;
+      background-image:
+        repeating-linear-gradient(0deg, transparent 0 3px, #cad6d105 3px 4px),
+        radial-gradient(circle at 18% 0%, #f4b94216, transparent 32%);
+      mix-blend-mode: screen;
+    }
+    button, select, input { font: inherit; }
+    button, select {
+      color: var(--ink);
+      border: 1px solid var(--line);
+      background: #18211e;
+      min-height: 34px;
+    }
+    button { cursor: pointer; padding: 0 12px; }
+    button:hover, button.active { border-color: var(--amber); color: var(--amber); }
+    .exit-file-button { align-self: center; margin: 0 18px 0 10px; border-color: var(--amber-dim); }
+    .data-loader {
+      position: fixed;
+      inset: 0;
+      z-index: 10;
+      display: grid;
+      place-items: center;
+      background: #080c0be8;
+    }
+    .data-loader[hidden] { display: none; }
+    .data-loader-panel {
+      width: min(440px, calc(100vw - 40px));
+      padding: 28px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+    .data-loader-panel h2 { margin: 0 0 12px; }
+    .data-loader-panel p { color: var(--muted); line-height: 1.6; }
+    .data-loader-panel input { max-width: 100%; }
+    .data-loader-error { color: var(--red) !important; }
+    select { padding: 0 34px 0 10px; }
+    .app {
+      position: fixed;
+      inset: 0;
+      width: auto;
+      height: auto;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+      display: grid;
+      grid-template-rows: 62px minmax(0, 1fr) 94px;
+    }
+    header {
+      min-width: 0;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: stretch;
+      background: #0d1311ee;
+      z-index: 2;
+    }
+    .brand {
+      width: 280px;
+      display: flex;
+      align-items: center;
+      gap: 13px;
+      padding: 0 20px;
+      border-right: 1px solid var(--line);
+    }
+    .brand-mark {
+      width: 31px;
+      height: 31px;
+      border: 2px solid var(--amber);
+      transform: rotate(45deg);
+      position: relative;
+    }
+    .brand-mark::after {
+      content: "";
+      position: absolute;
+      inset: 6px;
+      border: 1px solid var(--cyan);
+    }
+    .brand strong { display: block; font-size: 17px; letter-spacing: .18em; }
+    .brand small { color: var(--muted); font-family: Consolas, monospace; }
+    .header-stat {
+      min-width: 116px;
+      padding: 10px 16px 7px;
+      border-right: 1px solid var(--line);
+    }
+    .header-stat span { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .16em; }
+    .header-stat b { display: block; margin-top: 3px; font: 20px/1 Consolas, monospace; color: var(--amber); }
+    .case-control { margin-left: auto; display: flex; align-items: center; gap: 10px; padding: 0 18px; }
+    .case-control label { color: var(--muted); font-size: 11px; letter-spacing: .13em; }
+    main {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 250px minmax(0, 1fr) 320px;
+    }
+    .stage {
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      border-right: 1px solid var(--line);
+      position: relative;
+    }
+    .map-wrap {
+      min-height: 0;
+      position: relative;
+      background-color: #0b100e;
+      background-image:
+        linear-gradient(#18211e55 1px, transparent 1px),
+        linear-gradient(90deg, #18211e55 1px, transparent 1px);
+      background-size: 24px 24px;
+    }
+    #map { display: block; width: 100%; height: 100%; cursor: crosshair; }
+    .map-legend {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--line);
+      background: #0d1311;
+    }
+    .chip {
+      padding: 4px 7px;
+      border: 1px solid #ffffff18;
+      background: #090d0cce;
+      color: var(--muted);
+      font-size: 10px;
+      font-family: Consolas, monospace;
+    }
+    .chip i { display: inline-block; width: 8px; height: 8px; margin-right: 6px; background: var(--dot); }
+    .chip .circle { border-radius: 50%; }
+    .chip .diamond { transform: rotate(45deg); }
+    .chip .portal { border: 2px solid var(--dot); border-radius: 50%; background: transparent; }
+    .map-note {
+      margin: 12px 0 0;
+      color: var(--muted);
+      font-size: 10px;
+      line-height: 1.55;
+    }
+    .inspector {
+      min-height: 0;
+      overflow: auto;
+      border-right: 1px solid var(--line);
+      background: var(--panel);
+    }
+    .entity-card { padding: 20px 18px; }
+    .eyebrow { color: var(--amber); font: 10px Consolas, monospace; letter-spacing: .16em; }
+    .entity-card h2 { margin: 8px 0 0; font-size: 17px; font-weight: 600; overflow-wrap: anywhere; }
+    .entity-grid { display: grid; gap: 12px; margin-top: 22px; font: 11px Consolas, monospace; color: var(--muted); }
+    .entity-field { display: flex; justify-content: space-between; flex-wrap: wrap; align-items: baseline; gap: 3px 8px; min-width: 0; }
+    .entity-grid b { color: var(--ink); font-weight: 400; overflow-wrap: anywhere; }
+    .sp-panel { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--line); }
+    .sp-label { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--muted); }
+    .sp-label b { color: var(--cyan); font: 11px Consolas, monospace; }
+    .sp-track { height: 7px; margin: 8px 0 14px; background: #28332e; overflow: hidden; }
+    .sp-fill { height: 100%; background: var(--cyan); }
+    .sp-track.slot .sp-fill { background: var(--amber); }
+    .sp-help { color: var(--muted); font-size: 10px; line-height: 1.6; }
+    .reserve { min-height: 108px; padding: 12px 16px; border-top: 1px solid var(--line); background: var(--panel); }
+    .reserve-head { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; font-size: 11px; }
+    .reserve-head span { color: var(--muted); font-size: 10px; }
+    .reserve-cards { display: flex; gap: 8px; overflow-x: auto; margin-top: 10px; padding-bottom: 2px; }
+    .reserve-card { flex: 0 0 132px; min-height: 60px; padding: 9px 10px; text-align: left; }
+    .reserve-card strong { display: block; font-size: 12px; }
+    .reserve-card small { display: block; margin-top: 7px; color: var(--muted); font-size: 10px; }
+    .reserve-empty { margin: 8px 0; color: var(--muted); font-size: 11px; }
+    aside {
+      min-height: 0;
+      overflow: hidden;
+      display: grid;
+      grid-template-rows: auto auto minmax(0, 1fr);
+      background: var(--panel-2);
+    }
+    .aside-head { padding: 16px 16px 12px; border-bottom: 1px solid var(--line); }
+    .aside-head h2 { margin: 0 0 3px; font-size: 15px; letter-spacing: .1em; }
+    .aside-head p { margin: 0; color: var(--muted); font-size: 11px; }
+    .filters { display: flex; flex-wrap: wrap; gap: 5px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+    .filters button { min-height: 27px; padding: 0 8px; font-size: 10px; }
+    .events { overflow: auto; scrollbar-color: var(--amber-dim) #0d1311; }
+    .event {
+      display: grid;
+      grid-template-columns: 56px 9px 1fr;
+      gap: 8px;
+      align-items: start;
+      padding: 8px 12px;
+      border-bottom: 1px solid #ffffff0a;
+      cursor: pointer;
+      font-size: 11px;
+    }
+    .event:hover, .event.now { background: #f4b9420b; }
+    .event time { color: var(--muted); font-family: Consolas, monospace; }
+    .event .dot { width: 7px; height: 7px; margin-top: 3px; border: 1px solid currentColor; transform: rotate(45deg); }
+    .event strong { display: block; font-weight: 500; color: var(--ink); }
+    .event small { display: block; color: var(--muted); margin-top: 2px; font-family: Consolas, monospace; }
+    footer {
+      min-width: 0;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 360px minmax(0, 1fr) minmax(300px, 360px);
+      border-top: 1px solid var(--line);
+      background: #0d1311;
+    }
+    .transport { min-width: 0; display: flex; align-items: center; gap: 6px; padding: 0 14px; border-right: 1px solid var(--line); }
+    .transport button { width: 38px; padding: 0; font-family: Consolas, monospace; }
+    .speed { flex: 1 1 148px; width: auto; min-width: 132px; }
+    .timeline { min-width: 0; padding: 12px 18px; display: grid; grid-template-rows: 24px 1fr; }
+    .timeline-top { display: flex; justify-content: space-between; font: 11px Consolas, monospace; color: var(--muted); }
+    .timeline-top b { color: var(--ink); }
+    .track { position: relative; display: flex; align-items: center; }
+    #markers { position: absolute; inset: 5px 0 auto; width: 100%; height: 15px; pointer-events: none; }
+    #timeline { width: 100%; accent-color: var(--amber); position: relative; z-index: 2; }
+    .toggles { min-width: 0; display: flex; align-items: center; gap: 8px; padding: 0 14px; border-left: 1px solid var(--line); }
+    .toggles button { flex: 1; font-size: 10px; }
+    @media (max-width: 1050px) {
+      .entity-card { padding: 16px 14px; }
+      main { grid-template-columns: 210px minmax(0, 1fr) 250px; }
+      footer { grid-template-columns: 330px minmax(180px, 1fr) 300px; }
+      .brand { width: 210px; padding-inline: 14px; }
+      .header-stat { min-width: 96px; padding-inline: 10px; }
+      .header-stat b { font-size: 17px; }
+      .case-control { padding-inline: 8px; }
+      .case-control label { display: none; }
+      header > .header-stat:nth-of-type(4) { display: none; }
+      .transport { padding-inline: 10px; gap: 4px; }
+      .speed { min-width: 118px; font-size: 10px; }
+      .toggles { gap: 4px; padding-inline: 9px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div class="brand"><div class="brand-mark"></div><div><strong>ARKSIM</strong><small id="stageLabel">TACTICAL REPLAY</small></div></div>
+      <div class="header-stat"><span>战斗时刻</span><b id="clock">000.000</b></div>
+      <div class="header-stat"><span>生命 / 费用</span><b><i id="life">—</i> / <i id="dp">—</i></b></div>
+      <div class="header-stat"><span>击杀 / 生成</span><b><i id="killed">0</i> / <i id="spawned">0</i></b></div>
+      <div class="case-control"><label for="caseSelect">模拟方案</label><select id="caseSelect"></select></div>
+      <button id="closeDataBtn" class="exit-file-button" type="button" hidden>退出当前文件</button>
+    </header>
+
+    <main>
+      <section class="inspector" aria-label="选中单位状态">
+        <div class="entity-card">
+          <div class="eyebrow">SELECTED ENTITY / 单位状态</div>
+          <h2 id="entityName">未选择实体</h2>
+          <div class="entity-grid" id="entityGrid"></div>
+          <div id="spPanel"></div>
+          <p class="map-note" id="mapNote">点击地图单位或待部署卡片查看状态。按 Space 播放，←/→ 逐帧。</p>
+        </div>
+      </section>
+      <section class="stage">
+        <div class="map-legend" id="mapLegend" aria-label="地图图例"></div>
+        <div class="map-wrap">
+          <canvas id="map"></canvas>
+        </div>
+        <div class="reserve" aria-label="待部署区">
+          <div class="reserve-head"><b>待部署区</b><span>点击卡片查看 · 回放只读</span></div>
+          <div class="reserve-cards" id="reserveCards"></div>
+        </div>
+      </section>
+
+      <aside>
+        <div class="aside-head"><h2>事件流</h2><p>事件按战斗时间排列，点击可跳转。</p></div>
+        <div class="filters" id="filters"></div>
+        <div class="events" id="events"></div>
+      </aside>
+    </main>
+
+    <footer>
+      <div class="transport">
+        <button id="reset" title="回到开始">|◀</button>
+        <button id="stepBack" title="上一帧">◀</button>
+        <button id="play" title="播放/暂停">▶</button>
+        <button id="stepNext" title="下一帧">▶|</button>
+        <select id="speed" class="speed" aria-label="回放速度"><option value="0.5">0.5× · 15 帧/秒</option><option value="1" selected>1× · 30 帧/秒</option><option value="2">2× · 60 帧/秒</option><option value="3">3× · 90 帧/秒</option><option value="4">4× · 120 帧/秒</option><option value="8">8× · 240 帧/秒</option></select>
+      </div>
+      <div class="timeline">
+        <div class="timeline-top"><span>FRAME <b id="frameIndex">0</b></span><span id="statusLine">READY</span><span>END <b id="endTime">0.0</b>s</span></div>
+        <div class="track"><canvas id="markers"></canvas><input id="timeline" type="range" min="0" value="0"></div>
+      </div>
+      <div class="toggles"><button id="togglePath" class="active">目标路径 P</button><button id="toggleRange" class="active">攻击范围 R</button><button id="toggleIds" class="active">实体编号 I</button></div>
+    </footer>
+  </div>
+
+  <div id="dataLoader" class="data-loader" hidden>
+    <div class="data-loader-panel">
+      <h2>打开回放数据</h2>
+      <p>选择本地 JSON 数据文件。页面读取本地模拟数据，不会上传文件。最新文件位于 local/最新模拟/replay.json。</p>
+      <input id="dataFile" type="file" accept=".json,application/json" aria-label="选择回放数据文件">
+      <p id="dataLoaderStatus" role="status"></p>
+    </div>
+  </div>
+
+  <script>
+    const EMBEDDED_DATA = null;
+    function startReplay(DATA) {
+    const COLORS = {
+      ink:'#d8e0dd', muted:'#83908c', amber:'#f4b942', cyan:'#54d9d1', red:'#ff665e', green:'#8ecb64',
+      elite:'#f49b58', boss:'#e783c6', portal:'#a88ee8'
+    };
+    // Keep the legend and map rendering on the same palette.
+    const legendItems = [
+      ['蓝门', COLORS.cyan, ''], ['红门', COLORS.red, ''],
+      ['干员', COLORS.amber, 'diamond'], ['普通敌人', COLORS.red, 'circle'],
+      ['精英敌人', COLORS.elite, 'circle'], ['领袖敌人', COLORS.boss, 'circle'],
+      ['传送门', COLORS.portal, 'portal']
+    ];
+    const state = { caseIndex:0, frameIndex:0, playheadTime:0, playing:false, speed:1, selected:{type:'operator',id:null}, filters:new Set(['major']), path:true, range:true, ids:true, lastStamp:0 };
+    const el = id => document.getElementById(id);
+    const canvas = el('map'), ctx = canvas.getContext('2d');
+    const markerCanvas = el('markers'), markerCtx = markerCanvas.getContext('2d');
+    const eventGroups = {
+      major:['deploy','skill_cast','skill_active','skill_end','operator_death','enemy_death','leak','life_change'],
+      damage:['enemy_damage','operator_damage','projectile_launch','projectile_end'],
+      movement:['spawn','block','unblock','disappear','appear']
+    };
+    const hiddenEventKinds = new Set(['highland_trigger', 'highland_effect']);
+    const eventColor = kind => kind.includes('damage') || kind.includes('death') || kind==='leak' ? COLORS.red : kind.includes('skill') ? COLORS.amber : kind==='spawn' || kind==='appear' ? COLORS.green : COLORS.cyan;
+    const enemyColor = enemy => enemy.levelType==='BOSS' ? COLORS.boss : enemy.levelType==='ELITE' ? COLORS.elite : enemy.levelType==='NORMAL' ? COLORS.red : COLORS.muted;
+    const enemyCategory = enemy => ({NORMAL:'普通敌人', ELITE:'精英敌人', BOSS:'领袖敌人'}[enemy.levelType] || '类型未记录');
+    const currentCase = () => DATA.cases[state.caseIndex];
+    function currentFrame(){return currentCase().frames[state.frameIndex];}
+    function playbackEndIndex(){return currentCase().frames.length-1;}
+    const fmt = value => Number(value).toFixed(2).replace(/\.00$/,'');
+    function resizeCanvas(target, context) {
+      const rect = target.getBoundingClientRect(), ratio = window.devicePixelRatio || 1;
+      target.width = Math.max(1, Math.round(rect.width * ratio)); target.height = Math.max(1, Math.round(rect.height * ratio));
+      context.setTransform(ratio,0,0,ratio,0,0); return rect;
+    }
+    function geometry(target=canvas) {
+      const rect = target.getBoundingClientRect(), map = DATA.map;
+      const cell = Math.min((rect.width-54)/map.width,(rect.height-54)/map.height);
+      return {cell, ox:(rect.width-map.width*cell)/2, oy:(rect.height-map.height*cell)/2, h:map.height};
+    }
+    function xy(r,c,g){ return [g.ox+(c+.5)*g.cell,g.oy+(g.h-r-.5)*g.cell]; }
+    function tileStyle(tile) {
+      if(tile.key==='tile_end') return ['#113d3c',COLORS.cyan];
+      if(tile.key==='tile_start') return ['#3a1e1d',COLORS.red];
+      if(['tile_telin','tile_telout'].includes(tile.key)) return ['#241c36',COLORS.portal];
+      if(tile.height==='HIGHLAND' && tile.build==='RANGED') return ['#352f22','#766335'];
+      if(tile.pass==='FLY_ONLY') return ['#0a0e0d','#202925'];
+      if(tile.key==='tile_road') return ['#202b27','#3b4944'];
+      return ['#18211e','#303d38'];
+    }
+    function drawMap() {
+      const rect=resizeCanvas(canvas,ctx), g=geometry(), frame=currentFrame(), map=DATA.map;
+      ctx.clearRect(0,0,rect.width,rect.height);
+      for(let r=0;r<map.height;r++) for(let c=0;c<map.width;c++){
+        const tile=map.cells[r][c], [fill,stroke]=tileStyle(tile), x=g.ox+c*g.cell, y=g.oy+(map.height-r-1)*g.cell;
+        ctx.fillStyle=fill; ctx.fillRect(x+1,y+1,g.cell-2,g.cell-2); ctx.strokeStyle=stroke; ctx.lineWidth=1; ctx.strokeRect(x+1.5,y+1.5,g.cell-3,g.cell-3);
+        if(tile.height==='HIGHLAND' && tile.build==='RANGED'){
+          ctx.strokeStyle='#f4b94222'; ctx.beginPath(); ctx.moveTo(x+5,y+g.cell-5); ctx.lineTo(x+g.cell-5,y+5); ctx.stroke();
+        }
+        if(tile.key==='tile_end'){ctx.fillStyle=COLORS.cyan;ctx.font=`600 ${Math.max(10,g.cell*.2)}px Consolas`;ctx.textAlign='center';ctx.fillText('BLUE',x+g.cell/2,y+g.cell*.57);}
+        if(tile.key==='tile_start'){ctx.fillStyle=COLORS.red;ctx.font=`600 ${Math.max(10,g.cell*.2)}px Consolas`;ctx.textAlign='center';ctx.fillText('RED',x+g.cell/2,y+g.cell*.57);}
+        if(['tile_telin','tile_telout'].includes(tile.key)){
+          ctx.strokeStyle=COLORS.portal;ctx.lineWidth=2;ctx.beginPath();ctx.ellipse(x+g.cell/2,y+g.cell*.42,g.cell*.15,g.cell*.21,0,0,Math.PI*2);ctx.stroke();
+          ctx.fillStyle=COLORS.portal;ctx.font=`600 ${Math.max(9,g.cell*.16)}px Consolas`;ctx.textAlign='center';ctx.fillText(tile.key==='tile_telin'?'IN':'OUT',x+g.cell/2,y+g.cell*.83);
+        }
+      }
+      const op=frame.operators.find(x=>state.selected.type==='operator'&&x.id===state.selected.id)||frame.operators[0];
+      if(op && state.range){ctx.fillStyle='#54d9d122';ctx.strokeStyle='#54d9d177';for(const [r,c] of op.range){const x=g.ox+c*g.cell,y=g.oy+(map.height-r-1)*g.cell;ctx.fillRect(x+2,y+2,g.cell-4,g.cell-4);ctx.strokeRect(x+2.5,y+2.5,g.cell-5,g.cell-5);}}
+      const selectedEnemy = state.selected.type==='enemy' ? frame.enemies.find(e=>e.id===state.selected.id) : null;
+      if(selectedEnemy && state.path && selectedEnemy.route>=0){
+        const route=currentCase().routes[selectedEnemy.route]; ctx.strokeStyle='#f4b94299';ctx.lineWidth=2;ctx.setLineDash([6,5]);ctx.beginPath();
+        let [x,y]=xy(selectedEnemy.r,selectedEnemy.c,g);ctx.moveTo(x,y);
+        for(let i=selectedEnemy.routePoint+1;i<route.length;i++){const p=route[i];if(['WAIT_FOR_SECONDS','WAIT_CURRENT_WAVE_TIME','DISAPPEAR'].includes(p.kind))continue;[x,y]=xy(p.r,p.c,g);ctx.lineTo(x,y);}ctx.stroke();ctx.setLineDash([]);
+      }
+      for(const enemy of frame.enemies){if(enemy.hidden)continue;const [x,y]=xy(enemy.r,enemy.c,g),color=enemyColor(enemy),radius=Math.max(5,g.cell*.135);ctx.fillStyle='#07100fdd';ctx.strokeStyle=color;ctx.lineWidth=enemy.taunt?3:1.5;ctx.beginPath();ctx.arc(x,y,radius,0,Math.PI*2);ctx.fill();ctx.stroke();const ratio=Math.max(0,enemy.hp/enemy.max);ctx.strokeStyle=ratio>.5?COLORS.green:ratio>.2?COLORS.amber:COLORS.red;ctx.lineWidth=2;ctx.beginPath();ctx.arc(x,y,radius+3,-Math.PI/2,-Math.PI/2+Math.PI*2*ratio);ctx.stroke();if(state.ids){ctx.fillStyle=COLORS.ink;ctx.font='9px Consolas';ctx.textAlign='center';ctx.fillText(enemy.id,x,y+3);}if(state.selected.type==='enemy'&&state.selected.id===enemy.id){ctx.strokeStyle='#fff';ctx.lineWidth=1;ctx.strokeRect(x-radius-7,y-radius-7,(radius+7)*2,(radius+7)*2);}}
+      for(const projectile of frame.projectiles||[]){const [x,y0]=xy(projectile.r,projectile.c,g),y=y0-projectile.arc*g.cell*.55,color=projectile.side==='ENEMY'?COLORS.red:COLORS.cyan,radius=Math.max(2.5,g.cell*.045);if(projectile.arc){ctx.fillStyle='#0008';ctx.beginPath();ctx.ellipse(x,y0,g.cell*.055,g.cell*.025,0,0,Math.PI*2);ctx.fill();}ctx.shadowColor=color;ctx.shadowBlur=8;ctx.fillStyle=color;ctx.beginPath();ctx.arc(x,y,radius,0,Math.PI*2);ctx.fill();ctx.shadowBlur=0;}
+      for(const op of frame.operators){const [x,y]=xy(op.r,op.c,g),s=Math.max(9,g.cell*.18);ctx.save();ctx.translate(x,y);ctx.rotate(Math.PI/4);ctx.fillStyle=op.dead?'#4b4030':COLORS.amber;ctx.strokeStyle='#fff2';ctx.fillRect(-s,-s,s*2,s*2);ctx.strokeRect(-s,-s,s*2,s*2);ctx.restore();const hp=Math.max(0,op.hp/op.max);ctx.fillStyle='#101715';ctx.fillRect(x-g.cell*.3,y+s+7,g.cell*.6,4);ctx.fillStyle=hp>.5?COLORS.green:hp>.2?COLORS.amber:COLORS.red;ctx.fillRect(x-g.cell*.3,y+s+7,g.cell*.6*hp,4);ctx.fillStyle=COLORS.ink;ctx.font='10px Consolas';ctx.textAlign='center';ctx.fillText(op.starting?'SKILL / BEGIN':op.active?'SKILL / ACTIVE':`SP ${fmt(op.sp)}`,x,y-s-8);}
+      const nearEvents=currentCase().events.filter(e=>!hiddenEventKinds.has(e.kind) && Math.abs(e.t-frame.t)<.18 && (e.r!==undefined));
+      for(const event of nearEvents){const [x,y]=xy(event.r,event.c,g);ctx.strokeStyle=eventColor(event.kind);ctx.lineWidth=2;ctx.globalAlpha=.75;ctx.beginPath();ctx.arc(x,y,g.cell*.27,0,Math.PI*2);ctx.stroke();ctx.globalAlpha=1;}
+    }
+    function eventLabel(event){
+      const labels={spawn:'敌人生成',deploy:'干员部署',enemy_damage:'敌方受伤',operator_damage:'干员受伤',projectile_launch:'弹体发射',projectile_end:'弹体抵达/失效',block:'开始阻挡',unblock:'解除阻挡',skill_cast:'技能起动',skill_active:'技能生效',skill_end:'技能结束',enemy_death:'敌人击杀',operator_death:'干员倒下',leak:'敌人进门',life_change:'生命变化',disappear:'敌人消失',appear:'敌人出现'};
+      let detail=`#${event.target??'—'}`;if(event.amount!==undefined)detail+=` / ${fmt(event.amount)} DMG`;if(event.cast)detail+=` / 第 ${event.cast} 次`;if(event.life!==undefined)detail+=` / LIFE ${event.life}`;if(event.tile)detail+=` / (${event.tile.join(',')})`;return [labels[event.kind]||event.kind,detail];
+    }
+    function activeKinds(){if(state.filters.has('all'))return null;const result=new Set();for(const group of state.filters)for(const kind of eventGroups[group]||[])result.add(kind);return result;}
+    function renderEvents(){const box=el('events'),frame=currentFrame(),allowed=activeKinds();const filtered=currentCase().events.filter(e=>!hiddenEventKinds.has(e.kind)&&(!allowed||allowed.has(e.kind)));let nearest=filtered.findIndex(e=>e.t>=frame.t);if(nearest<0)nearest=filtered.length-1;const start=Math.max(0,nearest-70),slice=filtered.slice(start,start+150);box.innerHTML=slice.map(event=>{const [title,detail]=eventLabel(event);return `<div class="event ${Math.abs(event.t-frame.t)<.04?'now':''}" data-time="${event.t}" style="color:${eventColor(event.kind)}"><time>${event.t.toFixed(2)}</time><i class="dot"></i><div><strong>${title}</strong><small>${detail}</small></div></div>`}).join('');box.querySelectorAll('.event').forEach(node=>node.onclick=()=>seekTime(Number(node.dataset.time)));const now=box.querySelector('.now');if(now)now.scrollIntoView({block:'center'});}
+    const attributeText = (value, suffix='') => Number.isFinite(value) ? `${fmt(value)}${suffix}` : '—';
+    const reserveLabel = card => card.status==='cooldown' ? `冷却 ${Number(card.remaining).toFixed(1)}s` : card.status==='cost' ? '费用不足' : '待部署';
+    function renderReserve(){
+      const cards=currentFrame().reserve;
+      const box=el('reserveCards');
+      if(!cards){box.innerHTML='<p class="reserve-empty">此回放未记录待部署信息</p>';return;}
+      box.innerHTML=cards.length ? cards.map(card=>{
+        const profile=currentCase().roster?.find(item=>item.profile===card.profile);
+        const selected=state.selected.type==='reserve'&&state.selected.id===card.char;
+        return `<button class="reserve-card ${selected?'active':''}" data-char="${card.char}"><strong>${profile?.name||card.char}</strong><small>费用 ${Number(card.cost).toFixed(2)} · ${reserveLabel(card)}</small></button>`;
+      }).join('') : '<p class="reserve-empty">当前没有待部署干员</p>';
+      box.querySelectorAll('button').forEach(button=>button.onclick=()=>{state.selected={type:'reserve',id:button.dataset.char};render();});
+    }
+    function renderSp(entity){
+      const total=entity.spMax>0?Math.max(0,Math.min(1,entity.sp/entity.spMax)):0;
+      const slot=Number.isFinite(entity.spSlot)?Math.max(0,Math.min(1,entity.spSlot)):null;
+      const description=entity.spSlotMode==='periodic'?'满槽 +1 SP':entity.spSlotMode==='continuous'?'连续恢复的小数进度':'非自然恢复';
+      const stateLabel=entity.spSlotPaused?'暂停':'恢复中';
+      el('spPanel').innerHTML=`<div class="sp-panel">
+        <div class="sp-label"><span>技力 SP</span><b>${fmt(entity.sp)} / ${fmt(entity.spMax)}</b></div>
+        <div class="sp-track" role="progressbar" aria-label="技能技力" aria-valuemin="0" aria-valuemax="${entity.spMax}" aria-valuenow="${entity.sp}"><div class="sp-fill" style="width:${total*100}%"></div></div>
+        <div class="sp-label"><span>技力槽</span><b>${slot===null?'未记录':`${(slot*100).toFixed(1)}%`}</b></div>
+        <div class="sp-track slot" role="progressbar" aria-label="下一点技力积累" aria-valuemin="0" aria-valuemax="1" ${slot===null?'':`aria-valuenow="${slot}"`}><div class="sp-fill" style="width:${(slot??0)*100}%"></div></div>
+        <div class="sp-help">${slot===null?'没有可显示的自然恢复进度':`${description} · ${stateLabel}`}</div>
+      </div>`;
+    }
+    function renderInspector(){
+      const frame=currentFrame();
+      let entity=null, rows=[];
+      el('spPanel').innerHTML='';
+      if(state.selected.type==='reserve'){
+        const card=frame.reserve?.find(item=>item.char===state.selected.id);
+        if(!card){
+          const deployed=frame.operators.find(op=>op.char===state.selected.id&&!op.dead);
+          if(deployed){state.selected={type:'operator',id:deployed.id};renderInspector();return;}
+        }else{
+          entity=currentCase().roster?.find(item=>item.profile===card.profile);
+          const attrs=entity?.attributes||{};
+          rows=[['状态',reserveLabel(card)],['部署费用',Number(card.cost).toFixed(2)],['生命上限',attributeText(attrs.maxHp)],['攻击力',attributeText(attrs.atk)],['防御力',attributeText(attrs.def)],['法术抗性',attributeText(attrs.res)],['攻击间隔',attributeText(attrs.attackInterval,' s')],['阻挡上限',attributeText(attrs.blockCapacity)]];
+        }
+      }else if(state.selected.type==='operator'){
+        entity=frame.operators.find(op=>op.id===state.selected.id)||frame.operators[0];
+        if(entity){
+          const attrs=entity.attributes||{};
+          rows=[['ID',entity.id],['坐标',`${entity.r}, ${entity.c}`],['HP',`${fmt(entity.hp)} / ${fmt(entity.max)}`],['攻击力',attributeText(attrs.atk)],['防御力',attributeText(attrs.def)],['法术抗性',attributeText(attrs.res)],['攻击间隔',attributeText(attrs.attackInterval,' s')],['阻挡',`${entity.blocked} / ${attributeText(attrs.blockCapacity)}`],['技能',entity.starting?'开启动画':entity.active?'生效中':'未开启'],['已用技能',`${entity.casts} 次`],['状态',entity.dead?'倒下':'在场']];
+          renderSp(entity);
+        }
+      }else{
+        entity=frame.enemies.find(enemy=>enemy.id===state.selected.id);
+        if(entity)rows=[['ID',entity.id],['类型',enemyCategory(entity)],['HP',`${fmt(entity.hp)} / ${fmt(entity.max)}`],['坐标',`${entity.r}, ${entity.c}`],['路线',`${entity.route}:${entity.routePoint}`],['阻挡者',entity.blocked??'—'],['稳定阻挡点',entity.blockStable?entity.blockStable.join(', '):'—'],['偏移剩余',entity.blockShift?`${fmt(entity.blockShift)} s`:'—'],['嘲讽',entity.taunt],['状态',entity.hidden?'消失':'可见']];
+      }
+      el('entityName').textContent=entity?.name||entity?.key||entity?.char||'未选择实体';
+      el('entityGrid').innerHTML=entity?rows.map(([label,value])=>`<div class="entity-field"><span>${label}</span><b>${value}</b></div>`).join(''):'<span>点击地图单位或待部署卡片</span>';
+    }
+    function renderHeader(){
+      const frame=currentFrame(), c=currentCase(), logicFps=30*state.speed;
+      el('clock').textContent=frame.t.toFixed(3).padStart(7,'0');
+      el('life').textContent=frame.life;
+      el('dp').textContent=Number(frame.dpDisplay??frame.dp).toFixed(2);
+      el('dp').title=`可用整数费用 ${frame.dp}；小数部分为自然恢复进度`;
+      el('killed').textContent=frame.killed;
+      el('spawned').textContent=frame.spawned;
+      el('frameIndex').textContent=`f${frame.fixedFrame??Math.round(frame.t*30)} / f${c.frames.at(-1).fixedFrame??Math.round(c.frames.at(-1).t*30)}`;
+      const status=state.playing?'PLAY':state.frameIndex<c.frames.length-1?'PAUSED':c.result.win?'ALL CLEAR':'FINISHED / FAILED';
+      el('statusLine').textContent=`${status} · ${state.speed}× · ${logicFps} 帧/秒`;
+      el('timeline').value=state.frameIndex;
+    }
+    function drawMarkers(){const rect=resizeCanvas(markerCanvas,markerCtx),end=currentCase().frames.at(-1).t;markerCtx.clearRect(0,0,rect.width,rect.height);for(const event of currentCase().events){if(!['deploy','skill_cast','operator_death','leak'].includes(event.kind))continue;const x=end>0?event.t/end*rect.width:0;markerCtx.strokeStyle=eventColor(event.kind);markerCtx.beginPath();markerCtx.moveTo(x,2);markerCtx.lineTo(x,13);markerCtx.stroke();}}
+    function render(all=true){renderHeader();drawMap();renderInspector();renderReserve();if(all)renderEvents();}
+    function setFrame(index,all=true){const range=[0,currentCase().frames.length-1];state.frameIndex=Math.max(range[0],Math.min(index,range[1]));state.playheadTime=currentCase().frames[state.frameIndex].t;render(all);}
+    function frameIndexAt(time){const frames=currentCase().frames;let lo=0,hi=frames.length-1;while(lo<hi){const mid=Math.ceil((lo+hi)/2);if(frames[mid].t<=time)lo=mid;else hi=mid-1;}return lo;}
+    function seekTime(time,all=true){const frames=currentCase().frames,end=frames.at(-1).t;state.playheadTime=Math.max(frames[0].t,Math.min(time,end));state.frameIndex=frameIndexAt(state.playheadTime);render(all);}
+    function setCase(index){state.caseIndex=index;state.frameIndex=0;state.playheadTime=currentCase().frames[state.frameIndex].t;state.playing=false;state.selected={type:'operator',id:null};el('play').textContent='▶';const c=currentCase();el('caseSelect').value=String(index);const range=[0,c.frames.length-1];el('timeline').min=range[0];el('timeline').max=range[1];el('endTime').textContent=c.frames[range[1]].t.toFixed(1);drawMarkers();render();}
+    function animate(stamp){if(!state.lastStamp)state.lastStamp=stamp;const elapsed=Math.max(0,(stamp-state.lastStamp)/1000);state.lastStamp=stamp;if(state.playing){const oldIndex=state.frameIndex,endIndex=playbackEndIndex(),end=currentCase().frames[endIndex].t;state.playheadTime=Math.min(end,state.playheadTime+elapsed*state.speed);state.frameIndex=Math.min(endIndex,frameIndexAt(state.playheadTime));render(oldIndex!==state.frameIndex);if(state.playheadTime>=end){state.playing=false;el('play').textContent='▶';renderHeader();}}requestAnimationFrame(animate);}
+    function init(){
+      el('mapLegend').innerHTML=legendItems.map(([label,color,shape])=>`<span class="chip" style="--dot:${color}"><i class="${shape}"></i>${label}</span>`).join('');
+      el('stageLabel').textContent=`TACTICAL REPLAY / ${DATA.stage||'SIMULATION'}`;
+      el('caseSelect').innerHTML=DATA.cases.map((c,i)=>`<option value="${i}">${c.label}</option>`).join('');el('caseSelect').onchange=e=>setCase(Number(e.target.value));
+      const groups=[['major','关键'],['damage','伤害'],['movement','移动'],['all','全部']];el('filters').innerHTML=groups.map(([key,label])=>`<button data-filter="${key}" class="${state.filters.has(key)?'active':''}">${label}</button>`).join('');el('filters').querySelectorAll('button').forEach(btn=>btn.onclick=()=>{const key=btn.dataset.filter;if(key==='all')state.filters=new Set(['all']);else{state.filters.delete('all');state.filters.has(key)?state.filters.delete(key):state.filters.add(key);}el('filters').querySelectorAll('button').forEach(x=>x.classList.toggle('active',state.filters.has(x.dataset.filter)));renderEvents();});
+      el('play').onclick=()=>{if(!state.playing&&state.frameIndex>=playbackEndIndex())setFrame(0);state.playing=!state.playing;state.lastStamp=performance.now();el('play').textContent=state.playing?'Ⅱ':'▶';renderHeader();};el('reset').onclick=()=>setFrame(0);el('stepBack').onclick=()=>setFrame(state.frameIndex-1);el('stepNext').onclick=()=>setFrame(state.frameIndex+1);el('timeline').oninput=e=>setFrame(Number(e.target.value));el('speed').onchange=e=>{state.speed=Number(e.target.value);renderHeader();};
+      [['togglePath','path'],['toggleRange','range'],['toggleIds','ids']].forEach(([id,key])=>el(id).onclick=()=>{state[key]=!state[key];el(id).classList.toggle('active',state[key]);drawMap();});
+      canvas.onclick=e=>{const rect=canvas.getBoundingClientRect(),g=geometry(),mx=e.clientX-rect.left,my=e.clientY-rect.top,frame=currentFrame();let best={d:Infinity,type:null,id:null};for(const enemy of frame.enemies){if(enemy.hidden)continue;const [x,y]=xy(enemy.r,enemy.c,g),d=Math.hypot(x-mx,y-my);if(d<best.d){best={d,type:'enemy',id:enemy.id};}}for(const op of frame.operators){const [x,y]=xy(op.r,op.c,g),d=Math.hypot(x-mx,y-my);if(d<best.d){best={d,type:'operator',id:op.id};}}if(best.d<g.cell*.4){state.selected={type:best.type,id:best.id};render();}};
+      window.onkeydown=e=>{if(['INPUT','SELECT'].includes(document.activeElement.tagName))return;if(e.code==='Space'){e.preventDefault();el('play').click();}if(e.key==='ArrowLeft')setFrame(state.frameIndex-1);if(e.key==='ArrowRight')setFrame(state.frameIndex+1);if(e.key.toLowerCase()==='p')el('togglePath').click();if(e.key.toLowerCase()==='r')el('toggleRange').click();if(e.key.toLowerCase()==='i')el('toggleIds').click();};
+      window.onresize=()=>{drawMap();drawMarkers();};document.onvisibilitychange=()=>{state.lastStamp=performance.now();};setCase(0);requestAnimationFrame(animate);
+    }
+    init();
+    }
+    if (EMBEDDED_DATA) {
+      startReplay(EMBEDDED_DATA);
+    } else {
+      const loader = document.getElementById('dataLoader');
+      const status = document.getElementById('dataLoaderStatus');
+      const closeDataBtn = document.getElementById('closeDataBtn');
+      closeDataBtn.addEventListener('click', () => window.location.reload());
+      loader.hidden = false;
+      document.getElementById('dataFile').addEventListener('change', async event => {
+        const file = event.target.files?.[0];
+        if (!file) return;
+        status.classList.remove('data-loader-error');
+        status.textContent = '正在读取数据…';
+        try {
+          const data = JSON.parse((await file.text()).replace(/^\uFEFF/,''));
+          if (!data || !Array.isArray(data.cases) || !data.cases.length || !data.map) {
+            throw new Error('文件不是有效的回放数据');
+          }
+          startReplay(data);
+          loader.hidden = true;
+          closeDataBtn.title = `退出 ${file.name} 并选择其他数据文件`;
+          closeDataBtn.hidden = false;
+        } catch (error) {
+          status.classList.add('data-loader-error');
+          status.textContent = `读取失败：${error.message}`;
+          event.target.value = '';
+        }
+      });
+    }
+  </script>
+</body>
+</html>

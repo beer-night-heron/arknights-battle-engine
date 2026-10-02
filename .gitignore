@@ -1,0 +1,23 @@
+# Publish the main battle engine and its user-facing tools only.
+/*
+!/.gitignore
+!/README.md
+!/CHANGELOG.md
+!/arksim/
+!/docs/
+!/examples/
+!/viewer/
+!/tools/
+/tools/*
+!/tools/export_data.py
+!/tools/list_data.py
+!/tools/simulate.py
+# local/ includes data, plans, generated output and all historical material.
+/local/
+# Block accidental reintroduction of the discontinued engine.
+/arksim/kernel/
+/arksim/kernel_engine.py
+**/__pycache__/
+**/*.py[cod]
+**/.env
+**/.env.*

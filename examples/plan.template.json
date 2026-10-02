@@ -1,0 +1,16 @@
+[
+  {
+    "char_id": "char_替换为实际ID",
+    "tile": [2, 3],
+    "time": 10.0,
+    "level": 1,
+    "elite": 0,
+    "facing": 0,
+    "skill_id": null,
+    "trust": 0,
+    "potential_rank": 0,
+    "module_id": null,
+    "module_level": 0,
+    "action": "DEPLOY"
+  }
+]
