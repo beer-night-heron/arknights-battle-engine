@@ -21,7 +21,7 @@ import math
 import struct
 from collections import Counter, deque
 from dataclasses import dataclass, field
-from functools import cmp_to_key
+from functools import cmp_to_key, lru_cache
 from typing import Any
 
 from . import data as D
@@ -57,6 +57,9 @@ from .mechanics import (
     operator_target_key,
 )
 from .randomness import DeterministicRng
+from .graphics import (
+    EnemyGraphicProfile, FacingRuntime, ProjectileMotionProfile, map_offset,
+)
 from .targeting import FramePeriodicTicker, TargetSelectorRuntime
 
 
@@ -122,6 +125,23 @@ def _fixed_delay_frames(delay_seconds: float, frame_duration: float) -> int:
     if math.isclose(frame_count, nearest_frame, rel_tol=0.0, abs_tol=1e-5):
         return int(nearest_frame)
     return math.ceil(frame_count)
+
+
+@lru_cache(maxsize=256)
+def _animation_event_delay_frames(delay_seconds: float, frame_duration: float) -> int:
+    """Candidate zero-start float32 track clock, without integer snapping."""
+    step = struct.unpack("<f", struct.pack("<f", frame_duration))[0]
+    if not math.isfinite(delay_seconds) or not math.isfinite(step) or step <= 0.0:
+        raise ValueError("animation event time and step must be finite; step positive")
+    elapsed = 0.0
+    frames = 0
+    while elapsed < delay_seconds:
+        advanced = struct.unpack("<f", struct.pack("<f", elapsed + step))[0]
+        if advanced <= elapsed:
+            raise ValueError("animation event exceeds float32 clock precision")
+        elapsed = advanced
+        frames += 1
+    return frames
 
 
 @dataclass
@@ -236,7 +256,11 @@ class _Enemy:
     wave_start_time: float = 0.0
     attack_duration: float = 0.0
     attack_hit_time: float = 0.0
+    wait_for_attack_event: bool = False
     projectile_key: str | None = None
+    graphic_profile: EnemyGraphicProfile | None = None
+    facing: FacingRuntime | None = None
+    attack_started_at: float | None = None
     tile_idx: int = 0
     move_cd: float = 0.0
     route_idx: int = 0
@@ -357,6 +381,8 @@ class _Projectile:
     parabolic: bool = False
     initial_distance: float = 0.0
     travelled: float = 0.0
+    position_z: float = 0.0
+    motion_profile: ProjectileMotionProfile | None = None
 
     def position(self) -> tuple[float, float]:
         return self.position_row, self.position_col
@@ -508,6 +534,7 @@ class Battle:
         assumptions: SimulationAssumptions | None = None,
         spawn_timing: str = SPAWN_TIMING_FAST,
         enemy_attack_timing: str = ENEMY_ATTACK_TIMING_FLOAT,
+        enemy_graphics: dict[str, Any] | None = None,
     ) -> None:
         self.level = level
         self.enemy_index = enemy_index
@@ -538,6 +565,31 @@ class Battle:
         self.seed = int(seed)
         self.rng = DeterministicRng(self.seed)
         self.assumptions = assumptions or DEFAULT_ASSUMPTIONS
+        self.enemy_graphics: dict[str, EnemyGraphicProfile] = {}
+        self.operator_hit_offsets: dict[str, tuple[float, float, float]] = {}
+        self.projectile_motion_profiles: dict[str, ProjectileMotionProfile] = {}
+        if (self.assumptions.enemy_projectile_muzzle
+                or self.assumptions.enemy_facing_transition):
+            if enemy_graphics is None and D.DATA_DIR is not None:
+                enemy_graphics = D.load_enemy_graphics()
+            profiles = (enemy_graphics or {}).get("enemies", {})
+            if not isinstance(profiles, dict):
+                raise ValueError("enemy graphics 'enemies' must be an object")
+            for key, spec in profiles.items():
+                self.enemy_graphics[key] = EnemyGraphicProfile.from_dict(spec)
+            if self.assumptions.enemy_projectile_muzzle:
+                hit_profiles = (enemy_graphics or {}).get("operators", {})
+                if not isinstance(hit_profiles, dict):
+                    raise ValueError("enemy graphics 'operators' must be an object")
+                for key, spec in hit_profiles.items():
+                    if not isinstance(spec, dict) or spec.get("coordinateSpace") != "map":
+                        raise ValueError("operator hit profiles require coordinateSpace='map'")
+                    self.operator_hit_offsets[key] = map_offset(spec["hitOffset"])
+                motion_profiles = self.projectile_data.get("motion", {})
+                if not isinstance(motion_profiles, dict):
+                    raise ValueError("projectile motion must be an object")
+                for key, spec in motion_profiles.items():
+                    self.projectile_motion_profiles[key] = ProjectileMotionProfile.from_dict(spec)
         self.used_assumptions: set[str] = set()
         self.spawn_timing = self._normalize_spawn_timing(spawn_timing)
         self.enemy_attack_timing = self._normalize_enemy_attack_timing(
@@ -1557,6 +1609,7 @@ class Battle:
             wave_start_time=wave_start_time,
             attack_duration=attack_duration,
             attack_hit_time=attack_hit_time,
+            wait_for_attack_event=(timing or {}).get("wait_for_attack_event") is True,
             projectile_key=projectile_key,
             move_cd=0.0,
             spawn_move_lock_frames=spawn_move_lock_frames,
@@ -1579,6 +1632,24 @@ class Battle:
             ),
         )
         enemy.target_search_ticker.reset(self.frame_index)
+        if (apply_way == ApplyWay.RANGED.value and projectile_key
+                and (self.assumptions.enemy_projectile_muzzle
+                     or self.assumptions.enemy_facing_transition)):
+            enemy.graphic_profile = self.enemy_graphics.get(key)
+            if enemy.graphic_profile is None:
+                self.mechanic_diagnostics[f"ENEMY_GRAPHIC_PROFILE:{key}"] += 1
+            else:
+                sign = enemy.graphic_profile.initial_facing
+                enemy.facing = FacingRuntime(target=sign, origin=float(sign))
+        if (
+            apply_way == ApplyWay.RANGED.value
+            and self.assumptions.ranged_spawn_search_phase
+        ):
+            # Anchor the initial idle cycle to birth + period * k.
+            # Consume the birth slot so grouped updates cannot tick it twice.
+            enemy.target_search_ticker.tick(self.frame_index)
+            enemy.target_search_ticker.next(self.frame_index)
+            self.used_assumptions.add("RANGED_SPAWN_SEARCH_PHASE")
         self._initialize_enemy_buffs(enemy)
         if key in SHIELDGUARD_KEYS:
             enemy.taunt_level += 1
@@ -1991,6 +2062,7 @@ class Battle:
             return
         if not enemy.statuses.can_move:
             return
+        self._request_enemy_route_facing(enemy)
         self._move_enemy(enemy)
 
     def _start_operator_action(self, op: _Operator) -> None:
@@ -2710,12 +2782,31 @@ class Battle:
             source_row, source_col = map(float, source.tile)
         else:
             source_row, source_col = source.position()
-        if isinstance(target, _Operator):
-            target_row, target_col = map(float, target.tile)
-        else:
-            target_row, target_col = target.position()
+        source_z = 0.0
+        muzzle_position = None
+        if isinstance(source, _Enemy) and self.assumptions.enemy_projectile_muzzle:
+            muzzle_position = self.enemy_muzzle_position_v3(source)
+            if muzzle_position is not None:
+                source_row, source_col, source_z = muzzle_position
+                self.used_assumptions.add("ENEMY_PROJECTILE_MUZZLE")
+            elif (source.graphic_profile is not None
+                  and (self.enemy_projectiles.get(source.key) or {}).get("mountPointType") == 2):
+                self.mechanic_diagnostics[f"ENEMY_MUZZLE_OFFSET:{source.key}"] += 1
+        profile = self.projectile_motion_profiles.get(key) if side == "ENEMY" else None
+        if profile is not None:
+            self.used_assumptions.add("PROJECTILE_MOTION_PROFILE")
+            if profile.target_mount == "hit":
+                self.used_assumptions.add("PROJECTILE_TARGET_HIT")
+                if self._unit_hit_position(target) is None:
+                    target_key = target.char_id if isinstance(target, _Operator) else target.key
+                    self.mechanic_diagnostics[f"PROJECTILE_TARGET_HIT:{target_key}"] += 1
+        target_row, target_col, target_z = self._projectile_target_position(target, profile)
+        initial_distance = math.hypot(target_row - source_row, target_col - source_col)
+        if profile is not None and profile.distance_dimensions == 3:
+            initial_distance = math.sqrt(initial_distance ** 2 + (target_z - source_z) ** 2)
         self.projectile_counter += 1
-        self.used_assumptions.add("PROJECTILE_SOURCE_CENTER")
+        if muzzle_position is None:
+            self.used_assumptions.add("PROJECTILE_SOURCE_CENTER")
         self.projectiles.append(
             _Projectile(
                 projectile_id=self.projectile_counter,
@@ -2726,16 +2817,68 @@ class Battle:
                 target=target,
                 position_row=source_row,
                 position_col=source_col,
+                position_z=source_z,
+                motion_profile=profile,
                 launched_at=self.time,
                 operator_attack=operator_attack,
                 will_hit=will_hit,
                 cached_atk=cached_atk,
                 parabolic="mortar" in key.lower(),
-                initial_distance=math.hypot(
-                    target_row - source_row, target_col - source_col
-                ),
+                initial_distance=initial_distance,
             )
         )
+
+    def enemy_muzzle_position(self, enemy: _Enemy) -> tuple[float, float] | None:
+        position = self.enemy_muzzle_position_v3(enemy)
+        return position[:2] if position is not None else None
+
+    def enemy_muzzle_position_v3(self, enemy: _Enemy) -> tuple[float, float, float] | None:
+        """Return the same map-space attachment used by emission and replay.
+
+        Outside the configured attack pose, the profile's fixed offset is
+        the current fallback. This query never changes battle state.
+        """
+        profile = enemy.graphic_profile
+        if (not self.assumptions.enemy_projectile_muzzle or profile is None
+                or (self.enemy_projectiles.get(enemy.key) or {}).get("mountPointType") != 2):
+            return None
+        elapsed = (
+            max(0.0, self.time - enemy.attack_started_at)
+            if enemy.attack_started_at is not None else None
+        )
+        attack_time = elapsed if (
+            elapsed is not None
+            and (enemy.attack_target is not None or elapsed <= enemy.attack_duration)
+        ) else None
+        offset = profile.muzzle_at(attack_time)
+        if offset is None:
+            return None
+        sign = enemy.facing.value_at(self.time) if enemy.facing else 1.0
+        return (enemy.position_row + offset[0],
+                enemy.position_col + offset[1] * sign, offset[2])
+
+    def _unit_hit_position(self, unit: _Enemy | _Operator) -> tuple[float, float, float] | None:
+        if isinstance(unit, _Operator):
+            offset = self.operator_hit_offsets.get(unit.char_id)
+            row, col = map(float, unit.tile)
+            sign = 1.0
+        else:
+            offset = unit.graphic_profile.hit_offset if unit.graphic_profile else None
+            row, col = unit.position()
+            sign = unit.facing.value_at(self.time) if unit.facing else 1.0
+        if offset is None:
+            return None
+        return row + offset[0], col + offset[1] * sign, offset[2]
+
+    def _projectile_target_position(
+        self, target: _Enemy | _Operator, profile: ProjectileMotionProfile | None,
+    ) -> tuple[float, float, float]:
+        if profile is not None and profile.target_mount == "hit":
+            position = self._unit_hit_position(target)
+            if position is not None:
+                return position
+        row, col = map(float, target.tile) if isinstance(target, _Operator) else target.position()
+        return row, col, 0.0
 
     def _emit_operator_projectiles(
         self, op: _Operator, attack: _PendingOperatorAttack
@@ -3133,24 +3276,40 @@ class Battle:
         for projectile in self.projectiles:
             if not self._projectile_target_valid(projectile):
                 continue
-            if isinstance(projectile.target, _Operator):
-                target_row, target_col = map(float, projectile.target.tile)
-            else:
-                target_row, target_col = projectile.target.position()
+            profile = projectile.motion_profile
+            target_row, target_col, target_z = self._projectile_target_position(
+                projectile.target, profile,
+            )
             delta_row = target_row - projectile.position_row
             delta_col = target_col - projectile.position_col
+            delta_z = target_z - projectile.position_z
             distance = math.hypot(delta_row, delta_col)
-            step_distance = projectile.speed * self.dt
-            if distance <= step_distance + 1e-9:
+            spatial = profile is not None and profile.distance_dimensions == 3
+            if spatial:
+                distance = math.sqrt(delta_row ** 2 + delta_col ** 2 + delta_z ** 2)
+            step_seconds = self.dt
+            if (profile is not None and profile.quantized_step
+                    and math.isclose(self.dt, 1 / CLIENT_LOGIC_RATE, rel_tol=0.0, abs_tol=1e-12)):
+                step_seconds = CLIENT_FIXED_TIMER_STEP
+            step_distance = projectile.speed * step_seconds
+            epsilon = 1e-9 if profile is None else 0.0
+            if distance <= step_distance + epsilon:
                 projectile.travelled += distance
                 projectile.position_row = target_row
                 projectile.position_col = target_col
+                if spatial:
+                    projectile.position_z = target_z
+            else:
+                projectile.position_row += delta_row / distance * step_distance
+                projectile.position_col += delta_col / distance * step_distance
+                if spatial:
+                    projectile.position_z += delta_z / distance * step_distance
+                projectile.travelled += step_distance
+            radius = profile.reach_radius if profile is not None else 0.0
+            if distance - step_distance <= radius + epsilon:
                 self._projectile_lands(projectile)
-                continue
-            projectile.position_row += delta_row / distance * step_distance
-            projectile.position_col += delta_col / distance * step_distance
-            projectile.travelled += step_distance
-            active.append(projectile)
+            else:
+                active.append(projectile)
         self.projectiles = active
 
     def _projectile_lands(self, projectile: _Projectile) -> None:
@@ -3928,6 +4087,9 @@ class Battle:
             enemy.pause_until = self.time + 0.5
             return
         enemy.attack_target = target
+        if enemy.graphic_profile is not None:
+            enemy.attack_started_at = self.time
+            self._request_enemy_facing(enemy, target.tile[1] - enemy.position_col)
         enemy.attack_will_hit = self._attack_hits(
             enemy, DamageType.PHYSICAL
         )
@@ -3941,6 +4103,15 @@ class Battle:
             self.frame_index
             + _fixed_delay_frames(hit_delay, self.dt)
         )
+        if (not hit_after_windup and enemy.apply_way == ApplyWay.RANGED.value
+                and enemy.wait_for_attack_event and self.assumptions.enemy_animation_event_clock):
+            step = (CLIENT_FIXED_TIMER_STEP
+                    if math.isclose(self.dt, 1 / CLIENT_LOGIC_RATE, rel_tol=0.0, abs_tol=1e-12)
+                    else self.dt)
+            frames = _animation_event_delay_frames(hit_delay, step)
+            enemy.attack_hit_frame = self.frame_index + frames
+            enemy.attack_hit_at = self.time + frames * self.dt
+            self.used_assumptions.add("ENEMY_ANIMATION_EVENT_CLOCK")
         enemy.pause_until = self.time + enemy.attack_duration
         enemy.attack_move_resume_frame = None
         if (
@@ -3960,6 +4131,27 @@ class Battle:
                 + transition_frames
             )
             self.used_assumptions.add("RANGED_ATTACK_MOVE_TRANSITION")
+
+    def _request_enemy_facing(self, enemy: _Enemy, delta_col: float) -> None:
+        if enemy.facing is None or enemy.graphic_profile is None:
+            return
+        duration = (
+            enemy.graphic_profile.turn_seconds
+            if self.assumptions.enemy_facing_transition else 0.0
+        )
+        enemy.facing.request(delta_col, self.time, duration)
+        if self.assumptions.enemy_facing_transition:
+            self.used_assumptions.add("ENEMY_FACING_TRANSITION")
+
+    def _request_enemy_route_facing(self, enemy: _Enemy) -> None:
+        profile = enemy.graphic_profile
+        if (profile is None or not profile.face_route or enemy.disappeared
+                or enemy.route_idx >= len(enemy.route)):
+            return
+        # Follow the route cursor, not avoidance velocity or portal jumps.
+        self._request_enemy_facing(
+            enemy, enemy.route[enemy.route_idx].col - enemy.position_col
+        )
 
     def _effective_attack_interval(
         self, unit: _Enemy | _Operator | None = None

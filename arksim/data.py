@@ -69,6 +69,14 @@ def load_behavior_templates() -> dict[str, Any]:
         return {}
 
 
+def load_enemy_graphics() -> dict[str, Any]:
+    """Load optional, preconverted map-space enemy attachment profiles."""
+    try:
+        return _load("enemy_graphics.json")
+    except FileNotFoundError:
+        return {}
+
+
 def load_enemy_buff_abilities() -> dict[str, Any]:
     """Load the normalized enemy Buff definitions used by the simulator."""
     try:

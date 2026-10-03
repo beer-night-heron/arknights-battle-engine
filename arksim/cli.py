@@ -13,6 +13,7 @@ from typing import Any
 
 from . import data as D
 from .batch import summarize_results
+from .assumptions import DEFAULT_ASSUMPTIONS
 from .battle import (
     ENEMY_ATTACK_TIMING_FLOAT,
     ENEMY_ATTACK_TIMING_MORTAR_FRAMES,
@@ -36,6 +37,8 @@ def build_config(
     strict_behaviors: bool = False,
     spawn_timing: str = SPAWN_TIMING_FAST,
     enemy_attack_timing: str = ENEMY_ATTACK_TIMING_FLOAT,
+    enemy_muzzle: bool = False,
+    enemy_turning: bool = False,
 ) -> dict[str, Any]:
     """Shared input loading for summary and replay commands."""
     D.set_data_dir(data_dir)
@@ -65,6 +68,12 @@ def build_config(
         "strict_behaviors": strict_behaviors,
         "spawn_timing": spawn_timing,
         "enemy_attack_timing": enemy_attack_timing,
+        "enemy_graphics": D.load_enemy_graphics() if enemy_muzzle or enemy_turning else {},
+        "assumptions": replace(
+            DEFAULT_ASSUMPTIONS,
+            enemy_projectile_muzzle=enemy_muzzle,
+            enemy_facing_transition=enemy_turning,
+        ),
     }
 
 
@@ -100,6 +109,8 @@ def _run_once(config: dict[str, Any], seed: int):
         enemy_attack_timing=config.get(
             "enemy_attack_timing", ENEMY_ATTACK_TIMING_FLOAT
         ),
+        enemy_graphics=config.get("enemy_graphics"),
+        assumptions=config.get("assumptions"),
     )
     return battle.run()
 
@@ -174,6 +185,8 @@ def main(argv: list[str] | None = None) -> int:
         "--confidence", type=float, default=0.95, help="Wilson interval level"
     )
     parser.add_argument("--json-out", action="store_true", help="print JSON")
+    parser.add_argument("--enemy-muzzle", action="store_true", help="use optional enemy muzzle profiles")
+    parser.add_argument("--enemy-turning", action="store_true", help="simulate optional enemy facing transitions")
     parser.add_argument("--output", help="save result JSON as UTF-8 (not a replay file)")
     parser.add_argument(
         "--strict-behaviors",
@@ -206,6 +219,8 @@ def main(argv: list[str] | None = None) -> int:
             strict_behaviors=args.strict_behaviors,
             spawn_timing=args.spawn_timing,
             enemy_attack_timing=args.enemy_attack_timing,
+            enemy_muzzle=args.enemy_muzzle,
+            enemy_turning=args.enemy_turning,
         )
     except (OSError, ValueError, KeyError) as error:
         parser.error(f"cannot load simulation inputs: {error}")

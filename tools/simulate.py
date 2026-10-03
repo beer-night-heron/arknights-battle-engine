@@ -28,7 +28,7 @@ def compact_enemy(enemy: Any, battle: Battle) -> dict[str, Any]:
         ),
         -1,
     )
-    return {
+    state = {
         "id": enemy.enemy_index,
         "key": enemy.key,
         "name": enemy.name,
@@ -54,6 +54,12 @@ def compact_enemy(enemy: Any, battle: Battle) -> dict[str, Any]:
         "hidden": enemy.disappeared and not enemy.portal_targetable,
         "taunt": enemy.taunt_level,
     }
+    if enemy.facing is not None:
+        state["facing"] = round(enemy.facing.value_at(battle.time), 4)
+    muzzle = battle.enemy_muzzle_position_v3(enemy)
+    if muzzle is not None:
+        state["muzzle"] = {"r": round(muzzle[0], 4), "c": round(muzzle[1], 4), "z": round(muzzle[2], 4)}
+    return state
 
 
 def compact_operator(operator: Any, battle: Battle) -> dict[str, Any]:
@@ -115,6 +121,7 @@ def compact_projectile(projectile: Any) -> dict[str, Any]:
         "side": projectile.side,
         "r": round(projectile.position_row, 4),
         "c": round(projectile.position_col, 4),
+        "z": round(projectile.position_z, 4),
         "arc": round(4.0 * progress * (1.0 - progress), 4)
         if projectile.parabolic
         else 0.0,
@@ -354,6 +361,8 @@ def run_case(
         strict_behaviors=shared["strict_behaviors"],
         spawn_timing=shared["spawn_timing"],
         enemy_attack_timing=shared["enemy_attack_timing"],
+        enemy_graphics=shared.get("enemy_graphics"),
+        assumptions=shared.get("assumptions"),
     )
     frames: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
@@ -385,6 +394,8 @@ def run_case(
         "plan": plan_path.name,
         "sampleInterval": sample_interval,
         "spawnTiming": battle.spawn_timing,
+        "enemyMuzzle": battle.assumptions.enemy_projectile_muzzle,
+        "enemyTurning": battle.assumptions.enemy_facing_transition,
         "routes": export_routes(battle),
         "roster": roster,
         "frames": frames,
@@ -437,6 +448,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--spawn-timing", choices=("fast", "client", "frame_core"), default="fast")
     parser.add_argument("--enemy-attack-timing", choices=("float", "mortar_frames"), default="float")
     parser.add_argument("--strict-behaviors", action="store_true")
+    parser.add_argument("--enemy-muzzle", action="store_true", help="use optional enemy muzzle profiles")
+    parser.add_argument("--enemy-turning", action="store_true", help="simulate optional enemy facing transitions")
     parser.add_argument("--output-dir", default=str(ROOT / "local"), help="parent of 最新模拟 and 模拟历史")
     args = parser.parse_args(argv)
     if not math.isfinite(args.sample_interval) or args.sample_interval < 1 / 30:
@@ -447,6 +460,8 @@ def main(argv: list[str] | None = None) -> int:
             spawn_timing=args.spawn_timing,
             enemy_attack_timing=args.enemy_attack_timing,
             strict_behaviors=args.strict_behaviors,
+            enemy_muzzle=args.enemy_muzzle,
+            enemy_turning=args.enemy_turning,
         )
     except (OSError, ValueError, KeyError) as error:
         parser.error(f"cannot load simulation inputs: {error}")
@@ -458,6 +473,7 @@ def main(argv: list[str] | None = None) -> int:
         "engineVersion": __version__, "createdAt": created,
         "stage": args.stage, "spawnTiming": args.spawn_timing,
         "enemyAttackTiming": args.enemy_attack_timing,
+        "enemyMuzzle": args.enemy_muzzle, "enemyTurning": args.enemy_turning,
         "map": export_map(shared["level"]), "cases": [case],
     }
     output_root = Path(args.output_dir).resolve()
@@ -476,6 +492,7 @@ def main(argv: list[str] | None = None) -> int:
         "stage": args.stage, "plan": Path(args.plan).name, "seed": args.seed,
         "sampleInterval": args.sample_interval,
         "spawnTiming": args.spawn_timing, "enemyAttackTiming": args.enemy_attack_timing,
+        "enemyMuzzle": args.enemy_muzzle, "enemyTurning": args.enemy_turning,
         "frames": len(case["frames"]), "result": case["result"],
     }
     (staged / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -21,6 +21,10 @@ class SimulationAssumptions:
     enemy_spawn_move_lock_frames: int = 2
     enemy_spawn_attack_lock_frames: int = 2
     enemy_target_search_period_frames: int = 3
+    ranged_spawn_search_phase: bool = True
+    enemy_projectile_muzzle: bool = False
+    enemy_facing_transition: bool = False
+    enemy_animation_event_clock: bool = True
     entity_update_order_by_allocation: bool = True
     headb2_periodic_sp_recovery: bool = True
     operator_target_selector_before_enemy_movement: bool = False
@@ -54,6 +58,7 @@ ASSUMPTION_NOTES = {
     "ENEMY_SPAWN_FRAME_NO_MOVE": "出生逻辑帧与紧接的状态过渡帧不执行自主移动；其他出生动作仍需独立适配。",
     "ENEMY_SPAWN_ACTION_LOCK": "普通攻击敌人出生后的两个30Hz逻辑帧不开始新攻击；该时序是当前近似模型。",
     "ENEMY_TARGET_SEARCH_CYCLE": "近战普通攻击沿用阻挡目标；远程敌人在需要搜索时采用3帧周期和目标缓存，特殊敌人不保证适用。",
+    "RANGED_SPAWN_SEARCH_PHASE": "普通远程敌人的初始空闲扫描以出生帧为相位基准，在出生后第3、6等帧搜索，不追加第2帧单次查询；攻击间隔结束后重新建立周期。该规则仍为候选，部分敌人首轮起手与特殊出生动作尚待完善。",
     "MELEE_BLOCK_STARTS_ATTACK": "阻挡关系建立后，近战敌人在下一次自身更新启动普通攻击，可能位于同一逻辑帧或下一帧；该边界仍待完善。",
     "MELEE_BLOCK_ATTACK_HIT_AFTER_WINDUP": "近战阻挡攻击在前摇结束后的下一逻辑帧造成伤害或发射弹体；缺少前摇数据时回退为0秒，该规则仍是模型假设。",
     "OPERATOR_SELECTOR_PRE_MOVEMENT_SEARCH": "可选分组模式在全部敌人移动前搜索；默认创建序模式中，查询可见位置取决于双方更新顺序。",
@@ -74,5 +79,10 @@ ASSUMPTION_NOTES = {
     "CLIENT_DISPLAY_ENEMY_INFO_WORK_FRAME": "DISPLAY_ENEMY_INFO作为独立调度工作项累积一帧，在同刻普通动作后完成；关联预览尚未完整展开。",
     "CLIENT_PREVIEW_COMPLETION_ORDER": "同刻路线预览可改变单次SPAWN完成帧，该局部完成帧不继续延迟后续重复动作；排序边界仍是模型。",
     "PROJECTILE_SOURCE_CENTER": "未提供世界坐标发射挂点时，弹体从攻击者实体中心发射；挂点、缩放和朝向仍待完善。",
+    "ENEMY_PROJECTILE_MUZZLE": "可选敌方发射挂点按本地地图三维坐标配置及攻击动画采样插值，并随左右朝向翻转；配置覆盖、动作混合和实际出弹子阶段仍有限制。",
+    "ENEMY_ANIMATION_EVENT_CLOCK": "显式配置为等待动画事件的普通远程攻击，以量化逻辑步长逐帧累加float32动画时间至事件点；该出弹模型为候选，事件交接子阶段与不同动画速度仍待完善。",
+    "PROJECTILE_MOTION_PROFILE": "可选敌方弹体按配置选用二维或三维距离、量化步长及到达容差；抛物线高度和特殊弹体路径尚未完整模拟。",
+    "PROJECTILE_TARGET_HIT": "弹体追踪配置中的目标受击挂点，偏移使用地图坐标；缺少挂点时回退实体中心并登记诊断。",
+    "ENEMY_FACING_TRANSITION": "可选敌方转身按配置时长线性改变左右缩放；攻击起手朝向目标，可配置沿路线朝向。曲线与首次转向阶段仍为近似，不延迟攻击或移动。",
     "PROJECTILE_OPERATOR_INFERRED": "干员普通弹道仅在存在对应逻辑键时推断；技能专用和纯视觉弹体不自动套用。"
 }
