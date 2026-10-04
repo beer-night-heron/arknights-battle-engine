@@ -22,7 +22,9 @@
 | 文件 | 用途 / 缺失时的限制 |
 | --- | --- |
 | `buff_template_data.json` | 技能与 Buff 行为模板；缺失会限制数据驱动技能覆盖 |
-| `battle_equip_table.json` | 模组属性；使用 `module_id` 时需提供对应条目 |
+| `battle_equip_table.json` | 模组属性和效果参数；使用 `module_id` 时需提供对应条目和等级 |
+| `uniequip_table.json` | 模组所属角色、解锁阶段/等级/信赖条件；装备模组时必需 |
+| `favor_table.json` | 将模组的信赖点门槛换算为信赖百分数；有非零门槛时必需 |
 | `enemy_attack_timing.json`、`operator_attack_timing.json` | 前摇、命中等攻击时序；缺失会采用引擎回退值，不能保证逐帧时序 |
 | `projectile_data.json` | 弹体逻辑键、速度及单位映射；缺失无法保持相应弹道配置 |
 | `enemy_graphics.json` | 可选敌方地图坐标挂点、动画采样与转身配置；只在开启相应开关时加载 |

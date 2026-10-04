@@ -350,10 +350,12 @@
     const canvas = el('map'), ctx = canvas.getContext('2d');
     const markerCanvas = el('markers'), markerCtx = markerCanvas.getContext('2d');
     const eventGroups = {
-      major:['deploy','skill_cast','skill_active','skill_end','operator_death','enemy_death','leak','life_change'],
+      major:['deploy','skill_cast','skill_active','skill_end','mode_change','operator_death','enemy_death','leak','life_change','retreat','operation','wave_ready','wave_timeout'],
+      operations:['operation','mode_change','wave_ready','wave_timeout'],
       damage:['enemy_damage','operator_damage','projectile_launch','projectile_end'],
       movement:['spawn','block','unblock','disappear','appear']
     };
+    const escapeText = value => String(value).replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));
     const hiddenEventKinds = new Set(['highland_trigger', 'highland_effect']);
     const eventColor = kind => kind.includes('damage') || kind.includes('death') || kind==='leak' ? COLORS.red : kind.includes('skill') ? COLORS.amber : kind==='spawn' || kind==='appear' ? COLORS.green : COLORS.cyan;
     const enemyColor = enemy => enemy.levelType==='BOSS' ? COLORS.boss : enemy.levelType==='ELITE' ? COLORS.elite : enemy.levelType==='NORMAL' ? COLORS.red : COLORS.muted;
@@ -434,11 +436,27 @@
       drawMuzzles(frame,g);
     }
     function eventLabel(event){
-      const labels={spawn:'敌人生成',deploy:'干员部署',enemy_damage:'敌方受伤',operator_damage:'干员受伤',projectile_launch:'弹体发射',projectile_end:'弹体抵达/失效',block:'开始阻挡',unblock:'解除阻挡',skill_cast:'技能起动',skill_active:'技能生效',skill_end:'技能结束',enemy_death:'敌人击杀',operator_death:'干员倒下',leak:'敌人进门',life_change:'生命变化',disappear:'敌人消失',appear:'敌人出现'};
+      if(event.kind==='operation'){
+        const actions={DEPLOY:'部署',RETREAT:'撤退',SKILL:'开技能',SKILL_END:'主动结束',SWITCH_MODE:'切换模式'},statuses={succeeded:'成功',waiting:'等待',failed:'失败',unfinished:'未完成',not_executed:'未执行'};
+        const name=currentCase().roster?.find(item=>item.char===event.char)?.name||event.char||'';
+        const d=event.details||{},parts=[`第 ${event.index} 条 · ${name} · ${event.message||event.reason||''}`];
+        if(d.cost!==undefined)parts.push(`费用 ${fmt(d.available_cost)} / ${fmt(d.cost)}`);
+        if(d.occupied_slots!==undefined)parts.push(`席位 ${d.occupied_slots} / ${d.slot_limit}`);
+        if(d.required_sp!==undefined)parts.push(`技力 ${fmt(d.sp)} / ${fmt(d.required_sp)}`);
+        if(d.redeploy_ready_at>event.t)parts.push(`冷却至 ${fmt(d.redeploy_ready_at)} 秒`);
+        if(d.blocking_operation)parts.push(`前置操作 ${d.blocking_operation}`);
+        if(d.target_mode!==undefined)parts.push(`模式 ${d.mode_before} → ${d.target_mode}${d.unchanged?'（已处于目标模式）':''}`);
+        return [`${actions[event.action]||event.action} · ${statuses[event.status]||event.status}`,parts.join(' / ')];
+      }
+      if(event.kind==='wave_ready')return ['波次放行',`第 ${event.wave} 波 · 开始时间 ${fmt(event.startTime)} 秒`];
+      if(event.kind==='wave_timeout')return ['波次等待超时',`第 ${event.wave} 波 · 跳过分段 ${(event.skippedFragments||[]).join('、')||'无'}`];
+      if(event.kind==='mode_change')return ['模式切换',`#${event.target} / ${event.mode===0?'初始状态':'技能状态'}`];
+      if(event.kind==='skill_end'&&event.reason==='MANUAL_END')return ['主动结束技能',`#${event.target}`];
+      const labels={spawn:'敌人生成',deploy:'干员部署',retreat:'干员撤退',enemy_damage:'敌方受伤',operator_damage:'干员受伤',projectile_launch:'弹体发射',projectile_end:'弹体抵达/失效',block:'开始阻挡',unblock:'解除阻挡',skill_cast:'技能起动',skill_active:'技能生效',skill_end:'技能结束',enemy_death:'敌人击杀',operator_death:'干员倒下',leak:'敌人进门',life_change:'生命变化',disappear:'敌人消失',appear:'敌人出现'};
       let detail=`#${event.target??'—'}`;if(event.amount!==undefined)detail+=` / ${fmt(event.amount)} DMG`;if(event.cast)detail+=` / 第 ${event.cast} 次`;if(event.life!==undefined)detail+=` / LIFE ${event.life}`;if(event.tile)detail+=` / (${event.tile.join(',')})`;return [labels[event.kind]||event.kind,detail];
     }
     function activeKinds(){if(state.filters.has('all'))return null;const result=new Set();for(const group of state.filters)for(const kind of eventGroups[group]||[])result.add(kind);return result;}
-    function renderEvents(){const box=el('events'),frame=currentFrame(),allowed=activeKinds();const filtered=currentCase().events.filter(e=>!hiddenEventKinds.has(e.kind)&&(!allowed||allowed.has(e.kind)));let nearest=filtered.findIndex(e=>e.t>=frame.t);if(nearest<0)nearest=filtered.length-1;const start=Math.max(0,nearest-70),slice=filtered.slice(start,start+150);box.innerHTML=slice.map(event=>{const [title,detail]=eventLabel(event);return `<div class="event ${Math.abs(event.t-frame.t)<.04?'now':''}" data-time="${event.t}" style="color:${eventColor(event.kind)}"><time>${event.t.toFixed(2)}</time><i class="dot"></i><div><strong>${title}</strong><small>${detail}</small></div></div>`}).join('');box.querySelectorAll('.event').forEach(node=>node.onclick=()=>seekTime(Number(node.dataset.time)));const now=box.querySelector('.now');if(now)now.scrollIntoView({block:'center'});}
+    function renderEvents(){const box=el('events'),frame=currentFrame(),allowed=activeKinds();const filtered=currentCase().events.filter(e=>!hiddenEventKinds.has(e.kind)&&(!allowed||allowed.has(e.kind)));let nearest=filtered.findIndex(e=>e.t>=frame.t);if(nearest<0)nearest=filtered.length-1;const start=Math.max(0,nearest-70),slice=filtered.slice(start,start+150);box.innerHTML=slice.map(event=>{const [title,detail]=eventLabel(event);return `<div class="event ${Math.abs(event.t-frame.t)<.04?'now':''}" data-time="${event.t}" style="color:${eventColor(event.kind)}"><time>${event.t.toFixed(2)}</time><i class="dot"></i><div><strong>${escapeText(title)}</strong><small>${escapeText(detail)}</small></div></div>`}).join('');box.querySelectorAll('.event').forEach(node=>node.onclick=()=>seekTime(Number(node.dataset.time)));const now=box.querySelector('.now');if(now)now.scrollIntoView({block:'center'});}
     const attributeText = (value, suffix='') => Number.isFinite(value) ? `${fmt(value)}${suffix}` : '—';
     const reserveLabel = card => card.status==='cooldown' ? `冷却 ${Number(card.remaining).toFixed(1)}s` : card.status==='cost' ? '费用不足' : '待部署';
     function renderReserve(){
@@ -485,6 +503,8 @@
           const attrs=entity.attributes||{};
           rows=[['ID',entity.id],['坐标',`${entity.r}, ${entity.c}`],['HP',`${fmt(entity.hp)} / ${fmt(entity.max)}`],['攻击力',attributeText(attrs.atk)],['防御力',attributeText(attrs.def)],['法术抗性',attributeText(attrs.res)],['攻击间隔',attributeText(attrs.attackInterval,' s')],['阻挡',`${entity.blocked} / ${attributeText(attrs.blockCapacity)}`],['技能',entity.starting?'开启动画':entity.active?'生效中':'未开启'],['已用技能',`${entity.casts} 次`],['状态',entity.dead?'倒下':'在场']];
           renderSp(entity);
+          if(entity.canSwitchMode)rows.push(['技能模式',entity.skillMode===0?'初始状态':'技能状态']);
+          if(entity.canEndSkill)rows.push(['主动结束',entity.active?'支持':'技能未开启']);
         }
       }else{
         entity=frame.enemies.find(enemy=>enemy.id===state.selected.id);
@@ -519,7 +539,7 @@
       el('mapLegend').insertAdjacentHTML('beforeend',`<span class="chip" id="muzzleLegend" hidden style="--dot:${COLORS.cyan}" title="虚线连接单位中心与当前出手挂点"><i class="muzzle-cross"></i>出手挂点</span>`);
       el('stageLabel').textContent=`TACTICAL REPLAY / ${DATA.stage||'SIMULATION'}`;
       el('caseSelect').innerHTML=DATA.cases.map((c,i)=>`<option value="${i}">${c.label}</option>`).join('');el('caseSelect').onchange=e=>setCase(Number(e.target.value));
-      const groups=[['major','关键'],['damage','伤害'],['movement','移动'],['all','全部']];el('filters').innerHTML=groups.map(([key,label])=>`<button data-filter="${key}" class="${state.filters.has(key)?'active':''}">${label}</button>`).join('');el('filters').querySelectorAll('button').forEach(btn=>btn.onclick=()=>{const key=btn.dataset.filter;if(key==='all')state.filters=new Set(['all']);else{state.filters.delete('all');state.filters.has(key)?state.filters.delete(key):state.filters.add(key);}el('filters').querySelectorAll('button').forEach(x=>x.classList.toggle('active',state.filters.has(x.dataset.filter)));renderEvents();});
+      const groups=[['major','关键'],['operations','操作/波次'],['damage','伤害'],['movement','移动'],['all','全部']];el('filters').innerHTML=groups.map(([key,label])=>`<button data-filter="${key}" class="${state.filters.has(key)?'active':''}">${label}</button>`).join('');el('filters').querySelectorAll('button').forEach(btn=>btn.onclick=()=>{const key=btn.dataset.filter;if(key==='all')state.filters=new Set(['all']);else{state.filters.delete('all');state.filters.has(key)?state.filters.delete(key):state.filters.add(key);}el('filters').querySelectorAll('button').forEach(x=>x.classList.toggle('active',state.filters.has(x.dataset.filter)));renderEvents();});
       el('play').onclick=()=>{if(!state.playing&&state.frameIndex>=playbackEndIndex())setFrame(0);state.playing=!state.playing;state.lastStamp=performance.now();el('play').textContent=state.playing?'Ⅱ':'▶';renderHeader();};el('reset').onclick=()=>setFrame(0);el('stepBack').onclick=()=>setFrame(state.frameIndex-1);el('stepNext').onclick=()=>setFrame(state.frameIndex+1);el('timeline').oninput=e=>setFrame(Number(e.target.value));el('speed').onchange=e=>{state.speed=Number(e.target.value);renderHeader();};
       [['togglePath','path'],['toggleRange','range'],['toggleIds','ids'],['toggleMuzzle','muzzle']].forEach(([id,key])=>{el(id).setAttribute('aria-pressed',String(state[key]));el(id).onclick=()=>{if(el(id).disabled)return;state[key]=!state[key];el(id).classList.toggle('active',state[key]);el(id).setAttribute('aria-pressed',String(state[key]));if(key==='muzzle')el('muzzleLegend').hidden=!state.muzzle;drawMap();};});
       canvas.onclick=e=>{const rect=canvas.getBoundingClientRect(),g=geometry(),mx=e.clientX-rect.left,my=e.clientY-rect.top,frame=currentFrame();let best={d:Infinity,type:null,id:null};for(const enemy of frame.enemies){if(enemy.hidden)continue;const [x,y]=xy(enemy.r,enemy.c,g),d=Math.hypot(x-mx,y-my);if(d<best.d){best={d,type:'enemy',id:enemy.id};}}for(const op of frame.operators){const [x,y]=xy(op.r,op.c,g),d=Math.hypot(x-mx,y-my);if(d<best.d){best={d,type:'operator',id:op.id};}}if(best.d<g.cell*.4){state.selected={type:best.type,id:best.id};render();}};
@@ -534,7 +554,10 @@
       const loader = document.getElementById('dataLoader');
       const status = document.getElementById('dataLoaderStatus');
       const closeDataBtn = document.getElementById('closeDataBtn');
-      closeDataBtn.addEventListener('click', () => window.location.reload());
+      closeDataBtn.addEventListener('click', () => {
+        if (location.protocol !== 'file:' && location.search) history.replaceState(null, '', location.pathname);
+        window.location.reload();
+      });
       loader.hidden = false;
       document.getElementById('dataFile').addEventListener('change', async event => {
         const file = event.target.files?.[0];
@@ -556,6 +579,27 @@
           event.target.value = '';
         }
       });
+      const job = new URLSearchParams(location.search).get('job');
+      if (job && location.protocol !== 'file:') {
+        const input = document.getElementById('dataFile');
+        input.disabled = true;
+        status.textContent = '正在读取本次模拟…';
+        (async () => {
+          try {
+            const response = await fetch(`/api/replay?job=${encodeURIComponent(job)}`);
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || '无法读取回放');
+            if (!data?.cases?.length || !data.map) throw new Error('不是有效回放数据');
+            startReplay(data);
+            loader.hidden = true;
+            closeDataBtn.hidden = false;
+            closeDataBtn.title = '退出本次模拟并选择其他数据文件';
+          } catch (error) {
+            status.classList.add('data-loader-error');
+            status.textContent = `读取失败：${error.message}；也可以选择本地回放文件。`;
+          } finally { input.disabled = false; }
+        })();
+      }
     }
   </script>
 </body>

@@ -22,6 +22,8 @@ TABLES = [
     "zh_CN/gamedata/excel/range_table.json",
     "zh_CN/gamedata/excel/stage_table.json",
     "zh_CN/gamedata/excel/battle_equip_table.json",
+    "zh_CN/gamedata/excel/uniequip_table.json",
+    "zh_CN/gamedata/excel/favor_table.json",
     "zh_CN/gamedata/levels/enemydata/enemy_database.json",
     "zh_CN/gamedata/levels/levels_meta.json",
     BEHAVIOR_TABLE,

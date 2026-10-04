@@ -14,6 +14,7 @@ from typing import Any
 from . import data as D
 from .batch import summarize_results
 from .assumptions import DEFAULT_ASSUMPTIONS
+from .loadout import resolve_plan
 from .battle import (
     ENEMY_ATTACK_TIMING_FLOAT,
     ENEMY_ATTACK_TIMING_MORTAR_FRAMES,
@@ -46,13 +47,13 @@ def build_config(
     characters = D.load_characters()
     skills = D.load_skills()
     equips = D.load_battle_equips()
+    module_index = D.load_module_index()
+    favor_table = D.load_favor_table()
     for index, item in enumerate(plan, 1):
-        if item.char_id not in characters:
-            raise ValueError(f"plan item {index}: unknown char_id {item.char_id!r}")
-        if item.skill_id and item.skill_id not in skills:
-            raise ValueError(f"plan item {index}: unknown skill_id {item.skill_id!r}")
-        if item.module_id and item.module_id not in equips:
-            raise ValueError(f"plan item {index}: unknown module_id {item.module_id!r}")
+        try:
+            plan[index - 1] = resolve_plan(item, characters, skills, equips, module_index, favor_table)
+        except ValueError as error:
+            raise ValueError(f"plan item {index}: {error}") from error
     return {
         "level": D.load_level(resolve_level_file(D.load_stages(), stage)),
         "enemy_index": D.build_enemy_index(D.load_enemy_database()),
@@ -63,6 +64,8 @@ def build_config(
         "attack_timing": D.load_attack_timing(),
         "behavior_templates": D.load_behavior_templates(),
         "battle_equips": equips,
+        "module_index": module_index,
+        "favor_table": favor_table,
         "projectile_data": D.load_projectile_data(),
         "buff_abilities": D.load_enemy_buff_abilities(),
         "strict_behaviors": strict_behaviors,
@@ -110,6 +113,8 @@ def _run_once(config: dict[str, Any], seed: int):
             "enemy_attack_timing", ENEMY_ATTACK_TIMING_FLOAT
         ),
         enemy_graphics=config.get("enemy_graphics"),
+        module_index=config.get("module_index"),
+        favor_table=config.get("favor_table"),
         assumptions=config.get("assumptions"),
     )
     return battle.run()
@@ -294,6 +299,11 @@ def main(argv: list[str] | None = None) -> int:
 
 def load_plan(path: str) -> list[OperatorPlan]:
     raw = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    return parse_plan(raw)
+
+
+def parse_plan(raw: Any) -> list[OperatorPlan]:
+    """Validate file and graphical-editor plans through the same parser."""
     if not isinstance(raw, list):
         raise ValueError("plan must be a JSON array")
     allowed = {item.name for item in fields(OperatorPlan)}
@@ -305,14 +315,19 @@ def load_plan(path: str) -> list[OperatorPlan]:
         unknown = set(item) - allowed
         if unknown:
             raise ValueError(f"{prefix}: unknown fields {sorted(unknown)}")
-        for key in ("char_id", "tile", "time"):
+        for key in ("char_id", "time"):
             if key not in item:
                 raise ValueError(f"{prefix}: missing {key}")
         if not isinstance(item["char_id"], str) or not item["char_id"]:
             raise ValueError(f"{prefix}: char_id must be a nonempty string")
         action = item.get("action", "DEPLOY")
-        if not isinstance(action, str) or action.upper() not in ("DEPLOY", "RETREAT"):
-            raise ValueError(f"{prefix}: action must be DEPLOY or RETREAT")
+        if not isinstance(action, str) or action.upper() not in ("DEPLOY", "RETREAT", "SKILL", "SKILL_END", "SWITCH_MODE"):
+            raise ValueError(f"{prefix}: action must be DEPLOY, RETREAT, SKILL, SKILL_END or SWITCH_MODE")
+        item = dict(item)
+        if item.get("mode") is not None:
+            if action.upper() != "SWITCH_MODE" or type(item["mode"]) is not int or item["mode"] not in (0, 1):
+                raise ValueError(f"{prefix}: mode must be 0 or 1, only for SWITCH_MODE")
+        item.setdefault("tile", None)
         tile = item["tile"]
         if tile is not None and (
             not isinstance(tile, (list, tuple)) or len(tile) != 2
@@ -321,6 +336,13 @@ def load_plan(path: str) -> list[OperatorPlan]:
             raise ValueError(f"{prefix}: tile must be [nonnegative row, column] or null")
         if action.upper() == "DEPLOY" and tile is None:
             raise ValueError(f"{prefix}: DEPLOY requires tile")
+        if action.upper() != "DEPLOY" and tile is not None:
+            raise ValueError(f"{prefix}: {action.upper()} must omit tile or set it to null")
+        if type(item.get("auto_skill", False)) is not bool:
+            raise ValueError(f"{prefix}: auto_skill must be a boolean")
+        policy = item.get("on_failure", "WAIT")
+        if not isinstance(policy, str) or policy.upper() not in ("WAIT", "SKIP", "STOP"):
+            raise ValueError(f"{prefix}: on_failure must be WAIT, SKIP or STOP")
         for key in ("time", "trust"):
             value = item.get(key, 0)
             if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
@@ -329,13 +351,15 @@ def load_plan(path: str) -> list[OperatorPlan]:
             value = item.get(key, minimum)
             if type(value) is not int or value < minimum:
                 raise ValueError(f"{prefix}: {key} must be an integer >= {minimum}")
+        if item.get("skill_level") is not None and (type(item["skill_level"]) is not int or item["skill_level"] < 1):
+            raise ValueError(f"{prefix}: skill_level must be a positive integer or null")
         if item.get("elite") is not None and (type(item["elite"]) is not int or item["elite"] not in (0, 1, 2)):
             raise ValueError(f"{prefix}: elite must be 0, 1, 2 or null")
         if type(item.get("facing", 0)) is not int or item.get("facing", 0) not in range(4):
             raise ValueError(f"{prefix}: facing must be 0, 1, 2 or 3")
         for key in ("skill_id", "module_id"):
-            if item.get(key) is not None and not isinstance(item[key], str):
-                raise ValueError(f"{prefix}: {key} must be a string or null")
+            if item.get(key) is not None and (not isinstance(item[key], str) or not item[key]):
+                raise ValueError(f"{prefix}: {key} must be a nonempty string or null")
         plans.append(OperatorPlan(**item))
     return plans
 

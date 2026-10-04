@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ARKSIM / 战术编排</title><link rel="stylesheet" href="planner.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="planner.html">ARKSIM<span>主战斗引擎 / 战术编排</span></a>
+    <nav aria-label="编辑步骤"><button data-step="setup" class="active"><i>01</i>关卡与队伍</button><button data-step="operations"><i>02</i>操作编排</button></nav>
+    <div class="file-actions"><button id="importBtn">导入</button><button id="saveBtn">保存方案</button><button id="exportBtn">导出操作 JSON</button><a href="index.html" class="button">回放页 ↗</a></div>
+    <input id="importFile" type="file" accept=".json,application/json" hidden>
+  </header>
+  <div class="status-strip"><span id="connection">正在连接本地数据…</span><span id="saveState">未保存方案</span></div>
+  <main>
+    <section id="setupView" class="setup-layout">
+      <aside class="panel stage-panel">
+        <div class="eyebrow">01 / STAGE</div><h1>选择战场</h1><p class="subtle">从本地已导入的关卡中选择。</p>
+        <label>搜索关卡<input id="stageSearch" type="search" placeholder="关卡编号、名称或 ID"></label>
+        <label>关卡<select id="stageSelect"><option value="">请选择关卡</option></select></label>
+        <div id="stageInfo" class="stage-info">尚未选择地图</div>
+        <div class="mini-map" id="miniMap"></div>
+        <details class="run-options"><summary>模拟选项</summary>
+          <label>出怪时序<select id="spawnTiming"><option value="fast">标称时序</option><option value="client">逐帧时序</option><option value="frame_core">动作队列时序</option></select></label>
+          <label>敌方攻击计时<select id="attackTiming"><option value="float">默认浮点间隔</option><option value="mortar_frames">炮兵整数帧候选</option></select></label>
+          <label>随机种子<input id="seed" type="number" min="0" max="4294967295" step="1" value="0"></label>
+          <label class="check"><input id="enemyMuzzle" type="checkbox">模拟敌方出手挂点</label>
+          <label class="check"><input id="enemyTurning" type="checkbox">模拟敌方转身</label>
+        </details>
+      </aside>
+      <section class="panel roster-panel">
+        <div class="section-heading"><div><div class="eyebrow">02 / SQUAD</div><h1>携带队伍</h1></div><b id="squadCount">0 名</b></div>
+        <label class="search-label">添加干员<input id="operatorSearch" type="search" placeholder="输入干员名称或 ID" autocomplete="off"></label>
+        <div id="searchResults" class="search-results"></div>
+        <div id="squadList" class="squad-list"></div>
+        <div id="emptySquad" class="empty-state"><span class="crosshair">＋</span><h2>先把队伍带上</h2><p>搜索干员，设置练度和携带技能，加入队伍。</p></div>
+        <div class="setup-footer"><span class="subtle">每名干员统一一套配装，再部署时沿用。</span><button id="continueBtn" class="primary">开始编排操作 →</button></div>
+      </section>
+      <aside class="panel build-panel">
+        <div class="eyebrow">LOADOUT / 练度</div><h1 id="buildName">选择一名干员</h1><p id="buildHint" class="subtle">点击搜索结果或队伍卡片。</p>
+        <form id="buildForm" hidden>
+          <div class="field-pair"><label>精英化<select id="elite"></select></label><label>等级<input id="level" type="number" min="1" step="1" value="1"></label></div>
+          <div class="field-pair"><label>信赖 %<input id="trust" type="number" min="0" max="200" step="0.1" value="0"></label><label>潜能<select id="potential"></select></label></div>
+          <label>携带技能<select id="skill"></select></label><label>技能等级<select id="skillLevel"></select></label>
+          <label>模组<select id="module"></select></label><label>模组等级<select id="moduleLevel"></select></label>
+          <label class="check"><input id="autoSkill" type="checkbox">手动技能满技力自动释放</label>
+          <p class="subtle compact">默认手动技能等待操作；自动触发与被动技能按自身规则执行。</p>
+          <div id="buildStats" class="attribute-grid"></div>
+          <button type="submit" id="addMemberBtn" class="primary wide">加入队伍</button>
+        </form>
+      </aside>
+    </section>
+    <section id="operationsView" class="operations-layout" hidden>
+      <aside class="panel action-panel">
+        <div class="eyebrow">INPUT / 编辑操作</div><h1 id="operationTitle">添加操作</h1>
+        <form id="operationForm">
+          <label>干员<select id="opChar"></select></label><label>操作类型<select id="opAction"><option value="DEPLOY">部署</option><option value="RETREAT">撤退</option><option value="SKILL">开技能</option><option value="SKILL_END">主动结束技能</option><option value="SWITCH_MODE">切换模式</option></select></label>
+          <div class="field-pair"><label>时刻 / 秒<input id="opTime" type="number" min="0" step="any" value="0" required></label><label>逻辑帧 / 30 Hz<input id="opFrame" type="number" min="0" step="1" value="0" required></label></div>
+          <div id="deploymentFields"><label>部署位置<div id="tileReadout" class="readout">在地图上点击可部署格</div></label>
+            <label>朝向</label><div id="facingButtons" class="direction-buttons"><button type="button" data-facing="0" class="active">→ 右</button><button type="button" data-facing="1">↓ 下</button><button type="button" data-facing="2">← 左</button><button type="button" data-facing="3">↑ 上</button></div>
+          </div>
+          <label id="modeField" hidden>目标模式<select id="opMode"><option value="">切到另一状态</option><option value="0">初始状态</option><option value="1">技能状态</option></select></label>
+          <label>条件不满足时<select id="failure"><option value="WAIT">等待并阻塞后续操作</option><option value="SKIP">跳过这条操作</option><option value="STOP">停止模拟</option></select></label>
+          <p id="actionHint" class="subtle compact"></p>
+          <div class="form-buttons"><button type="submit" id="addOperationBtn" class="primary">＋ 加入操作</button><button type="button" id="cancelEditBtn" hidden>取消编辑</button></div>
+        </form>
+        <div class="carried-heading">携带干员 <button id="backToSquadBtn">修改队伍</button></div><div id="carriedList" class="carried-list"></div>
+      </aside>
+      <section class="map-column">
+        <div class="map-heading"><div><div class="eyebrow">FIELD / 计划示意</div><h1 id="mapName">地图</h1></div><span id="mapClock">0.000 秒 · f0</span></div>
+        <div class="legend"><span class="blue">■ 蓝门</span><span class="red">■ 红门</span><span class="amber">◆ 干员</span><span class="cyan">＋ 可部署</span><span class="portal">◌ 传送门</span></div>
+        <div id="mapBoard" class="map-board"></div>
+        <div class="map-controls"><label>查看计划时刻<input id="previewTime" type="range" min="0" max="120" step="0.0333333333333333" value="0"></label><button id="followTimeBtn">定位到输入时刻</button></div>
+        <p class="map-note">地图显示截至所选时刻的计划部署，不预测费用、阻挡、死亡或操作成功；运行后在回放页查看实际结果。</p>
+      </section>
+      <aside class="panel timeline-panel">
+        <div class="section-heading"><div><div class="eyebrow">TIMELINE / 操作序列</div><h1>行动计划</h1></div><b id="operationCount">0 条</b></div>
+        <p class="subtle compact">按时间执行。同一时刻按列表顺序；箭头调整同刻顺序。</p>
+        <div id="operationList" class="operation-list"></div>
+        <div class="run-footer"><button id="validateBtn">检查计划</button><button id="simulateBtn" class="primary">运行模拟 ↗</button><p id="runStatus" class="subtle compact">模拟完成后可打开原回放页。</p><a id="openReplay" class="button wide" target="_blank" rel="noopener" hidden>打开本次回放 →</a></div>
+      </aside>
+    </section>
+  </main>
+  <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+  <div id="offline" class="offline" hidden><h1>启动本地编辑器</h1><p>请在项目目录运行下面的命令，再打开提示的网址。</p><code>python tools/editor.py</code><p id="offlineReason"></p><button onclick="location.reload()">重新连接</button></div>
+  <script src="planner.js"></script>
+</body>
+</html>

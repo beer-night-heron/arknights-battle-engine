@@ -1,6 +1,6 @@
 """Frame-based spawn scheduling ported from SusieGlitter's SpawnCore.
 
-This implements the static action-queue timing used by the H7-2 comparison.
+This implements static action-queue timing for the frame_core scheduling mode.
 Runtime wave-clear gates remain optional inputs because they are not part of
 the stage data itself.
 """
@@ -236,12 +236,15 @@ def build_spawn_frame_schedule(
     enabled_hidden_groups: set[str] | None = None,
     wave_gates: dict[int, int] | None = None,
     wave_clear_frames: list[int | None] | None = None,
+    fragment_timings: list[dict[str, Any]] | None = None,
+    truncate_on_timeout: bool = True,
 ) -> list[dict[str, Any]]:
     """Return client-style action rows with absolute logic frames."""
     rows: list[dict[str, Any]] = []
     cursor = 0
     last_spawn_frame: int | None = None
     for wave_index, wave in enumerate(waves or []):
+        timing_begin = len(fragment_timings) if fragment_timings is not None else 0
         if wave_index:
             candidates = [cursor]
             if last_spawn_frame is not None:
@@ -255,7 +258,7 @@ def build_spawn_frame_schedule(
             cursor = max(cursor, int(requested_gate))
         wave_start = cursor + _frames(wave.get("preDelay"))
         cursor = wave_start
-        for fragment_index, fragment in enumerate(wave.get("fragments") or []):
+        for fragment_index, fragment in enumerate(wave.get("fragments") or [{}]):
             process_start = cursor
             items = _build_fragment_queue(
                 fragment,
@@ -303,9 +306,16 @@ def build_spawn_frame_schedule(
                     last_spawn_frame = row["actual_frame"]
             completion = (last_actual + FRAGMENT_HANDOFF_FRAMES
                           if drained else process_start)
+            if fragment_timings is not None:
+                fragment_timings.append({"wave": wave_index, "fragment": fragment_index,
+                                         "wave_start": wave_start, "completion": completion})
             max_wait = _number(wave.get("maxTimeWaitingForNextWave"), -1.0)
-            if max_wait > 0 and completion - wave_start > _frames(max_wait):
+            if truncate_on_timeout and max_wait > 0 and completion - wave_start > _frames(max_wait):
                 break
             cursor = completion
         cursor += _frames(wave.get("postDelay"))
+        if fragment_timings is not None:
+            for timing in fragment_timings[timing_begin:]:
+                timing["last"] = timing is fragment_timings[-1]
+                timing["wave_end"] = cursor
     return rows

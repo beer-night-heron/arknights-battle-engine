@@ -41,8 +41,15 @@ def main() -> int:
                 if value.get("levelId") and (Path(args.data_dir) / resolve_level_file(stages, key)).is_file()
             ]
         else:
+            module_index = D.load_module_index().get("equipDict", {})
+            modules = D.load_battle_equips()
             rows = [
                 {"id": key, "name": value.get("name"), "position": value.get("position"),
+                 "maxLevels": [phase.get("maxLevel") for phase in value.get("phases", [])],
+                 "maxPotentialRank": value.get("maxPotentialLevel", 0),
+                 "modules": [{"id": mid, "levels": [p.get("equipLevel") for p in modules[mid].get("phases", [])],
+                              "unlockPhase": metadata.get("unlockEvolvePhase"), "unlockLevel": metadata.get("unlockLevel")}
+                             for mid, metadata in module_index.items() if metadata.get("charId") == key and mid in modules],
                  "skills": [item.get("skillId") for item in value.get("skills", [])]}
                 for key, value in D.load_characters().items()
                 if key.startswith("char_")

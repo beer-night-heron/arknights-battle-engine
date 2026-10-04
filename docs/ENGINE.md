@@ -8,6 +8,11 @@
 | --- | --- |
 | `battle.py` | 战斗状态与阶段协调：部署、费用、出怪、实体更新、移动、阻挡、攻击事件、技能和结束判定 |
 | `data.py` | 读取本地 JSON，索引敌人，计算等级、信赖、潜能和模组属性 |
+| `loadout.py` | 验证配装范围、归属与解锁条件，解析技能等级，选择当前配置下的特性和天赋参数 |
+| `operations.py` | 操作结果、原因说明和去重后的状态转换记录 |
+| `skill_controls.py` | 从技能的明确操作声明识别主动结束和两状态切换权限 |
+| `editor.py` | 本地编辑数据目录、配装校验及队伍方案到普通计划的转换；不替代战斗计算 |
+| `waves.py` | 根据战斗中的敌人离场状态放行分段与波次，处理等待超时 |
 | `mechanics.py` | 伤害包、物理/法术/真实伤害、状态、元素效果及目标排序规则 |
 | `targeting.py` | 帧周期计时器、目标筛选与缓存生命周期 |
 | `buffs.py` | Buff 定义、实例、叠加、属性修正和生命周期 |
@@ -46,12 +51,13 @@ print(result.win, result.enemies_killed, result.enemies_leaked)
 
 | 字段 | 含义 |
 | --- | --- |
-| `win`、`reason` | 是否全清，以及 `all_clear` / `life_points_depleted` / `timeout` |
+| `win`、`reason` | 是否全清，以及 `all_clear` / `life_points_depleted` / `timeout` / `operation_failed` |
 | `time` | 结束时的模拟秒数 |
 | `life_points`、`max_life_points` | 剩余与初始生命 |
 | `enemies_spawned`、`enemies_killed`、`enemies_leaked` | 出场、击杀、漏怪计数 |
 | `operators_deployed` | 结束时仍在场的存活干员数，并非部署动作总数 |
 | `operator_metrics` | 各次部署的属性、伤害与存活统计 |
+| `operation_results` | 全部计划操作的状态、时间、失败原因和上下文 |
 | `seed`、`random_draws` | 种子与实际随机抽取次数 |
 | `behavior_warnings`、`unsupported_behavior_nodes` | 行为模板未覆盖情况 |
 | `mechanic_warnings`、`unsupported_mechanics` | 已能识别的机制缺口 |

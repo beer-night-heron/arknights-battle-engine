@@ -2,7 +2,7 @@
 
 基于战斗机制构建的 Python 模拟器。用 JSON 编写部署计划，计算战斗结果，再通过 HTML 页面查看地图、单位状态与事件随时间的变化。
 
-当前以 `Battle` 为唯一主战斗引擎。已实现移动、阻挡、索敌、攻击、部分技能与 Buff、伤害及弹体流程；角色和关卡机制尚未全部覆盖。具体范围见 [机制支持与缺口](docs/MECHANICS.md)。
+当前以 `Battle` 为唯一主战斗引擎。已实现部署/撤退/开技能/主动结束/模式切换计划与操作反馈、普通动态波次、移动、阻挡、索敌、攻击、部分技能与 Buff、伤害及弹体流程；角色和关卡机制尚未全部覆盖。具体范围见 [机制支持与缺口](docs/MECHANICS.md)。
 
 ## 开始使用
 
@@ -27,6 +27,14 @@
 
 每次成功生成都会更新 `local/最新模拟/`，上一版完整保存在 `local/模拟历史/`。查看页面是固定文件，只需读取新的 JSON。逐帧播放、单位详情、文件区别和批量运行说明见 [使用指南](docs/USAGE.md)。
 
+也可以用图形界面选择关卡、配置携带干员练度，再点击地图编写时间操作：
+
+```powershell
+python tools/editor.py
+```
+
+打开 `http://127.0.0.1:8873/planner.html`，支持保存方案、导入旧计划、导出操作 JSON 和运行后打开原回放页。详见 [图形化操作编辑](docs/EDITOR.md)。
+
 ## 只计算结果
 
 ```powershell
@@ -44,7 +52,8 @@ python -m arksim.cli --stage "关卡ID" --plan "local/plans/my-plan.json" --runs
 | `tools/simulate.py` | 执行计划并生成模拟回放，维护最新与历史结果 |
 | `tools/list_data.py` | 查询本地关卡、干员配置和地图坐标 |
 | `tools/export_data.py` | 从本地数据 Git 仓库导入基础表格和关卡 |
-| `viewer/` | 固定的 HTML 回放读取页 |
+| `tools/editor.py` | 本地计划编辑服务、配装校验与模拟入口 |
+| `viewer/` | 原 HTML 回放读取页与图形化计划编辑页 |
 | `examples/` | 通用计划模板 |
 | `docs/` | 使用、计划字段、数据准备、引擎组成与机制缺口 |
 | `local/` | 本地数据、个人计划、模拟输出及归档；不上传 GitHub |

@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .loadout import module_phase, validate_attributes
+
 
 DATA_DIR: Path | None = None
 
@@ -88,6 +90,20 @@ def load_enemy_buff_abilities() -> dict[str, Any]:
 def load_battle_equips() -> dict[str, Any]:
     try:
         return _load("battle_equip_table.json")
+    except FileNotFoundError:
+        return {}
+
+
+def load_module_index() -> dict[str, Any]:
+    try:
+        return _load("uniequip_table.json")
+    except FileNotFoundError:
+        return {}
+
+
+def load_favor_table() -> dict[str, Any]:
+    try:
+        return _load("favor_table.json")
     except FileNotFoundError:
         return {}
 
@@ -195,15 +211,10 @@ def char_attributes(
 
     Follows the game's level-to-stat model: each elite phase has a
     `maxLevel` cap and a set of attribute keyframes; stats are linearly
-    interpolated between keyframes and clamped to the phase's level range.
+    interpolated between keyframes after validating the phase's level range.
     """
-    phases = char.get("phases", [])
-    if not phases:
-        return {}
-    if elite is None:
-        phase = max(phases, key=lambda p: p.get("maxLevel", 0))
-    else:
-        phase = phases[max(0, min(elite, len(phases) - 1))]
+    elite = validate_attributes(char, level, elite, trust, potential_rank)
+    phase = char["phases"][elite]
 
     out = _interpolate_attributes(
         phase.get("attributesKeyFrames", []), level, phase.get("maxLevel", 1)
@@ -236,23 +247,10 @@ def char_attributes(
             elif formula == "MULTIPLIER":
                 out[key] = float(out.get(key, 0.0)) * (1.0 + value)
 
-    if module is not None and module_level > 0:
-        phases = module.get("phases", [])
-        chosen = next(
-            (
-                item
-                for item in phases
-                if int(item.get("equipLevel", 0)) == int(module_level)
-            ),
-            None,
-        )
-        if chosen is None and phases:
-            chosen = min(
-                phases,
-                key=lambda item: abs(
-                    int(item.get("equipLevel", 0)) - int(module_level)
-                ),
-            )
+    if module is None and module_level != 0:
+        raise ValueError("module_level requires module data")
+    if module is not None:
+        chosen = module_phase(module, module_level)
         for item in (chosen or {}).get("attributeBlackboard", []):
             key = _ATTRIBUTE_KEY.get(str(item.get("key", "")).upper())
             if key is not None:

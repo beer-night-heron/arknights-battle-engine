@@ -8,7 +8,7 @@ Core rules follow PRTS 游戏数据基础 / 战斗机制:
     radius; flying motion bypasses ordinary ground blockers
   - melee attack range is the tile(s) in front of the operator's facing
   - SP types, charge capacity, ammo duration and explicit interruption hooks;
-    MANUAL skills still auto-cast as a v0 plan compatibility approximation
+    MANUAL skills wait for a plan operation unless auto_skill is enabled
 
 Skill behaviour trees (`battle/buff_template_data.json`) are dispatched through
 an incremental interpreter. Unsupported events/nodes remain observable in the
@@ -25,6 +25,7 @@ from functools import cmp_to_key, lru_cache
 from typing import Any
 
 from . import data as D
+from .skill_controls import SkillControls, skill_controls
 from .assumptions import (
     ASSUMPTION_NOTES,
     DEFAULT_ASSUMPTIONS,
@@ -61,6 +62,9 @@ from .graphics import (
     EnemyGraphicProfile, FacingRuntime, ProjectileMotionProfile, map_offset,
 )
 from .targeting import FramePeriodicTicker, TargetSelectorRuntime
+from .loadout import module_phase, resolve_plan, select_abilities
+from .operations import OperationAttempt, OperationLog
+from .waves import DynamicWaveScheduler, SpawnFragment
 
 
 UNBALANCE_MIN_DURATION = 0.1
@@ -90,10 +94,10 @@ PULL_FORCE_BY_FORCE_LEVEL = {
 }
 
 CLIENT_LOGIC_RATE = 30
-# The H7-2 client capture reports this fixed-frame duration on every sample.
+# Quantized fixed-frame duration used by the compatible timer model.
 CLIENT_FIXED_TIMER_STEP = 0.03333330154418945
 CLIENT_FP_SCALE = 1 << 32
-# MathUtil.LessEqual uses the resident Q32.32 equality tolerance.
+# Equality tolerance for the Q32.32 timer model.
 CLIENT_FP_EPSILON_RAW = 42950
 SPAWN_TIMING_FAST = "fast"
 SPAWN_TIMING_CLIENT = "client"
@@ -153,6 +157,12 @@ class SpawnEvent:
     nominal_time: float = 0.0
     scheduler_delay_frames: int = 0
     logic_frame: int | None = None
+    wave_index: int = 0
+    fragment_index: int = 0
+    dont_block_wave: bool = False
+    block_fragment: bool = False
+    dispatched: bool = False
+    cancelled: bool = False
 
 
 @dataclass(frozen=True)
@@ -160,6 +170,7 @@ class _SpawnWorkItem:
     nominal_time: float
     order: int
     kind: str
+    source_action: dict[str, Any] | None = field(default=None, compare=False, kw_only=True)
     enemy_key: str = ""
     route_index: int = 0
     action_count: int = 1
@@ -192,9 +203,14 @@ class OperatorPlan:
     module_id: str | None = None
     module_level: int = 0
     action: str = "DEPLOY"
+    skill_level: int | None = None
+    auto_skill: bool = False
+    on_failure: str = "WAIT"
+    mode: int | None = None
 
     def __post_init__(self) -> None:
         self.action = self.action.upper()
+        self.on_failure = self.on_failure.upper()
         if self.tile is not None:
             self.tile = (int(self.tile[0]), int(self.tile[1]))
 
@@ -218,6 +234,7 @@ class Result:
     random_draws: int = 0
     assumptions: list[str] = field(default_factory=list)
     operator_metrics: list[dict[str, Any]] = field(default_factory=list)
+    operation_results: list[dict[str, Any]] = field(default_factory=list)
     spawn_timing: str = SPAWN_TIMING_FAST
     enemy_attack_timing: str = ENEMY_ATTACK_TIMING_FLOAT
 
@@ -229,6 +246,7 @@ class _ScheduledHighlandEffect:
     tile: tuple[int, int]
     amount: float
     sp_recovery_locked: bool = False
+    sluggish_duration: float = 0.5
 
 
 @dataclass
@@ -254,6 +272,10 @@ class _Enemy:
     can_normal_attack: bool = True
     unblockable: bool = False
     wave_start_time: float = 0.0
+    wave_index: int = 0
+    fragment_index: int = 0
+    dont_block_wave: bool = False
+    block_fragment: bool = False
     attack_duration: float = 0.0
     attack_hit_time: float = 0.0
     wait_for_attack_event: bool = False
@@ -442,6 +464,9 @@ class _Operator:
     potential_rank: int = 0
     module_id: str | None = None
     module_level: int = 0
+    plan_profile: int | None = None
+    trait_blackboard: dict[str, Any] = field(default_factory=dict)
+    talent_blackboards: dict[str, dict[str, Any]] = field(default_factory=dict)
     base_range_cells: set[tuple[int, int]] = field(default_factory=set)
     deployed_at: float = 0.0
     death_time: float | None = None
@@ -458,6 +483,9 @@ class _Operator:
     sp_recovery_remaining_raw: int = CLIENT_FP_SCALE
     auto: bool = True
     skill_type: str = ""
+    skill_controls: SkillControls = field(default_factory=SkillControls)
+    skill_mode: int = 0
+    skill_mode_target: int | None = None
     skill_duration_type: str = "NONE"
     skill_active: bool = False
     skill_startup_until: float = -1.0
@@ -535,6 +563,8 @@ class Battle:
         spawn_timing: str = SPAWN_TIMING_FAST,
         enemy_attack_timing: str = ENEMY_ATTACK_TIMING_FLOAT,
         enemy_graphics: dict[str, Any] | None = None,
+        module_index: dict[str, Any] | None = None,
+        favor_table: dict[str, Any] | None = None,
     ) -> None:
         self.level = level
         self.enemy_index = enemy_index
@@ -560,7 +590,20 @@ class Battle:
         }
         self.enemy_projectiles = self.projectile_data.get("enemies", {})
         self.operator_projectiles = self.projectile_data.get("operators", {})
-        self.plan = sorted(plan, key=lambda p: p.time)
+        self.module_index = (D.load_module_index() if module_index is None and D.DATA_DIR is not None
+                             else module_index or {})
+        self.favor_table = (D.load_favor_table() if favor_table is None and D.DATA_DIR is not None
+                            else favor_table or {})
+        resolved_plan = []
+        for index, item in enumerate(plan, 1):
+            try:
+                resolved_plan.append(resolve_plan(item, self.characters, self.skills,
+                                                   self.battle_equips, self.module_index, self.favor_table))
+            except ValueError as error:
+                raise ValueError(f"plan item {index}: {error}") from error
+        self.plan = sorted(resolved_plan, key=lambda p: p.time)
+        source_indices = {id(item): index for index, item in enumerate(resolved_plan, 1)}
+        self.operation_log = OperationLog(self.plan, [source_indices[id(item)] for item in self.plan])
         self.dt = dt
         self.seed = int(seed)
         self.rng = DeterministicRng(self.seed)
@@ -1009,11 +1052,52 @@ class Battle:
         return normalized
 
     def _build_spawn_events(self, waves: list[dict[str, Any]]) -> list[SpawnEvent]:
+        self._spawn_fragments: list[SpawnFragment] = []
         if self.spawn_timing == SPAWN_TIMING_FRAME_CORE:
-            return self._build_frame_core_spawn_events(waves)
-        if self.spawn_timing == SPAWN_TIMING_CLIENT:
-            return self._build_client_spawn_events(waves)
-        return self._build_fast_spawn_events(waves)
+            events = self._build_frame_core_spawn_events(waves)
+        elif self.spawn_timing == SPAWN_TIMING_CLIENT:
+            events = self._build_client_spawn_events(waves)
+        else:
+            events = self._build_fast_spawn_events(waves)
+        self.wave_scheduler = DynamicWaveScheduler(self._spawn_fragments)
+        if (len(waves) > 1 or any(e.block_fragment for e in events)
+                or any(float(w.get("maxTimeWaitingForNextWave", -1) or -1) > 0 for w in waves)):
+            self.mechanic_diagnostics.setdefault("DYNAMIC_WAVE_HANDOFF_CANDIDATE", 1)
+        if self.level.get("branches"):
+            self.mechanic_diagnostics.setdefault("SPAWN_BRANCH_EXECUTOR", 1)
+        for wave in waves:
+            for fragment in wave.get("fragments", []):
+                for action in fragment.get("actions", []):
+                    kind = str(action.get("actionType", "")).upper()
+                    if kind not in ("SPAWN", "PREVIEW_CURSOR", "DISPLAY_ENEMY_INFO", "EMPTY"):
+                        self.mechanic_diagnostics.setdefault(f"SPAWN_ACTION_EXECUTOR:{kind or 'UNKNOWN'}", 1)
+                    if action.get("randomSpawnGroupKey") or action.get("hiddenGroup"):
+                        self.mechanic_diagnostics.setdefault("SPAWN_CONDITIONAL_GROUP", 1)
+                    if (action.get("managedByScheduler") is False or action.get("forceBlockWaveInBranch")
+                            or action.get("notCountInTotal") or action.get("isUnharmfulAndAlwaysCountAsKilled")):
+                        self.mechanic_diagnostics.setdefault("SPAWN_SPECIAL_ACCOUNTING", 1)
+        return events
+
+    @staticmethod
+    def _spawn_flags(wave: int, fragment: int, action: dict) -> dict[str, Any]:
+        return {"wave_index": wave, "fragment_index": fragment,
+                "dont_block_wave": bool(action.get("dontBlockWave", False)),
+                "block_fragment": bool(action.get("blockFragment", False))}
+
+    def _record_spawn_fragment(self, wave_index: int, fragment_index: int, end: float,
+                               wave_start: float, wave: dict, events: list[SpawnEvent]) -> None:
+        self._spawn_fragments.append(SpawnFragment(
+            wave_index, fragment_index, end, wave_start,
+            post_delay=float(wave.get("postDelay", 0) or 0),
+            max_wait=float(wave.get("maxTimeWaitingForNextWave", -1) or -1),
+            events=events,
+        ))
+
+    def _finish_spawn_wave(self, begin: int, end: float) -> None:
+        if begin < len(self._spawn_fragments):
+            self._spawn_fragments[-1].last = True
+            for group in self._spawn_fragments[begin:]:
+                group.wave_end_time = end
 
     def _build_frame_core_spawn_events(
         self, waves: list[dict[str, Any]]
@@ -1021,7 +1105,8 @@ class Battle:
         """Use the published SpawnCore queue arithmetic for static wave data."""
         from .spawn_core import build_spawn_frame_schedule
 
-        rows = build_spawn_frame_schedule(waves)
+        timings: list[dict[str, Any]] = []
+        rows = build_spawn_frame_schedule(waves, fragment_timings=timings, truncate_on_timeout=False)
         events = []
         for row in rows:
             if row["actionType"] != "SPAWN":
@@ -1036,24 +1121,29 @@ class Battle:
                 nominal_time=row["ideal_frame"] / CLIENT_LOGIC_RATE,
                 scheduler_delay_frames=frame - int(row["ideal_frame"]),
                 logic_frame=frame + 1,
+                **self._spawn_flags(row["wave"], row["fragment"], row),
             ))
-        if len(waves) > 1:
-            self.mechanic_diagnostics.setdefault(
-                "SPAWN_TIMING_FRAME_CORE_STATIC_WAVE_GATE", 1
-            )
+        for timing in timings:
+            wi, fi = timing["wave"], timing["fragment"]
+            self._record_spawn_fragment(wi, fi, (timing["completion"] + 1) / CLIENT_LOGIC_RATE,
+                                        (timing["wave_start"] + 1) / CLIENT_LOGIC_RATE, waves[wi],
+                                        [e for e in events if e.wave_index == wi and e.fragment_index == fi])
+            self._spawn_fragments[-1].last = timing["last"]
+            self._spawn_fragments[-1].wave_end_time = (timing["wave_end"] + 1) / CLIENT_LOGIC_RATE
         self.used_assumptions.add("SPAWN_CORE_FRAME_SCHEDULER")
         return events
 
-    @staticmethod
     def _build_fast_spawn_events(
-        waves: list[dict[str, Any]],
+        self, waves: list[dict[str, Any]],
     ) -> list[SpawnEvent]:
         events: list[SpawnEvent] = []
         t = 0.0
-        for wave in waves:
+        for wi, wave in enumerate(waves):
+            begin = len(self._spawn_fragments)
             t += wave.get("preDelay", 0.0) or 0.0
             wave_start_time = t
-            for frag in wave.get("fragments", []):
+            for fi, frag in enumerate(wave.get("fragments", []) or [{}]):
+                event_begin = len(events)
                 t += frag.get("preDelay", 0.0) or 0.0
                 frag_end = t
                 for action in Battle._client_sorted_actions(
@@ -1073,13 +1163,16 @@ class Battle:
                                 route_index=route_index,
                                 wave_start_time=wave_start_time,
                                 nominal_time=t + pre_delay + k * interval,
+                                **self._spawn_flags(wi, fi, action),
                             )
                         )
                     frag_end = max(
                         frag_end, t + pre_delay + (count - 1) * interval
                     )
                 t = frag_end
+                self._record_spawn_fragment(wi, fi, t, wave_start_time, wave, events[event_begin:])
             t += wave.get("postDelay", 0.0) or 0.0
+            self._finish_spawn_wave(begin, t)
         events.sort(key=lambda e: e.time)
         return events
 
@@ -1089,9 +1182,9 @@ class Battle:
     ) -> list[dict[str, Any]]:
         """Reproduce the client's unstable timeOffset quicksort.
 
-        The IL2CPP Scheduler sorts ActionItem only by timeOffset.  Its legacy
-        Hoare partition swaps equal elements, which is observable for H7-2's
-        five zero-delay shieldguards as 1,2,3,4,5 -> 4,5,3,1,2.
+        The compatible scheduler sorts actions only by their time offsets.
+        Hoare partition swaps equal elements, so equal delays do not preserve
+        input order.  This remains part of the candidate scheduling model.
         """
         ordered = list(actions)
 
@@ -1128,10 +1221,10 @@ class Battle:
     ) -> list[SpawnEvent]:
         """Build the observed client-equivalent sequential coroutine timeline.
 
-        H7-2 and 7-16 frame captures show one accumulated logic frame for each
-        entered fragment, completed spawn, preview cursor, and calibrated
-        display action.  The costs are folded into final spawn frames here so
-        the hot battle loop stays flat.
+        The candidate model adds one accumulated logic frame for each entered
+        fragment, completed spawn, preview cursor, and calibrated display
+        action.  Costs are folded into final spawn frames here so the hot
+        battle loop stays flat.
 
         Auto-preview cursor offsets are relative to the associated spawn time;
         they may therefore precede the nominal start of their Fragment.
@@ -1140,19 +1233,16 @@ class Battle:
         nominal_cursor = 0.0
         completed_work_frames = 0
 
-        if len(waves) > 1:
-            self.mechanic_diagnostics.setdefault(
-                "SPAWN_TIMING:STATIC_WAVE_TRANSITION", 1
-            )
-
-        for wave in waves:
+        for wi, wave in enumerate(waves):
+            begin = len(self._spawn_fragments)
             nominal_cursor += float(wave.get("preDelay", 0.0) or 0.0)
             wave_start_frame = (
                 self._client_logic_frame(nominal_cursor) + completed_work_frames
             )
             wave_start_time = wave_start_frame / CLIENT_LOGIC_RATE
 
-            for fragment in wave.get("fragments", []):
+            for fi, fragment in enumerate(wave.get("fragments", []) or [{}]):
+                event_begin = len(events)
                 nominal_cursor += float(fragment.get("preDelay", 0.0) or 0.0)
                 fragment_start = nominal_cursor
                 fragment_end = fragment_start
@@ -1204,6 +1294,7 @@ class Battle:
                                     str(action.get("key", "")),
                                     route_index,
                                     count,
+                                    source_action=action,
                                 )
                             )
                             order += 1
@@ -1232,9 +1323,9 @@ class Battle:
                         )
 
                 # DISPLAY_ENEMY_INFO is an executor/coroutine of its own.  The
-                # H7-2 same-time fit places its completion after the regular
-                # work at that offset, while its autoPreviewRoute flag does
-                # not provide evidence for two additional cursor items.
+                # candidate schedule places its completion after regular work
+                # at that offset.  Its autoPreviewRoute flag does not create
+                # two additional cursor items in this model.
                 for display_time in deferred_display_times:
                     work_items.append(
                         _SpawnWorkItem(
@@ -1283,13 +1374,19 @@ class Battle:
                                     completed_work_frames + preview_after
                                 ),
                                 logic_frame=logic_frame,
+                                **self._spawn_flags(wi, fi, item.source_action or {}),
                             )
                         )
                     completed_work_frames += 1
 
                 nominal_cursor = fragment_end
+                self._record_spawn_fragment(
+                    wi, fi, (self._client_logic_frame(nominal_cursor) + completed_work_frames) / CLIENT_LOGIC_RATE,
+                    wave_start_time, wave, events[event_begin:],
+                )
 
             nominal_cursor += float(wave.get("postDelay", 0.0) or 0.0)
+            self._finish_spawn_wave(begin, (self._client_logic_frame(nominal_cursor) + completed_work_frames) / CLIENT_LOGIC_RATE)
 
         events.sort(
             key=lambda event: (
@@ -1740,26 +1837,57 @@ class Battle:
             deployed_cost=deployed_cost,
             respawn_time=float(attrs.get("respawnTime", 70.0)),
         )
+        op.plan_profile = next((index for index, item in enumerate(self.plan) if item is plan), None)
+        equipped_phase = module_phase(module, plan.module_level) if module is not None else None
+        trait, talents, deferred = select_abilities(
+            char, plan.elite, plan.level, plan.potential_rank, equipped_phase,
+        )
+        op.trait_blackboard = self._blackboard(trait) if trait is not None else {}
+        if op.trait_blackboard and op.subprofession != "hammer":
+            self.mechanic_diagnostics[f"OPERATOR_TRAIT:{op.char_id}"] += 1
+        for index, candidate in talents.items():
+            prefab = str(candidate.get("prefabKey") or index)
+            board = self._blackboard(candidate)
+            op.talent_blackboards[prefab] = board
+            if (board or prefab not in ("#", "")) and not (op.char_id == "char_1051_headb2" and prefab in ("1", "2")):
+                self.mechanic_diagnostics[f"OPERATOR_TALENT:{op.char_id}:{index}"] += 1
+            elif op.char_id == "char_1051_headb2" and prefab == "2" and plan.skill_id:
+                # Only the S2 self bonus is executed; the team aura is not.
+                if plan.skill_id != "skchr_headb2_2" or any(
+                    item.action == "DEPLOY" and item.char_id != op.char_id for item in self.plan
+                ):
+                    self.mechanic_diagnostics[f"OPERATOR_TALENT_SCOPE:{op.char_id}:{index}"] += 1
+        for part in deferred:
+            self.mechanic_diagnostics[f"OPERATOR_MODULE_CONDITION:{plan.module_id}:{part}"] += 1
+        if equipped_phase and not (op.char_id == "char_1051_headb2" and plan.module_id == "uniequip_002_headb2"):
+            if equipped_phase.get("parts"):
+                self.mechanic_diagnostics[f"OPERATOR_MODULE_EFFECT:{plan.module_id}"] += 1
         if plan.skill_id:
-            self._attach_skill(op, plan.skill_id)
+            self._attach_skill(op, plan.skill_id, plan.skill_level)
+            op.auto = op.skill_type == "AUTO" or plan.auto_skill
         self.initialize_operator_target_selector(
             op, first_search_frame=self.frame_index + 32
         )
         return op
 
-    def _attach_skill(self, op: _Operator, skill_id: str) -> None:
+    def _attach_skill(self, op: _Operator, skill_id: str, skill_level: int | None = None) -> None:
         skill = self.skills.get(skill_id)
         if not skill:
             return
         levels = skill.get("levels", [])
         if not levels:
             return
-        level = levels[-1]
+        if skill_level is None:
+            skill_level = len(levels)
+        if type(skill_level) is not int or not 1 <= skill_level <= len(levels):
+            raise ValueError(f"skill_level must be 1..{len(levels)}")
+        level = levels[skill_level - 1]
         sp_data = level.get("spData", {})
         sp_type = str(sp_data.get("spType", ""))
         sp_cost = float(sp_data.get("spCost", 0) or 0)
         max_charge_time = max(int(sp_data.get("maxChargeTime", 1) or 1), 1)
         op.skill = level
+        op.skill_controls = skill_controls(level)
         op.sp_cost = sp_cost
         op.max_charge_time = max_charge_time
         op.sp_max = sp_cost * max_charge_time
@@ -1767,7 +1895,7 @@ class Battle:
         op.sp_increment = float(sp_data.get("increment", 1.0) or 1.0)
         op.sp_recovery_remaining_raw = CLIENT_FP_SCALE
         op.sp_type = sp_type
-        op.auto = True  # v0: manual skills also auto-cast when full
+        op.auto = False
         op.skill_type = str(level.get("skillType", ""))
         op.skill_duration_type = str(level.get("durationType", "NONE"))
         op.skill_blackboard = self._blackboard(level)
@@ -1841,6 +1969,8 @@ class Battle:
             if status == "wait":
                 break
             self.plan_index += 1
+            if self.end_reason:
+                return
 
         if self._uses_entity_update_order():
             self.used_assumptions.add("ENTITY_UPDATE_ORDER_BY_ALLOCATION")
@@ -1904,22 +2034,38 @@ class Battle:
         )
 
     def _spawn_due_enemies(self) -> None:
-        while (
-            self.spawn_index < len(self.spawn_events)
-            and self._spawn_event_is_due(self.spawn_events[self.spawn_index])
-        ):
+        for enemy in self.enemies:
+            if enemy.dead or enemy.leaked:
+                self.wave_scheduler.departed(enemy, self.time)
+        while True:
+            self.wave_scheduler.advance(self.time, self.frame_index, self.dt, self.enemies)
+            if self.spawn_index >= len(self.spawn_events):
+                break
             ev = self.spawn_events[self.spawn_index]
-            self.spawn_index += 1
-            if ev.route_index >= len(self.paths):
+            if ev.cancelled:
+                ev.dispatched = True
+                self.spawn_index += 1
                 continue
-            self.enemies.append(
-                self._make_enemy(
-                    ev.enemy_key,
-                    ev.route_index,
-                    wave_start_time=ev.wave_start_time,
-                )
+            if not self.wave_scheduler.allowed(ev) or not self._spawn_event_is_due(ev):
+                break
+            self.spawn_index += 1
+            ev.dispatched = True
+            if not 0 <= ev.route_index < len(self.paths):
+                self.mechanic_diagnostics.setdefault("SPAWN_INVALID_ROUTE", 1)
+                continue
+            enemy = self._make_enemy(
+                ev.enemy_key, ev.route_index, wave_start_time=ev.wave_start_time,
             )
+            enemy.wave_index = ev.wave_index
+            enemy.fragment_index = ev.fragment_index
+            enemy.dont_block_wave = ev.dont_block_wave
+            enemy.block_fragment = ev.block_fragment
+            self.enemies.append(enemy)
+            self.wave_scheduler.last_births[ev.wave_index] = self.time
             self.enemies_spawned += 1
+
+    def all_spawns_finished(self) -> bool:
+        return self.spawn_index >= len(self.spawn_events) and self.wave_scheduler.finished
 
     def _tick_operator(self, op: _Operator) -> None:
         self._update_skill(op)
@@ -2083,7 +2229,7 @@ class Battle:
                     self._finish_operator_attack_chain(op)
                     return
                 # Headb2's attack boundary consumes Search/Next even when
-                # no replacement exists (native f677/f873 reload to 3).
+                # no replacement exists, resetting the three-frame ticker.
                 self._force_refresh_operator_target(op)
                 if not self._cached_operator_target_is_valid(op):
                     self._finish_operator_attack_chain(op)
@@ -2108,15 +2254,17 @@ class Battle:
     def _spawn_event_is_due(self, event: SpawnEvent) -> bool:
         if event.logic_frame is not None:
             return event.logic_frame <= self.frame_index
-        return event.time <= self.time
+        return event.time <= self.time + 1e-9
 
     def run(self, max_time: float = 600.0) -> Result:
         while self.time < max_time:
             self.step()
+            if self.end_reason:
+                break
             if self.life_points <= 0:
                 self.end_reason = "life_points_depleted"
                 break
-            if self.spawn_index >= len(self.spawn_events) and not self.enemies:
+            if self.all_spawns_finished() and not self.enemies:
                 self.end_reason = "all_clear"
                 break
         if not self.end_reason:
@@ -2147,6 +2295,7 @@ class Battle:
             ],
             spawn_timing=self.spawn_timing,
             enemy_attack_timing=self.enemy_attack_timing,
+            operation_results=self.operation_log.summary(self.end_reason, self.time),
             operator_metrics=[
                 {
                     "char_id": op.char_id,
@@ -2176,7 +2325,7 @@ class Battle:
         if op.skill is None:
             return
         recovery_was_stopped = (
-            op.skill_active
+            (op.skill_active and not op.skill_controls.can_switch)
             or self._skill_starting(op)
             or op.statuses.has(Status.SP_BLOCKED)
         )
@@ -2209,7 +2358,7 @@ class Battle:
             self._finish_skill(op, "DURATION_END")
         if (
             op.sp_type == "INCREASE_WITH_TIME"
-            and not op.skill_active
+            and (not op.skill_active or op.skill_controls.can_switch)
             and not self._skill_starting(op)
             and not op.statuses.has(Status.SP_BLOCKED)
         ):
@@ -2256,9 +2405,10 @@ class Battle:
             op.sp_recovery_remaining_raw += count * CLIENT_FP_SCALE
             self._gain_sp(op, float(count))
 
-    def _cast_skill(self, op: _Operator) -> bool:
+    def _cast_skill(self, op: _Operator, *, switch_mode: bool = False) -> bool:
         level = op.skill
-        if level is None or op.skill_active or self._skill_starting(op):
+        if (level is None or self._skill_starting(op)
+                or (op.skill_active and not (switch_mode and op.skill_controls.can_switch))):
             return False
         no_charge = op.sp_type in ("PASSIVE", "NO_CHARGE", "INCREASE_WHEN_NONE")
         if not no_charge and not self._skill_ready(op):
@@ -2267,6 +2417,8 @@ class Battle:
             return False
         if not no_charge:
             op.sp = max(0.0, op.sp - self._skill_cost(op))
+        if op.skill_controls.can_switch:
+            op.skill_mode_target = 1 - op.skill_mode
         self._register_ability_use(op)
         op.skill_end_reason = None
         op.skill_cast_count += 1
@@ -2286,6 +2438,9 @@ class Battle:
     def _activate_skill_effect(self, op: _Operator) -> bool:
         """Apply a skill after any cast animation has completed."""
         level = op.skill
+        if op.skill_controls.can_switch and op.skill_mode_target == 0:
+            self._finish_skill(op, "MODE_SWITCH")
+            return True
         if level is None or op.skill_active:
             return False
         if op.skill_prefab_id == "skchr_headb2_2":
@@ -2311,7 +2466,17 @@ class Battle:
             )
             if op.target_selector is not None:
                 op.target_selector.mark_dirty()
-        if duration == -1.0:
+        if op.skill_controls.can_switch:
+            op.skill_mode = 1
+            op.skill_mode_target = None
+        if op.skill_controls.can_end or op.skill_controls.can_switch:
+            # Control phases and ability-specific finish effects need their
+            # own validation; the description only establishes permission.
+            self.mechanic_diagnostics[f"SKILL_CONTROL_TRANSITION_CANDIDATE:{op.skill_prefab_id}"] = 1
+            if op.behavior_template_key is None:
+                self.mechanic_diagnostics[f"SKILL_CONTROL_EFFECTS_INCOMPLETE:{op.skill_prefab_id}"] = 1
+        if (duration == -1.0 and op.skill_duration_type != "AMMO"
+                and not op.skill_controls.can_end and not op.skill_controls.can_switch):
             self._apply_stat_buff(op, blackboard, permanent=True)
             op.skill_active = False
             op.skill_end_reason = "PERMANENT"
@@ -2329,6 +2494,8 @@ class Battle:
                 self._finish_skill(op, "AMMO_UNCONFIGURED")
                 return False
             self.configure_skill_ammo(op, capacity)
+            self._apply_stat_buff(op, blackboard, timed=True)
+        elif op.skill_controls.can_switch or (duration == -1.0 and op.skill_controls.can_end):
             self._apply_stat_buff(op, blackboard, timed=True)
         elif duration > 0:
             if op.skill_prefab_id == "skchr_huang_3":
@@ -2356,14 +2523,14 @@ class Battle:
     ) -> tuple[dict[str, Any], float]:
         """Resolve S2's first/second cast and the self part of talent 2."""
         out = dict(blackboard)
-        talent = 0.18 if op.potential_rank >= 2 else 0.14
-        self_bonus = talent * 2.0
+        talent = op.talent_blackboards.get("2", {})
+        self_scale = float(talent.get("scale_bonus", 1.0))
         if op.skill_cast_count >= 2:
             out["atk"] = float(out.get("headb2_s_2[second].atk", 0.0))
             out["def"] = float(out.get("headb2_s_2[second].def", 0.0))
             duration = -1.0
-        out["atk"] = float(out.get("atk", 0.0)) + self_bonus
-        out["def"] = float(out.get("def", 0.0)) + self_bonus
+        out["atk"] = float(out.get("atk", 0.0)) + float(talent.get("atk", 0.0)) * self_scale
+        out["def"] = float(out.get("def", 0.0)) + float(talent.get("def", 0.0)) * self_scale
         return out, duration
 
     def _skill_cost(self, op: _Operator) -> float:
@@ -2376,7 +2543,7 @@ class Battle:
     def _gain_sp(self, op: _Operator, amount: float) -> float:
         if (
             amount <= 0
-            or op.skill_active
+            or (op.skill_active and not op.skill_controls.can_switch)
             or self._skill_starting(op)
             or op.statuses.has(Status.SP_BLOCKED)
         ):
@@ -2448,6 +2615,7 @@ class Battle:
             return
         if not op.behavior_finish_dispatched:
             self._dispatch_skill_event(op, "ON_SKILL_FINISH")
+            op.behavior_finish_dispatched = True
         if op.timed_atk_scale != 1.0:
             op.atk_scale /= op.timed_atk_scale
         if op.timed_def_scale != 1.0:
@@ -2461,6 +2629,8 @@ class Battle:
         self._dispatch_skill_event(op, "ON_BUFF_FINISH")
         op.behavior_active = False
         op.skill_active = False
+        op.skill_mode = 0
+        op.skill_mode_target = None
         op.skill_end_reason = reason
         op.ammo = None
         op.ammo_capacity = None
@@ -2583,7 +2753,7 @@ class Battle:
                 targets=targets,
                 attack_scale=op.next_attack_scale,
                 source_atk_scale=op.atk_scale,
-                sp_recovery_locked=op.skill_active,
+                sp_recovery_locked=op.skill_active and not op.skill_controls.can_switch,
                 will_hit=self._attack_hits(op, op.damage_type),
             )
             op.next_attack_scale = 1.0
@@ -2611,7 +2781,7 @@ class Battle:
             targets=[target],
             attack_scale=op.next_attack_scale,
             source_atk_scale=op.atk_scale,
-            sp_recovery_locked=op.skill_active,
+            sp_recovery_locked=op.skill_active and not op.skill_controls.can_switch,
             will_hit=self._attack_hits(op, op.damage_type),
         )
         op.next_attack_scale = 1.0
@@ -2651,7 +2821,7 @@ class Battle:
             targets=[target],
             attack_scale=op.next_attack_scale,
             source_atk_scale=op.atk_scale,
-            sp_recovery_locked=op.skill_active,
+            sp_recovery_locked=op.skill_active and not op.skill_controls.can_switch,
             will_hit=self._attack_hits(op, op.damage_type),
         )
         op.next_attack_scale = 1.0
@@ -2920,21 +3090,19 @@ class Battle:
         self, op: _Operator, attack: _PendingOperatorAttack
     ) -> None:
         target_position = attack.primary.position()
+        radius = float(op.trait_blackboard.get("attack@ability_range_radius", 1.0))
         nearby = [
             enemy
             for enemy in self.enemies
             if self._enemy_is_attackable(enemy)
             and self._enemy_intersects_circle(
-                enemy, target_position, radius=1.0
+                enemy, target_position, radius=radius
             )
         ]
-        module_scale = (
-            1.15
-            if op.module_id == "uniequip_002_headb2"
-            and op.module_level > 0
-            and len(nearby) >= 3
-            else 1.0
-        )
+        trait = op.trait_blackboard
+        module_scale = (float(trait["atk_scale_e"])
+                        if op.char_id == "char_1051_headb2" and "atk_scale_e" in trait
+                        and len(nearby) >= float(trait.get("cnt", math.inf)) else 1.0)
         attack_scale = attack.attack_scale * module_scale
         self._deal_damage_to_enemy(
             op,
@@ -2942,8 +3110,8 @@ class Battle:
             attack_scale,
             source_atk_scale=attack.source_atk_scale,
         )
-        talent_scale = {2: 1.32, 3: 1.40}.get(op.module_level, 1.24)
-        splash_scale = 0.5 * attack_scale
+        talent_scale = float(op.talent_blackboards.get("1", {}).get("damage_scale", 1.0)) if op.char_id == "char_1051_headb2" else 1.0
+        splash_scale = float(trait.get("attack@atk_scale_2", 0.5)) * attack_scale
         for enemy in nearby:
             if (
                 enemy is attack.primary
@@ -2984,7 +3152,10 @@ class Battle:
             if self.assumptions.highland_hit_uses_tile_center
             else "HIGHLAND_TILE_INTERSECTION"
         )
-        echo_scale = 0.27 if op.potential_rank >= 4 else 0.24
+        talent = op.talent_blackboards.get("1", {})
+        if "attack@splash_atk_scale" not in talent:
+            return
+        echo_scale = float(talent["attack@splash_atk_scale"])
         # The main attack cast evaluates the X-module condition once.  Every
         # highland splash created by that attack inherits the same decision.
         amount = op.atk * source_atk_scale * echo_scale * module_scale
@@ -3003,6 +3174,7 @@ class Battle:
                         source=op,
                         tile=(row, col),
                         amount=amount,
+                        sluggish_duration=float(talent.get("attack@sluggish", 0.0)),
                         sp_recovery_locked=sp_recovery_locked,
                     )
                 )
@@ -3043,13 +3215,14 @@ class Battle:
             return
         if sp_recovery_locked:
             return
+        amount = float(op.skill_blackboard.get("sp_per_highland", 0.0))
         if op.skill_active or self._skill_starting(op):
             self.used_assumptions.add("ACTIVE_SKILL_SP_LOCK")
             if not self.assumptions.allow_active_skill_sp_gain:
                 return
-            self._store_sp_gain(op, 1.0)
+            self._store_sp_gain(op, amount)
             return
-        self._gain_sp(op, 1.0)
+        self._gain_sp(op, amount)
 
     def _process_scheduled_highland_effects(self) -> None:
         pending: list[_ScheduledHighlandEffect] = []
@@ -3086,7 +3259,7 @@ class Battle:
                     attack_type=AttackType.SPLASH,
                     apply_way=ApplyWay.RANGED,
                 )
-                if not enemy.dead:
+                if not enemy.dead and effect.sluggish_duration > 0:
                     sluggish_frames = max(
                         0, int(self.assumptions.sluggish_extra_frames)
                     )
@@ -3095,7 +3268,7 @@ class Battle:
                     )
                     enemy.statuses.apply(
                         Status.SLUGGISH,
-                        0.5 + sluggish_frames / CLIENT_LOGIC_RATE,
+                        effect.sluggish_duration + sluggish_frames / CLIENT_LOGIC_RATE,
                         resistible=False,
                     )
         self.scheduled_highland_effects = pending
@@ -4202,8 +4375,8 @@ class Battle:
         )
         if initial_wait_expiry:
             self.used_assumptions.add("INITIAL_ROUTE_WAIT_SAME_FRAME_MOVE")
-            # H7-2 #3/#4/#5 support movement on the visible birth-wait
-            # expiry frame; later route waits keep their own phase.
+            # Initial visible waits may resume movement on the expiry frame;
+            # later route waits keep their own phase.
             enemy.wait_active_at_frame_start = False
             enemy.wait_phase_consumed = False
         wait_active_at_frame_start = enemy.wait_active_at_frame_start
@@ -4411,8 +4584,7 @@ class Battle:
             # Keep the ordinary visible-route boundary on the intended
             # floating-point clock, but do not let a tiny subtraction tail
             # postpone the next MOVE frame.  Hidden/portal waits deliberately
-            # keep the strict countdown because H7-2 observes 301 frames for a
-            # nominal 10-second portal wait.
+            # keep the strict countdown to preserve their handoff boundary.
             if not enemy.disappeared:
                 epsilon = max(
                     0.0,
@@ -5102,6 +5274,8 @@ class Battle:
 
     def _cleanup(self) -> None:
         for enemy in list(self.enemies):
+            if enemy.dead or enemy.leaked:
+                self.wave_scheduler.departed(enemy, self.time)
             if enemy.leaked and not enemy.dead:
                 self.life_points -= enemy.life_reduce
                 self.enemies_leaked += 1
@@ -5549,10 +5723,23 @@ class Battle:
     # ------------------------------------------------------------- deploy
     def _execute_plan_action(self, plan: OperatorPlan) -> str:
         if plan.action == "RETREAT":
-            return self._try_retreat(plan.char_id)
-        if plan.action != "DEPLOY":
-            return "skip"
-        return self._try_deploy(plan)
+            attempt = self._try_retreat(plan.char_id)
+        elif plan.action == "SKILL":
+            attempt = self._try_manual_skill(plan.char_id)
+        elif plan.action == "SKILL_END":
+            attempt = self._try_skill_end(plan.char_id)
+        elif plan.action == "SWITCH_MODE":
+            attempt = self._try_switch_mode(plan.char_id, plan.mode)
+        elif plan.action == "DEPLOY":
+            attempt = self._try_deploy(plan)
+        else:
+            attempt = OperationAttempt("skip", "unsupported_action")
+        if attempt.status == "wait" and plan.on_failure != "WAIT":
+            attempt = OperationAttempt("skip", attempt.reason, attempt.details)
+        self.operation_log.record(self.plan_index, attempt, self.time, self.frame_index)
+        if attempt.status == "skip" and plan.on_failure == "STOP":
+            self.end_reason = "operation_failed"
+        return attempt.status
 
     def _active_operator(self, char_id: str) -> _Operator | None:
         for op in reversed(self.operators):
@@ -5560,14 +5747,77 @@ class Battle:
                 return op
         return None
 
-    def _try_retreat(self, char_id: str) -> str:
+    def _try_retreat(self, char_id: str) -> OperationAttempt:
         op = self._active_operator(char_id)
         if op is None:
-            return "skip"
+            return OperationAttempt("skip", "not_on_field")
         op.retreated = True
         op.dead = True
         self._process_operator_departure(op, retreated=True)
-        return "ok"
+        return OperationAttempt("ok", details={"deployment": op.deployment_index})
+
+    def _try_manual_skill(self, char_id: str) -> OperationAttempt:
+        op = self._active_operator(char_id)
+        if op is None:
+            return OperationAttempt("skip", "not_on_field")
+        if op.skill is None:
+            return OperationAttempt("skip", "skill_unavailable" if op.skill_end_reason == "PERMANENT" else "no_skill")
+        if op.skill_type != "MANUAL":
+            return OperationAttempt("skip", "not_manual_skill")
+        details = {"deployment": op.deployment_index, "sp": op.sp, "required_sp": self._skill_cost(op),
+                   "startup_remaining": max(0.0, op.skill_startup_until - self.time),
+                   "active_until": op.active_until,
+                   "statuses": [status.value for status in op.statuses.durations]}
+        if self._skill_starting(op):
+            return OperationAttempt("wait", "skill_starting", details)
+        if op.skill_active:
+            return OperationAttempt("wait", "skill_active", details)
+        if not op.statuses.can_use_skill:
+            return OperationAttempt("wait", "skill_disabled", details)
+        if not self._skill_ready(op):
+            return OperationAttempt("wait", "insufficient_sp", details)
+        if not self._cast_skill(op):
+            return OperationAttempt("skip", "skill_rejected",
+                                    {**details, "sp_after": op.sp, "casts_after": op.skill_cast_count})
+        return OperationAttempt("ok", details={**details, "cast": op.skill_cast_count})
+
+    def _try_skill_end(self, char_id: str) -> OperationAttempt:
+        op = self._active_operator(char_id)
+        if op is None:
+            return OperationAttempt("skip", "not_on_field")
+        if not op.skill_controls.can_end:
+            return OperationAttempt("skip", "skill_not_endable")
+        details = {"deployment": op.deployment_index, "sp": op.sp, "ammo": op.ammo}
+        if self._skill_starting(op):
+            return OperationAttempt("wait", "skill_starting", details)
+        if not op.skill_active:
+            return OperationAttempt("skip", "skill_not_active", details)
+        if not op.statuses.can_use_skill:
+            return OperationAttempt("wait", "skill_disabled", details)
+        self._finish_skill(op, "MANUAL_END")
+        return OperationAttempt("ok", details={**details, "sp_after": op.sp})
+
+    def _try_switch_mode(self, char_id: str, mode: int | None = None) -> OperationAttempt:
+        op = self._active_operator(char_id)
+        if op is None:
+            return OperationAttempt("skip", "not_on_field")
+        if not op.skill_controls.can_switch:
+            return OperationAttempt("skip", "skill_not_switchable")
+        target = 1 - op.skill_mode if mode is None else mode
+        details = {"deployment": op.deployment_index, "mode_before": op.skill_mode,
+                   "target_mode": target, "sp": op.sp, "required_sp": self._skill_cost(op)}
+        if self._skill_starting(op):
+            return OperationAttempt("wait", "skill_starting", details)
+        if target == op.skill_mode:
+            return OperationAttempt("ok", details={**details, "unchanged": True, "sp_after": op.sp})
+        if not op.statuses.can_use_skill:
+            return OperationAttempt("wait", "skill_disabled", details)
+        if not self._skill_ready(op):
+            return OperationAttempt("wait", "insufficient_sp", details)
+        if not self._cast_skill(op, switch_mode=True):
+            return OperationAttempt("skip", "skill_rejected", details)
+        return OperationAttempt("ok", details={**details, "sp_after": op.sp,
+                                              "cast": op.skill_cast_count})
 
     def _process_operator_departure(
         self, op: _Operator, *, retreated: bool
@@ -5584,17 +5834,13 @@ class Battle:
         self.redeploy_penalty[op.char_id] = penalty
         self.redeploy_ready_at[op.char_id] = self.time + op.respawn_time
 
-    def _try_deploy(self, plan: OperatorPlan) -> str:
+    def _try_deploy(self, plan: OperatorPlan) -> OperationAttempt:
         if plan.char_id not in self.characters:
-            return "skip"
+            return OperationAttempt("skip", "unknown_operator")
         if plan.tile is None:
-            return "skip"
+            return OperationAttempt("skip", "missing_tile")
         if self._active_operator(plan.char_id) is not None:
-            return "skip"
-        if self.time + 1e-9 < self.redeploy_ready_at.get(plan.char_id, 0.0):
-            return "wait"
-        if sum(1 for op in self.operators if not op.dead) >= self.character_limit:
-            return "wait"
+            return OperationAttempt("skip", "already_deployed")
         module = (
             self.battle_equips.get(plan.module_id) if plan.module_id else None
         )
@@ -5612,12 +5858,26 @@ class Battle:
         cost = min(math.floor(base_cost * (1.0 + 0.5 * penalty)), self.max_cost)
         row, col = plan.tile
         profession = str(self.characters[plan.char_id].get("position", "RANGED"))
-        if self.dp < cost:
-            return "wait"
+        details = {"tile": list(plan.tile), "cost": cost, "available_cost": self.dp,
+                   "occupied_slots": sum(1 for op in self.operators if not op.dead),
+                   "slot_limit": self.character_limit,
+                   "redeploy_ready_at": self.redeploy_ready_at.get(plan.char_id, 0.0)}
+        if not (0 <= row < len(self.map_grid) and 0 <= col < len(self.map_grid[0])):
+            return OperationAttempt("skip", "out_of_bounds", details)
         if self.tile_occupied(row, col):
-            return "skip"
+            return OperationAttempt("skip", "tile_occupied", details)
         if not self.is_buildable(row, col, profession):
-            return "skip"
+            return OperationAttempt("skip", "not_buildable", details)
+        blockers = []
+        if self.time + 1e-9 < details["redeploy_ready_at"]:
+            blockers.append("redeploy_cooldown")
+        if details["occupied_slots"] >= self.character_limit:
+            blockers.append("deployment_limit")
+        if self.dp < cost:
+            blockers.append("insufficient_cost")
+        if blockers:
+            details["blockers"] = blockers
+            return OperationAttempt("wait", blockers[0], details)
         self.dp -= cost
         self.operators.append(self._make_operator(plan, cost))
-        return "ok"
+        return OperationAttempt("ok", details={**details, "deployment": self.operators[-1].deployment_index})

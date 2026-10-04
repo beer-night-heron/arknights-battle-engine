@@ -7,10 +7,13 @@
     "elite": 0,
     "facing": 0,
     "skill_id": null,
+    "skill_level": null,
+    "auto_skill": false,
     "trust": 0,
     "potential_rank": 0,
     "module_id": null,
     "module_level": 0,
-    "action": "DEPLOY"
+    "action": "DEPLOY",
+    "on_failure": "WAIT"
   }
 ]

@@ -12,6 +12,7 @@
 !/tools/export_data.py
 !/tools/list_data.py
 !/tools/simulate.py
+!/tools/editor.py
 # local/ includes data, plans, generated output and all historical material.
 /local/
 # Block accidental reintroduction of the discontinued engine.

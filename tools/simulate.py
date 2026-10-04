@@ -77,6 +77,7 @@ def compact_operator(operator: Any, battle: Battle) -> dict[str, Any]:
     return {
         "id": operator.deployment_index,
         "char": operator.char_id,
+        "profile": operator.plan_profile,
         "name": operator.name,
         "r": operator.tile[0],
         "c": operator.tile[1],
@@ -87,7 +88,7 @@ def compact_operator(operator: Any, battle: Battle) -> dict[str, Any]:
         "spSlot": round(max(0.0, min(1.0, progress)), 6) if progress is not None else None,
         "spSlotMode": "periodic" if periodic else "continuous" if progress is not None else "none",
         "spSlotPaused": (
-            operator.dead or operator.skill_active
+            operator.dead or (operator.skill_active and not operator.skill_controls.can_switch)
             or operator.skill_startup_until >= 0.0
             or operator.statuses.has(Status.SP_BLOCKED)
             or operator.sp >= operator.sp_max
@@ -102,6 +103,10 @@ def compact_operator(operator: Any, battle: Battle) -> dict[str, Any]:
         "starting": operator.skill_startup_until >= 0.0,
         "active": operator.skill_active or operator.skill_end_reason == "PERMANENT",
         "casts": operator.skill_cast_count,
+        "skillMode": operator.skill_mode if operator.skill_controls.can_switch else None,
+        "canEndSkill": operator.skill_controls.can_end,
+        "canSwitchMode": operator.skill_controls.can_switch,
+        "skillEndReason": operator.skill_end_reason,
         "atkScale": round(operator.atk_scale, 4),
         "defScale": round(operator.def_scale, 4),
         "blocked": len([enemy for enemy in operator.blocked if not enemy.dead]),
@@ -145,6 +150,9 @@ def export_roster(battle: Battle) -> list[dict[str, Any]]:
             "profile": index, "char": plan.char_id,
             "name": character.get("name", plan.char_id),
             "baseCost": int(attrs.get("cost", 0)),
+            "loadout": {key: getattr(plan, key) for key in (
+                "elite", "level", "trust", "potential_rank", "skill_id", "skill_level", "auto_skill", "module_id", "module_level",
+            )},
             "attributes": {
                 "maxHp": round(float(attrs.get("maxHp", 0)), 2),
                 "atk": round(float(attrs.get("atk", 0)), 2),
@@ -278,9 +286,13 @@ def derive_events(
         if old["starting"] and not new["starting"] and new["active"]:
             events.append(make_event(time, "skill_active", target=operator_id, cast=new["casts"], atkScale=new["atkScale"], defScale=new["defScale"], r=new["r"], c=new["c"]))
         if old["active"] and not new["active"]:
-            events.append(make_event(time, "skill_end", target=operator_id, cast=new["casts"], r=new["r"], c=new["c"]))
+            events.append(make_event(time, "skill_end", target=operator_id, cast=new["casts"], reason=new["skillEndReason"], r=new["r"], c=new["c"]))
+        if old["skillMode"] != new["skillMode"]:
+            events.append(make_event(time, "mode_change", target=operator_id, mode=new["skillMode"], r=new["r"], c=new["c"]))
         if not old["dead"] and new["dead"]:
-            events.append(make_event(time, "operator_death", target=operator_id, r=new["r"], c=new["c"]))
+            ref = after["operatorRefs"][operator_id]
+            events.append(make_event(time, "retreat" if ref.retreated else "operator_death",
+                                     target=operator_id, r=new["r"], c=new["c"]))
 
     before_projectiles = before["projectiles"]
     after_projectiles = after["projectiles"]
@@ -363,6 +375,8 @@ def run_case(
         enemy_attack_timing=shared["enemy_attack_timing"],
         enemy_graphics=shared.get("enemy_graphics"),
         assumptions=shared.get("assumptions"),
+        module_index=shared.get("module_index"),
+        favor_table=shared.get("favor_table"),
     )
     frames: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
@@ -378,14 +392,26 @@ def run_case(
             frames.append(snapshot(after))
             next_sample += sample_interval
         before = after
+        if battle.end_reason:
+            break
         if battle.life_points <= 0:
             battle.end_reason = "life_points_depleted"
             break
-        if battle.spawn_index >= len(battle.spawn_events) and not battle.enemies:
+        if battle.all_spawns_finished() and not battle.enemies:
             battle.end_reason = "all_clear"
             break
     if not battle.end_reason:
         battle.end_reason = "timeout"
+    events.extend(battle.operation_log.events)
+    events.extend(battle.wave_scheduler.events)
+    for operation in battle.operation_log.summary(battle.end_reason, battle.time):
+        if operation["status"] in ("unfinished", "not_executed"):
+            events.append(make_event(
+                battle.time, "operation", index=operation["index"], action=operation["action"],
+                char=operation["char_id"], status=operation["status"], reason=operation["reason"],
+                message=operation["message"], details=operation["details"],
+            ))
+    events.sort(key=lambda event: event["t"])
     final_state = snapshot(capture_state(battle, roster))
     if not frames or frames[-1]["t"] != final_state["t"]:
         frames.append(final_state)
