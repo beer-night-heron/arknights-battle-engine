@@ -15,6 +15,8 @@ from . import data as D
 from .batch import summarize_results
 from .assumptions import DEFAULT_ASSUMPTIONS
 from .loadout import resolve_plan
+from .squad import BUILD_FIELDS, resolve_squad
+from .runes import select_stage_runes
 from .battle import (
     ENEMY_ATTACK_TIMING_FLOAT,
     ENEMY_ATTACK_TIMING_MORTAR_FRAMES,
@@ -40,6 +42,9 @@ def build_config(
     enemy_attack_timing: str = ENEMY_ATTACK_TIMING_FLOAT,
     enemy_muzzle: bool = False,
     enemy_turning: bool = False,
+    squad_path: str | Path | None = None,
+    difficulty: str | None = None,
+    optional_runes: list[str] | None = None,
 ) -> dict[str, Any]:
     """Shared input loading for summary and replay commands."""
     D.set_data_dir(data_dir)
@@ -54,14 +59,22 @@ def build_config(
             plan[index - 1] = resolve_plan(item, characters, skills, equips, module_index, favor_table)
         except ValueError as error:
             raise ValueError(f"plan item {index}: {error}") from error
+    squad = None
+    if squad_path is not None:
+        squad, _ = resolve_squad(plan, load_squad(squad_path), characters, skills,
+                                 equips, module_index, favor_table)
+    stages = D.load_stages()
+    level = select_stage_runes(stages, stage, D.load_level(resolve_level_file(stages, stage)), optional_runes, difficulty)
     return {
-        "level": D.load_level(resolve_level_file(D.load_stages(), stage)),
+        "level": level,
         "enemy_index": D.build_enemy_index(D.load_enemy_database()),
         "characters": characters,
         "ranges": D.load_ranges(),
         "plan": plan,
+        "squad": squad,
         "skills": skills,
         "attack_timing": D.load_attack_timing(),
+        "operator_forms": D.load_operator_forms(),
         "behavior_templates": D.load_behavior_templates(),
         "battle_equips": equips,
         "module_index": module_index,
@@ -116,6 +129,8 @@ def _run_once(config: dict[str, Any], seed: int):
         module_index=config.get("module_index"),
         favor_table=config.get("favor_table"),
         assumptions=config.get("assumptions"),
+        squad=config.get("squad"),
+        operator_forms=config.get("operator_forms"),
     )
     return battle.run()
 
@@ -181,6 +196,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
     parser.add_argument("--stage", required=True, help="stage ID from stage_table.json")
     parser.add_argument("--plan", required=True, help="path to a plan JSON file")
+    parser.add_argument("--squad", help="carried operator builds, including undeployed operators")
+    parser.add_argument("--difficulty", choices=("NORMAL", "SIX_STAR"), help="override stage rune difficulty")
+    parser.add_argument("--rune", action="append", default=[], help="optional rune ID or level key; repeat for each selection")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -226,6 +244,9 @@ def main(argv: list[str] | None = None) -> int:
             enemy_attack_timing=args.enemy_attack_timing,
             enemy_muzzle=args.enemy_muzzle,
             enemy_turning=args.enemy_turning,
+            squad_path=args.squad,
+            difficulty=args.difficulty,
+            optional_runes=args.rune,
         )
     except (OSError, ValueError, KeyError) as error:
         parser.error(f"cannot load simulation inputs: {error}")
@@ -300,6 +321,26 @@ def main(argv: list[str] | None = None) -> int:
 def load_plan(path: str) -> list[OperatorPlan]:
     raw = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     return parse_plan(raw)
+
+
+def load_squad(path: str | Path) -> list[OperatorPlan]:
+    raw = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    return parse_squad(raw)
+
+
+def parse_squad(raw: Any) -> list[OperatorPlan]:
+    if not isinstance(raw, list) or len(raw) > 100:
+        raise ValueError("squad must be a JSON array of at most 100 operator builds")
+    seen, squad = set(), []
+    for index, item in enumerate(raw, 1):
+        if not isinstance(item, dict) or set(item) - BUILD_FIELDS:
+            raise ValueError(f"squad item {index}: invalid build fields")
+        parsed = parse_plan([{**item, "time": 0, "tile": [0, 0]}])[0]
+        if parsed.char_id in seen:
+            raise ValueError(f"squad item {index}: duplicate operator {parsed.char_id}")
+        seen.add(parsed.char_id)
+        squad.append(parsed)
+    return squad
 
 
 def parse_plan(raw: Any) -> list[OperatorPlan]:

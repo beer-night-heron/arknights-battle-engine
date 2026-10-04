@@ -5,8 +5,102 @@ const labels = {DEPLOY:'部署',RETREAT:'撤退',SKILL:'开技能',SKILL_END:'�
 const professionNames = {PIONEER:'先锋',WARRIOR:'近卫',TANK:'重装',SNIPER:'狙击',CASTER:'术师',MEDIC:'医疗',SUPPORT:'辅助',SPECIAL:'特种'};
 const buildFields = ['char_id','elite','level','trust','potential_rank','skill_id','skill_level','module_id','module_level','auto_skill'];
 const freshProject = () => ({format:'arksim-plan-editor',version:1,stage:'',squad:[],operations:[],options:{spawn_timing:'fast',enemy_attack_timing:'float',seed:0,enemy_muzzle:false,enemy_turning:false}});
-const state = {project:freshProject(),catalog:null,stage:null,details:new Map(),selectedBuild:null,editIndex:null,tile:null,facing:0,preview:0,dirty:false,draftDirty:false,running:false,revision:0};
+const state = {project:freshProject(),catalog:null,stage:null,details:new Map(),selectedBuild:null,editIndex:null,tile:null,facing:0,preview:0,dirty:false,draftDirty:false,operationDirty:false,savedLabel:'未保存方案',running:false,revision:0};
 let noticeTimer, statTimer, buildRequest=0, stageRequest=0;
+const buildInputs=['elite','level','trust','potential','skill','skillLevel','module','moduleLevel','autoSkill'];
+const operationInputs=['opChar','opAction','opTime','opFrame','opMode','failure'];
+const optionInputs=['spawnTiming','attackTiming','seed','enemyMuzzle','enemyTurning'];
+let draftTimer,draftReady=false,restoringDraft=false,recoveryDraft=null,draftRevision=0,savedDraftRevision=0;
+let previousDraftSession='',draftSession=crypto.randomUUID().replaceAll('-','');
+try {previousDraftSession=sessionStorage.getItem('arksim-editor-draft-session')||'';} catch(error) {}
+
+function readFields(ids) {return Object.fromEntries(ids.map(id=>[id,$(id).type==='checkbox'?$(id).checked:$(id).value]));}
+function writeFields(fields,ids) {
+  for(const id of ids) if(Object.hasOwn(fields,id)) {
+    if($(id).type==='checkbox')$(id).checked=fields[id]===true;else $(id).value=fields[id];
+  }
+}
+function showSaveState(message=null) {
+  const pending=[state.draftDirty?'练度尚未加入／保存':'',state.operationDirty?'操作表单尚未加入／保存':''].filter(Boolean);
+  $('saveState').textContent=pending.length?pending.join('；'):message??(state.dirty?'方案有未保存修改':state.savedLabel);
+}
+function scheduleDraft() {
+  if(!draftReady||restoringDraft)return;
+  recoveryDraft=null;$('draftRecovery').hidden=true;
+  draftRevision++;$('draftState').textContent='草稿待保存…';
+  clearTimeout(draftTimer);draftTimer=setTimeout(()=>flushDraft(),600);
+}
+function draftSnapshot() {
+  return {version:1,project:state.project,ui:{step:$('operationsView').hidden?'setup':'operations',
+    selectedBuild:state.selectedBuild,build:readFields(buildInputs),operation:readFields(operationInputs),options:readFields(optionInputs),
+    editIndex:state.editIndex,tile:state.tile,facing:state.facing,preview:state.preview,
+    dirty:state.dirty,buildDirty:state.draftDirty,operationDirty:state.operationDirty,
+    savedLabel:state.savedLabel,stageSearch:$('stageSearch').value,operatorSearch:$('operatorSearch').value}};
+}
+async function flushDraft(keepalive=false) {
+  clearTimeout(draftTimer);
+  if(!draftReady||restoringDraft||draftRevision===savedDraftRevision)return;
+  const revision=draftRevision;
+  const body=JSON.stringify({session:draftSession,revision,snapshot:draftSnapshot()});
+  try {sessionStorage.setItem('arksim-editor-draft-session',draftSession);} catch(error) {}
+  $('draftState').textContent='正在保存草稿…';
+  try {
+    const response=await fetch('/api/draft',{method:'POST',headers:{'Content-Type':'application/json'},body,keepalive});
+    const saved=await response.json();if(!response.ok)throw new Error(saved.error||'草稿保存失败');
+    savedDraftRevision=Math.max(savedDraftRevision,revision);
+    if(revision===draftRevision){$('draftState').textContent=`草稿已保存 · ${new Date(saved.savedAt).toLocaleTimeString('zh-CN')}`;$('draftState').classList.remove('error');}
+  }catch(error){
+    if(revision===draftRevision){$('draftState').textContent='草稿未写入，请保留页面并检查本地服务';$('draftState').classList.add('error');}
+  }
+}
+async function checkDraft() {
+  draftReady=true;
+  const revision=draftRevision;
+  try {
+    const result=await api(`/api/draft?session=${encodeURIComponent(previousDraftSession)}`);
+    if(draftRevision!==revision)return;
+    recoveryDraft=result.draft;
+    if(recoveryDraft){
+      const project=recoveryDraft.snapshot.project,stage=state.catalog.stages.find(s=>s.id===project.stage);
+      $('draftDescription').textContent=`${stage?`${stage.code} · ${stage.name}`:'尚未选择关卡'} / ${project.squad.length} 名干员 / ${project.operations.length} 条操作 · ${new Date(recoveryDraft.savedAt).toLocaleString('zh-CN')}`;
+      $('draftRecovery').hidden=false;$('draftState').textContent='发现本地草稿，可恢复继续编辑';
+    }else $('draftState').textContent='编辑后自动保存草稿';
+  }catch(error){$('draftState').textContent='无法读取草稿；编辑后将重试保存';$('draftState').classList.add('error');}
+}
+async function loadProject(project) {
+  await Promise.all(project.squad.map(b=>loadDetail(b.char_id)));
+  const stage=project.stage?await api(stageUrl(project.stage,project.options?.optional_runes)):null;
+  stageRequest++;buildRequest++;
+  state.project=project;state.stage=stage;state.selectedBuild=null;state.draftDirty=false;state.tile=null;state.preview=0;
+  state.operationDirty=false;cancelEdit();$('buildForm').hidden=true;$('buildName').textContent='选择一名干员';
+  const opts=project.options;$('spawnTiming').value=opts.spawn_timing;$('attackTiming').value=opts.enemy_attack_timing;$('seed').value=opts.seed;$('enemyMuzzle').checked=opts.enemy_muzzle;$('enemyTurning').checked=opts.enemy_turning;
+  updateStageView();renderSquad();renderOperations();renderMaps();
+}
+async function restoreDraft() {
+  if(!recoveryDraft||restoringDraft)return;
+  const snapshot=recoveryDraft.snapshot,ui=snapshot.ui;
+  restoringDraft=true;document.querySelector('main').inert=true;$('restoreDraftBtn').disabled=true;
+  try {
+    await loadProject(snapshot.project);
+    $('stageSearch').value=ui.stageSearch||'';$('operatorSearch').value=ui.operatorSearch||'';
+    if(ui.selectedBuild){
+      await openBuild(ui.selectedBuild);
+      writeFields(ui.build,buildInputs);
+      updateBuildChoices({skill_id:ui.build.skill||null,skill_level:Number(ui.build.skillLevel),module_id:ui.build.module||null,module_level:Number(ui.build.moduleLevel)});
+      writeFields(ui.build,buildInputs);state.draftDirty=ui.buildDirty===true;previewBuild();
+    }
+    writeFields(ui.options,optionInputs);writeFields(ui.operation,operationInputs);
+    state.editIndex=Number.isInteger(ui.editIndex)&&state.project.operations[ui.editIndex]?ui.editIndex:null;
+    state.tile=ui.tile;state.facing=ui.facing;state.preview=ui.preview;
+    state.dirty=ui.dirty===true;state.operationDirty=ui.operationDirty===true;state.revision++;
+    state.savedLabel=ui.savedLabel||(!state.dirty&&!state.draftDirty&&!state.operationDirty?ui.saveState:null)||'已恢复草稿，正式方案尚未保存';
+    if(state.editIndex!==null){$('operationTitle').textContent='编辑操作';$('addOperationBtn').textContent='保存修改';$('cancelEditBtn').hidden=false;}
+    updateStageOptions();renderSearch();switchStep(ui.step==='operations'&&state.stage&&state.project.squad.length?'operations':'setup');
+    showSaveState();$('openReplay').hidden=true;
+    recoveryDraft=null;$('draftRecovery').hidden=true;notify('草稿已恢复，尚未加入的表单仍需确认保存');
+  }finally{restoringDraft=false;document.querySelector('main').inert=false;$('restoreDraftBtn').disabled=false;}
+  scheduleDraft();
+}
 
 async function api(path, body) {
   const response = await fetch(path, body === undefined ? {} : {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -21,7 +115,7 @@ function notify(message,error=false) {
 }
 function guard(fn) { return async (...args) => {try {await fn(...args);} catch(error) {notify(error.message,true);}}; }
 function markDirty() {
-  state.dirty=true; state.revision++; $('saveState').textContent='方案有未保存修改';
+  state.dirty=true; state.revision++; showSaveState();scheduleDraft();
   $('openReplay').hidden=true;
 }
 function operatorName(id) {return state.catalog?.operators.find(o=>o.id===id)?.name || id;}
@@ -49,16 +143,27 @@ function updateStageOptions() {
   const stages=state.catalog.stages.filter(s=>`${s.id} ${s.code} ${s.name}`.toLowerCase().includes(term)||s.id===state.project.stage);
   setOptions($('stageSelect'),[{value:'',label:'请选择关卡'},...stages.map(s=>({value:s.id,label:`${s.code} · ${s.name}${state.catalog.stages.filter(other=>other.code===s.code&&other.name===s.name).length>1?` · ${s.id}`:''}`}))],state.project.stage);
 }
+function stageUrl(id,runes=[]) {
+  const query=new URLSearchParams({id});for(const rune of runes||[])query.append('rune',rune);
+  return `/api/stage?${query}`;
+}
 async function selectStage(id, dirty=true) {
   const request=++stageRequest;
   const stage=id?await api(`/api/stage?id=${encodeURIComponent(id)}`):null;
   if (request!==stageRequest) return;
   state.project.stage=id; state.stage=stage; state.tile=null;
+  state.project.options.optional_runes=[];
   if (dirty) markDirty();
-  const meta=state.catalog.stages.find(s=>s.id===id);
-  $('stageInfo').textContent=stage?`${meta.code} · ${meta.name} / ${stage.map.width} × ${stage.map.height}`:'尚未选择地图';
+  updateStageView();renderMaps(); renderOperationForm();
+}
+function updateStageView() {
+  const meta=state.catalog.stages.find(s=>s.id===state.project.stage),stage=state.stage;
+  $('stageInfo').textContent=stage?`${meta?.code||stage.id} · ${meta?.name||''} / ${stage.map.width} × ${stage.map.height}`:'尚未选择地图';
   $('mapName').textContent=meta?`${meta.code} · ${meta.name}`:'地图';
-  updateStageOptions(); renderMaps(); renderOperationForm();
+  updateStageOptions();
+  const groups=stage?.runeGroups||[];
+  $('runeOptions').hidden=!groups.some(g=>g.length);
+  $('runeOptions').innerHTML=groups.map((group,index)=>group.length?`<label>沙盘 ${index+1} 级条件<select data-rune-group="${index}"><option value="">不选择</option>${group.map(r=>`<option value="${escapeText(r.id)}" ${(state.project.options.optional_runes||[]).includes(r.id)?'selected':''}>${escapeText(r.description)}</option>`).join('')}</select></label>`:'').join('');
 }
 function renderSearch() {
   const term=$('operatorSearch').value.trim().toLowerCase();
@@ -105,6 +210,7 @@ async function openBuild(id) {
   updateBuildChoices(build);
   $('addMemberBtn').textContent=member?'保存练度':'加入队伍';
   $('buildStats').innerHTML=''; renderSquad(); previewBuild();
+  scheduleDraft();
 }
 function updateBuildChoices(preferred=null) {
   const detail=detailFor(state.selectedBuild); if(!detail) return;
@@ -158,6 +264,7 @@ function switchStep(step) {
   $('setupView').hidden=step!=='setup'; $('operationsView').hidden=step!=='operations';
   document.querySelectorAll('[data-step]').forEach(b=>b.classList.toggle('active',b.dataset.step===step));
   renderSquad(); renderOperations(); renderMaps();
+  scheduleDraft();
 }
 function orderedOperations() {return state.project.operations.map((op,index)=>({op,index})).sort((a,b)=>a.op.time-b.op.time||a.index-b.index);}
 function plannedUnits() {
@@ -227,17 +334,20 @@ function operationDraft() {
 function addOperation() {
   const op=operationDraft();
   if(state.editIndex===null)state.project.operations.push(op);else state.project.operations[state.editIndex]=op;
+  state.operationDirty=false;
   markDirty();cancelEdit();renderOperations();renderMaps();notify('操作已保存到当前方案');
 }
 function cancelEdit() {
+  state.operationDirty=false;
   state.editIndex=null;$('operationTitle').textContent='添加操作';$('addOperationBtn').textContent='＋ 加入操作';$('cancelEditBtn').hidden=true;
 }
 function editOperation(index) {
-  const op=state.project.operations[index];state.editIndex=index;
+  const op=state.project.operations[index];state.editIndex=index;state.operationDirty=false;
   $('opChar').value=op.char_id;$('opAction').value=op.action;$('failure').value=op.on_failure||'WAIT';$('opMode').value=op.mode??'';
   state.tile=op.tile?[...op.tile]:null;state.facing=op.facing??0;setTime(op.time);
   $('operationTitle').textContent='编辑操作';$('addOperationBtn').textContent='保存修改';$('cancelEditBtn').hidden=false;
   renderSquad();renderOperations();renderMaps();
+  showSaveState();scheduleDraft();
 }
 function moveOperation(index,direction) {
   const rows=orderedOperations(),at=rows.findIndex(x=>x.index===index),other=rows[at+direction];
@@ -254,7 +364,7 @@ function renderOperations() {
   }).join(''):'<div class="empty-state"><h2>还没有操作</h2><p>选干员、定时刻，在地图上部署第一位。</p></div>';
 }
 function readOptions() {
-  state.project.options={spawn_timing:$('spawnTiming').value,enemy_attack_timing:$('attackTiming').value,seed:Number($('seed').value),enemy_muzzle:$('enemyMuzzle').checked,enemy_turning:$('enemyTurning').checked};
+  state.project.options={...state.project.options,spawn_timing:$('spawnTiming').value,enemy_attack_timing:$('attackTiming').value,seed:Number($('seed').value),enemy_muzzle:$('enemyMuzzle').checked,enemy_turning:$('enemyTurning').checked};
 }
 async function validated() {
   if(state.draftDirty)await saveMember(false);
@@ -266,27 +376,26 @@ function download(url,name) {
 }
 async function saveProject() {
   const compiled=await validated();
+  const revision=state.revision;
   const saved=await api('/api/save',compiled.project);
-  state.dirty=false;$('saveState').textContent='方案已保存到本地';
+  if(state.revision===revision){state.dirty=false;state.savedLabel='方案已保存到本地';}
+  showSaveState();scheduleDraft();
   download(saved.projectUrl,`arksim-${state.project.stage}-方案.json`);
   notify(`方案已保存：${saved.projectFile}。可用“导入”继续编辑。`);
 }
 async function importFile(file) {
-  if((state.dirty||state.draftDirty)&&!confirm('导入将替换当前编辑内容。未保存的修改会丢失，是否继续？')) return;
+  if((state.dirty||state.draftDirty||state.operationDirty)&&!confirm('导入将替换当前编辑内容。未保存的修改会丢失，是否继续？')) return;
   const raw=JSON.parse((await file.text()).replace(/^\uFEFF/,''));
   let compiled;
   if(Array.isArray(raw)) {
     if(!state.project.stage)throw new Error('旧操作 JSON 不含地图，请先选择对应关卡，再导入');
     compiled=await api('/api/import-plan',{plan:raw,stage:state.project.stage});
   }else compiled=await api('/api/validate',raw);
-  const project=compiled.project;
-  await Promise.all(project.squad.map(b=>loadDetail(b.char_id)));
-  await selectStage(project.stage,false);
-  state.project=project;state.selectedBuild=null;state.draftDirty=false;state.dirty=false;state.revision++;cancelEdit();
-  $('buildForm').hidden=true;$('buildName').textContent='选择一名干员';
-  const opts=project.options;$('spawnTiming').value=opts.spawn_timing;$('attackTiming').value=opts.enemy_attack_timing;$('seed').value=opts.seed;$('enemyMuzzle').checked=opts.enemy_muzzle;$('enemyTurning').checked=opts.enemy_turning;
-  $('saveState').textContent=`已导入 ${file.name}`;$('openReplay').hidden=true;
+  await loadProject(compiled.project);
+  state.dirty=false;state.revision++;
+  state.savedLabel=`已导入 ${file.name}`;showSaveState();$('openReplay').hidden=true;
   updateStageOptions();renderSquad();renderOperations();renderMaps();notify('方案已导入');
+  scheduleDraft();
 }
 async function simulate() {
   if(state.running)return;
@@ -312,13 +421,20 @@ async function simulate() {
 
 $('stageSearch').addEventListener('input',()=>state.catalog&&updateStageOptions());
 $('stageSelect').addEventListener('change',guard(event=>selectStage(event.target.value)));
+$('runeOptions').addEventListener('change',guard(async()=>{
+  const runes=[...$('runeOptions').querySelectorAll('select')].map(s=>s.value).filter(Boolean);
+  const request=++stageRequest,id=state.project.stage;
+  const stage=await api(stageUrl(id,runes));if(request!==stageRequest)return;
+  state.project.options.optional_runes=runes;state.stage=stage;state.tile=null;
+  markDirty();updateStageView();renderMaps();renderOperationForm();
+}));
 $('operatorSearch').addEventListener('input',()=>state.catalog&&renderSearch());
 $('searchResults').addEventListener('click',guard(event=>{const button=event.target.closest('[data-id]');if(button)return openBuild(button.dataset.id);}));
 $('squadList').addEventListener('click',guard(event=>{const remove=event.target.closest('[data-remove]');if(remove)return removeMember(remove.dataset.remove);const card=event.target.closest('[data-id]');if(card)return openBuild(card.dataset.id);}));
 $('squadList').addEventListener('keydown',guard(async event=>{if(event.target.classList.contains('squad-card')&&['Enter',' '].includes(event.key)){event.preventDefault();await openBuild(event.target.dataset.id);}}));
 $('buildForm').addEventListener('submit',guard(event=>{event.preventDefault();return saveMember();}));
 $('buildForm').addEventListener('input',()=>{
-  state.draftDirty=true;$('saveState').textContent='练度尚未加入／保存';
+  state.draftDirty=true;showSaveState();
   clearTimeout(statTimer);statTimer=setTimeout(previewBuild,300);
 });
 for(const id of ['elite','level','trust','skill','module']) $(id).addEventListener('change',()=>{
@@ -341,7 +457,7 @@ $('mapBoard').addEventListener('click',guard(event=>{
   state.tile=tile;renderOperationForm();renderMaps();
 }));
 $('operationForm').addEventListener('submit',guard(event=>{event.preventDefault();addOperation();}));
-$('cancelEditBtn').addEventListener('click',()=>{cancelEdit();renderOperations();});
+$('cancelEditBtn').addEventListener('click',()=>{cancelEdit();showSaveState();renderOperations();scheduleDraft();});
 $('operationList').addEventListener('click',event=>{
   const row=event.target.closest('[data-index]');if(!row)return;const index=Number(row.dataset.index);
   if(event.target.closest('[data-delete]')){state.project.operations.splice(index,1);cancelEdit();markDirty();renderOperations();renderMaps();}
@@ -358,7 +474,19 @@ $('saveBtn').addEventListener('click',guard(saveProject));
 $('simulateBtn').addEventListener('click',guard(simulate));
 $('importBtn').addEventListener('click',()=>$('importFile').click());
 $('importFile').addEventListener('change',guard(async event=>{const file=event.target.files?.[0];if(file)try{await importFile(file);}finally{event.target.value='';}}));
-window.addEventListener('beforeunload',event=>{if(state.dirty||state.draftDirty){event.preventDefault();event.returnValue='';}});
+function markOperationDraft() {state.operationDirty=true;showSaveState();scheduleDraft();}
+for(const event of ['input','change']){
+  $('operationForm').addEventListener(event,markOperationDraft);
+  document.addEventListener(event,e=>{if(e.target.matches('input,select'))scheduleDraft();});
+}
+document.querySelectorAll('[data-facing]').forEach(button=>button.addEventListener('click',markOperationDraft));
+$('mapBoard').addEventListener('click',event=>{if(event.target.closest('[data-r]')&&state.tile&&$('opAction').value==='DEPLOY')markOperationDraft();});
+$('followTimeBtn').addEventListener('click',scheduleDraft);
+$('restoreDraftBtn').addEventListener('click',guard(restoreDraft));
+$('skipDraftBtn').addEventListener('click',scheduleDraft);
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')flushDraft(true);});
+window.addEventListener('pagehide',()=>flushDraft(true));
+window.addEventListener('beforeunload',event=>{flushDraft(true);if(state.dirty||state.draftDirty||state.operationDirty){event.preventDefault();event.returnValue='';}});
 
 (async()=>{
   try {
@@ -366,6 +494,7 @@ window.addEventListener('beforeunload',event=>{if(state.dirty||state.draftDirty)
     state.catalog=await api('/api/catalog');
     $('connection').textContent=`本地数据已连接 · ${state.catalog.stages.length} 个关卡 / ${state.catalog.operators.length} 名干员 · v${state.catalog.engineVersion}`;
     updateStageOptions();renderSquad();renderOperations();
+    await checkDraft();
     if(!state.catalog.stages.length)notify('没有可用地图，请先向本地数据目录导入关卡文件',true);
   }catch(error){$('offline').hidden=false;$('offlineReason').textContent=error.message;$('connection').textContent='未连接本地服务';}
 })();

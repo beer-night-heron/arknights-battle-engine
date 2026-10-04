@@ -350,8 +350,8 @@
     const canvas = el('map'), ctx = canvas.getContext('2d');
     const markerCanvas = el('markers'), markerCtx = markerCanvas.getContext('2d');
     const eventGroups = {
-      major:['deploy','skill_cast','skill_active','skill_end','mode_change','operator_death','enemy_death','leak','life_change','retreat','operation','wave_ready','wave_timeout'],
-      operations:['operation','mode_change','wave_ready','wave_timeout'],
+      major:['deploy','skill_cast','skill_active','skill_end','mode_change','form_change','operator_death','enemy_death','leak','life_change','retreat','operation','wave_ready','wave_timeout'],
+      operations:['operation','mode_change','form_change','wave_ready','wave_timeout'],
       damage:['enemy_damage','operator_damage','projectile_launch','projectile_end'],
       movement:['spawn','block','unblock','disappear','appear']
     };
@@ -436,6 +436,7 @@
       drawMuzzles(frame,g);
     }
     function eventLabel(event){
+      if(event.kind==='form_change')return [event.event==='ALL_OUT_ATTACK'?'总攻击':'形态变化',`#${event.target} / ${formName(event.form)} / f${event.frame}`];
       if(event.kind==='operation'){
         const actions={DEPLOY:'部署',RETREAT:'撤退',SKILL:'开技能',SKILL_END:'主动结束',SWITCH_MODE:'切换模式'},statuses={succeeded:'成功',waiting:'等待',failed:'失败',unfinished:'未完成',not_executed:'未执行'};
         const name=currentCase().roster?.find(item=>item.char===event.char)?.name||event.char||'';
@@ -458,6 +459,7 @@
     function activeKinds(){if(state.filters.has('all'))return null;const result=new Set();for(const group of state.filters)for(const kind of eventGroups[group]||[])result.add(kind);return result;}
     function renderEvents(){const box=el('events'),frame=currentFrame(),allowed=activeKinds();const filtered=currentCase().events.filter(e=>!hiddenEventKinds.has(e.kind)&&(!allowed||allowed.has(e.kind)));let nearest=filtered.findIndex(e=>e.t>=frame.t);if(nearest<0)nearest=filtered.length-1;const start=Math.max(0,nearest-70),slice=filtered.slice(start,start+150);box.innerHTML=slice.map(event=>{const [title,detail]=eventLabel(event);return `<div class="event ${Math.abs(event.t-frame.t)<.04?'now':''}" data-time="${event.t}" style="color:${eventColor(event.kind)}"><time>${event.t.toFixed(2)}</time><i class="dot"></i><div><strong>${escapeText(title)}</strong><small>${escapeText(detail)}</small></div></div>`}).join('');box.querySelectorAll('.event').forEach(node=>node.onclick=()=>seekTime(Number(node.dataset.time)));const now=box.querySelector('.now');if(now)now.scrollIntoView({block:'center'});}
     const attributeText = (value, suffix='') => Number.isFinite(value) ? `${fmt(value)}${suffix}` : '—';
+    const formName = form => ({BODY:'本体',THANATOS:'塔纳托斯',ORPHEUS:'俄耳甫斯',TRANSITION:'切换中',ALL_OUT:'总攻击'}[form]||form);
     const reserveLabel = card => card.status==='cooldown' ? `冷却 ${Number(card.remaining).toFixed(1)}s` : card.status==='cost' ? '费用不足' : '待部署';
     function renderReserve(){
       const cards=currentFrame().reserve;
@@ -503,6 +505,7 @@
           const attrs=entity.attributes||{};
           rows=[['ID',entity.id],['坐标',`${entity.r}, ${entity.c}`],['HP',`${fmt(entity.hp)} / ${fmt(entity.max)}`],['攻击力',attributeText(attrs.atk)],['防御力',attributeText(attrs.def)],['法术抗性',attributeText(attrs.res)],['攻击间隔',attributeText(attrs.attackInterval,' s')],['阻挡',`${entity.blocked} / ${attributeText(attrs.blockCapacity)}`],['技能',entity.starting?'开启动画':entity.active?'生效中':'未开启'],['已用技能',`${entity.casts} 次`],['状态',entity.dead?'倒下':'在场']];
           renderSp(entity);
+          if(entity.form)rows.push(['形态',formName(entity.form)]);
           if(entity.canSwitchMode)rows.push(['技能模式',entity.skillMode===0?'初始状态':'技能状态']);
           if(entity.canEndSkill)rows.push(['主动结束',entity.active?'支持':'技能未开启']);
         }

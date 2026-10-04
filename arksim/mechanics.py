@@ -87,6 +87,7 @@ class DamagePacket:
     target_defense_override: float | None = None
     target_resistance_override: float | None = None
     target_elemental_resistance_override: float | None = None
+    weakness: bool = False
 
     def normalized_damage_type(self) -> DamageType:
         value = str(getattr(self.damage_type, "value", self.damage_type)).upper()
@@ -485,7 +486,8 @@ def apply_damage(
         if statuses.has(Status.HEAL_FREE) or getattr(target, "dead", False):
             return DamageResult(0.0, 0.0, 0.0, cancelled=True, healed=True)
         basic = max(float(packet.amount), 0.0)
-        amount = basic * packet.output_scale * packet.taken_scale
+        amount = (basic * packet.output_scale * packet.taken_scale
+                  * getattr(target, "received_heal_scale", 1.0))
         missing = max(float(target.max_hp) - float(target.hp), 0.0)
         healed = min(amount, missing)
         target.hp += healed
@@ -519,6 +521,23 @@ def apply_damage(
         else packet
     )
 
+    defense = (float(packet.target_defense_override) if packet.target_defense_override is not None
+               else float(getattr(target, "defense", 0.0)))
+    resistance = (float(packet.target_resistance_override) if packet.target_resistance_override is not None
+                  else float(getattr(target, "res", 0.0)))
+    if packet.weakness and damage_type in (DamageType.PHYSICAL, DamageType.ARTS):
+        fixed = getattr(target, "fixed_weakness", None)
+        if fixed is not None:
+            damage_type = DamagePacket(0, fixed).normalized_damage_type()
+        else:
+            physical = calculate_basic_damage(replace(resolved_packet, damage_type=DamageType.PHYSICAL),
+                                              defense=defense, resistance=resistance)
+            arts = calculate_basic_damage(replace(resolved_packet, damage_type=DamageType.ARTS),
+                                          defense=defense, resistance=resistance)
+            if not math.isclose(physical, arts, rel_tol=1e-6, abs_tol=1e-6):
+                damage_type = DamageType.PHYSICAL if physical > arts else DamageType.ARTS
+        resolved_packet = replace(resolved_packet, damage_type=damage_type)
+        packet = replace(packet, damage_type=damage_type)
     basic = calculate_basic_damage(
         resolved_packet,
         defense=(
@@ -594,6 +613,9 @@ def apply_damage(
         amount = min(amount, max(float(target.hp) - 1.0, 0.0))
     target.hp -= amount
     killed = target.hp <= 0
+    handler = getattr(target, "lethal_handler", None)
+    if killed and callable(handler) and handler(packet):
+        killed = False
     if killed:
         target.hp = 0.0
         target.dead = True

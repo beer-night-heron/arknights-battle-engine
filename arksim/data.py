@@ -79,6 +79,14 @@ def load_enemy_graphics() -> dict[str, Any]:
         return {}
 
 
+def load_operator_forms() -> dict[str, Any]:
+    """Optional local animation and form transition profiles."""
+    try:
+        return _load("operator_forms.json")
+    except FileNotFoundError:
+        return {}
+
+
 def load_enemy_buff_abilities() -> dict[str, Any]:
     """Load the normalized enemy Buff definitions used by the simulator."""
     try:

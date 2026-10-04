@@ -68,6 +68,7 @@ def compact_operator(operator: Any, battle: Battle) -> dict[str, Any]:
         and operator.skill_prefab_id == "skchr_headb2_2"
         and math.isclose(battle.dt, 1 / CLIENT_LOGIC_RATE, abs_tol=1e-12)
         and operator.sp_increment == 1.0
+        and operator.squad_bonus.sp_recovery == 0.0
     )
     progress = (
         1.0 - operator.sp_recovery_remaining_raw / CLIENT_FP_SCALE
@@ -94,8 +95,8 @@ def compact_operator(operator: Any, battle: Battle) -> dict[str, Any]:
             or operator.sp >= operator.sp_max
         ),
         "attributes": {
-            "atk": round(operator.atk * operator.atk_scale, 2),
-            "def": round(operator.defense * operator.def_scale, 2),
+            "atk": round(battle.operator_attack_power(operator), 2),
+            "def": round(battle.operator_defense(operator), 2),
             "res": round(battle._effective_resistance(operator), 2),
             "attackInterval": round(battle._effective_attack_interval(operator), 4),
             "blockCapacity": operator.block_count if operator.statuses.can_block else 0,
@@ -107,6 +108,7 @@ def compact_operator(operator: Any, battle: Battle) -> dict[str, Any]:
         "canEndSkill": operator.skill_controls.can_end,
         "canSwitchMode": operator.skill_controls.can_switch,
         "skillEndReason": operator.skill_end_reason,
+        "form": operator.form_runtime.mode if operator.form_runtime is not None else None,
         "atkScale": round(operator.atk_scale, 4),
         "defScale": round(operator.def_scale, 4),
         "blocked": len([enemy for enemy in operator.blocked if not enemy.dead]),
@@ -136,7 +138,12 @@ def compact_projectile(projectile: Any) -> dict[str, Any]:
 def export_roster(battle: Battle) -> list[dict[str, Any]]:
     """Keep plan profiles separate so redeployments can use different builds."""
     roster = []
-    for index, plan in enumerate(battle.plan):
+    planned = {item.char_id for item in battle.plan if item.action == "DEPLOY"}
+    profiles = list(enumerate(battle.plan)) + [
+        (len(battle.plan) + index, item) for index, item in enumerate(battle.squad)
+        if item.char_id not in planned
+    ]
+    for index, plan in profiles:
         if plan.action != "DEPLOY" or plan.char_id not in battle.characters:
             continue
         character = battle.characters[plan.char_id]
@@ -148,6 +155,7 @@ def export_roster(battle: Battle) -> list[dict[str, Any]]:
         )
         roster.append({
             "profile": index, "char": plan.char_id,
+            "planned": plan.char_id in planned,
             "name": character.get("name", plan.char_id),
             "baseCost": int(attrs.get("cost", 0)),
             "loadout": {key: getattr(plan, key) for key in (
@@ -177,9 +185,8 @@ def reserve_state(battle: Battle, roster: list[dict[str, Any]]) -> list[dict[str
         if char_id in active:
             continue
         remaining = max(0.0, battle.redeploy_ready_at.get(char_id, 0.0) - battle.time)
-        penalty = battle.redeploy_penalty.get(char_id, 0)
-        cost = min(math.floor(profile["baseCost"] * (1.0 + .5 * penalty)), battle.max_cost)
-        status = "cooldown" if remaining > 1e-9 else "cost" if battle.dp < cost else "ready"
+        cost = battle.deployment_cost(char_id, profile["baseCost"])
+        status = "cooldown" if remaining > 1e-9 else "cost" if battle.dp - cost < battle.cost_lower_bound else "ready"
         cards.append({"profile": profile["profile"], "char": char_id, "cost": cost, "status": status, "remaining": round(remaining, 3)})
     return cards
 
@@ -377,6 +384,8 @@ def run_case(
         assumptions=shared.get("assumptions"),
         module_index=shared.get("module_index"),
         favor_table=shared.get("favor_table"),
+        squad=shared.get("squad"),
+        operator_forms=shared.get("operator_forms"),
     )
     frames: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
@@ -404,6 +413,12 @@ def run_case(
         battle.end_reason = "timeout"
     events.extend(battle.operation_log.events)
     events.extend(battle.wave_scheduler.events)
+    for op in battle.operators:
+        if op.form_runtime is not None:
+            events.extend(make_event(item["time"], "form_change", target=op.deployment_index,
+                                     form=item["mode"], event=item["event"], frame=item["frame"],
+                                     hp=item["hp"], sp=item["sp"], expiresAt=item["expires_at"])
+                          for item in op.form_runtime.events)
     for operation in battle.operation_log.summary(battle.end_reason, battle.time):
         if operation["status"] in ("unfinished", "not_executed"):
             events.append(make_event(
@@ -424,6 +439,9 @@ def run_case(
         "enemyTurning": battle.assumptions.enemy_facing_transition,
         "routes": export_routes(battle),
         "roster": roster,
+        "squad": [item.char_id for item in battle.squad],
+        "difficulty": battle.level.get("selectedDifficulty", "NORMAL"),
+        "optionalRunes": battle.level.get("selectedOptionalRunes", []),
         "frames": frames,
         "events": events,
         "result": asdict(battle.result()),
@@ -468,6 +486,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
     parser.add_argument("--stage", required=True)
     parser.add_argument("--plan", required=True)
+    parser.add_argument("--squad", help="carried operator builds, including undeployed operators")
+    parser.add_argument("--difficulty", choices=("NORMAL", "SIX_STAR"))
+    parser.add_argument("--rune", action="append", default=[], help="optional rune ID or level key; repeat for each selection")
     parser.add_argument("--label", default="模拟")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--sample-interval", type=float, default=1 / 30)
@@ -488,6 +509,9 @@ def main(argv: list[str] | None = None) -> int:
             strict_behaviors=args.strict_behaviors,
             enemy_muzzle=args.enemy_muzzle,
             enemy_turning=args.enemy_turning,
+            squad_path=args.squad,
+            difficulty=args.difficulty,
+            optional_runes=args.rune,
         )
     except (OSError, ValueError, KeyError) as error:
         parser.error(f"cannot load simulation inputs: {error}")
@@ -498,6 +522,8 @@ def main(argv: list[str] | None = None) -> int:
         "format": "arksim-replay", "schemaVersion": 1,
         "engineVersion": __version__, "createdAt": created,
         "stage": args.stage, "spawnTiming": args.spawn_timing,
+        "difficulty": shared["level"].get("selectedDifficulty", "NORMAL"),
+        "optionalRunes": shared["level"].get("selectedOptionalRunes", []),
         "enemyAttackTiming": args.enemy_attack_timing,
         "enemyMuzzle": args.enemy_muzzle, "enemyTurning": args.enemy_turning,
         "map": export_map(shared["level"]), "cases": [case],
@@ -516,6 +542,9 @@ def main(argv: list[str] | None = None) -> int:
         "format": "arksim-replay", "schemaVersion": 1,
         "createdAt": created, "engineVersion": __version__,
         "stage": args.stage, "plan": Path(args.plan).name, "seed": args.seed,
+        "difficulty": shared["level"].get("selectedDifficulty", "NORMAL"),
+        "optionalRunes": shared["level"].get("selectedOptionalRunes", []),
+        "squad": Path(args.squad).name if args.squad else None,
         "sampleInterval": args.sample_interval,
         "spawnTiming": args.spawn_timing, "enemyAttackTiming": args.enemy_attack_timing,
         "enemyMuzzle": args.enemy_muzzle, "enemyTurning": args.enemy_turning,

@@ -9,12 +9,12 @@ from . import data as D
 from .cli import parse_plan, resolve_level_file
 from .loadout import resolve_plan
 from .skill_controls import skill_controls
+from .squad import BUILD_FIELDS
+from .runes import select_stage_runes, forbidden_locations
 
-BUILD_FIELDS = {"char_id", "elite", "level", "trust", "potential_rank", "skill_id",
-                "skill_level", "module_id", "module_level", "auto_skill"}
 OP_FIELDS = {"char_id", "time", "action", "tile", "facing", "on_failure", "mode"}
 DEFAULT_OPTIONS = {"spawn_timing": "fast", "enemy_attack_timing": "float", "seed": 0,
-                   "enemy_muzzle": False, "enemy_turning": False}
+                   "enemy_muzzle": False, "enemy_turning": False, "optional_runes": []}
 
 
 class EditorData:
@@ -33,17 +33,24 @@ class EditorData:
         for key, value in self.stages.get("stages", {}).items():
             if value.get("levelId") and (self.data_dir / resolve_level_file(self.stages, key)).is_file():
                 stages.append({"id": key, "code": value.get("code") or key,
-                               "name": value.get("name") or key})
+                               "name": value.get("name") or key, "difficulty": value.get("difficulty")})
         operators = [{"id": k, "name": v.get("name", k), "position": v.get("position"),
                       "profession": v.get("profession"), "rarity": v.get("rarity")}
                      for k, v in self.characters.items() if k.startswith("char_")]
         return {"stages": stages, "operators": operators}
 
-    def stage(self, key: str) -> dict:
+    def stage(self, key: str, optional_runes: list[str] | None = None) -> dict:
         from tools.simulate import export_map
         filename = resolve_level_file(self.stages, key)
-        level = D.load_level(filename)
-        return {"id": key, "map": export_map(level), "options": level.get("options", {})}
+        level = select_stage_runes(self.stages, key, D.load_level(filename), optional_runes)
+        grid = export_map(level)
+        for r, c in forbidden_locations(level):
+            if 0 <= r < grid["height"] and 0 <= c < grid["width"]:
+                grid["cells"][r][c]["build"] = "NONE"
+        meta = self.stages["stages"][key]
+        groups = [[{"id": rid, "description": self.stages["sixStarRuneData"][rid]["runeDesc"]}
+                   for rid in meta.get(field) or []] for field in ("advancedRuneIdList1", "advancedRuneIdList2")]
+        return {"id": key, "map": grid, "options": level.get("options", {}), "runeGroups": groups}
 
     def operator(self, key: str) -> dict:
         char = self.characters.get(key)
@@ -133,6 +140,9 @@ class EditorData:
             raise ValueError("种子须为0至4294967295的整数")
         if any(type(options[k]) is not bool for k in ("enemy_muzzle", "enemy_turning")):
             raise ValueError("挂点和转身开关须为布尔值")
+        if not isinstance(options["optional_runes"], list) or any(not isinstance(key, str) for key in options["optional_runes"]):
+            raise ValueError("关卡附加条件须为字符串数组")
+        stage = self.stage(stage_id, options["optional_runes"])
         operations = project.get("operations")
         if not isinstance(operations, list) or len(operations) > 10000:
             raise ValueError("操作须为数组，最多10000条")

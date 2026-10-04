@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -28,19 +29,86 @@ class EditorServer(ThreadingHTTPServer):
         self.output_root = output_root.resolve()
         self.jobs: dict[str, dict] = {}
         self.saved: dict[str, Path] = {}
+        self.draft_lock = threading.Lock()
         self.job_lock = threading.Lock()
         super().__init__(address, EditorHandler)
+
+    def latest_draft(self, session: str = "") -> dict | None:
+        if session and not re.fullmatch(r"[0-9a-f]{32}", session):
+            raise ValueError("草稿会话编号无效")
+        folder = self.output_root / "editor" / "drafts"
+        files = sorted(folder.glob("*.json"), reverse=True)
+        own = [p for p in files if f"_{session}_" in p.name] if session else []
+        for path in own + [p for p in files if p not in own]:
+            try:
+                draft = json.loads(path.read_text(encoding="utf-8"))
+                self.validate_draft(draft)
+                if not isinstance(draft.get("savedAt"), str):
+                    continue
+                return draft
+            except (OSError, ValueError, TypeError):
+                continue
+        return None
+
+    @staticmethod
+    def validate_draft(draft: dict) -> None:
+        if not isinstance(draft, dict) or not isinstance(draft.get("session"), str) or not re.fullmatch(r"[0-9a-f]{32}", draft["session"]):
+            raise ValueError("草稿会话编号无效")
+        if type(draft.get("revision")) is not int or draft["revision"] < 1:
+            raise ValueError("草稿修订编号无效")
+        snapshot = draft.get("snapshot")
+        if not isinstance(snapshot, dict) or snapshot.get("version") != 1:
+            raise ValueError("草稿格式无效")
+        project = snapshot.get("project")
+        if (not isinstance(project, dict) or project.get("format") != "arksim-plan-editor"
+                or type(project.get("version")) is not int or project["version"] != 1
+                or not isinstance(project.get("stage"), str)
+                or not isinstance(project.get("options"), dict)
+                or not isinstance(project.get("squad"), list) or len(project["squad"]) > 100
+                or not isinstance(project.get("operations"), list) or len(project["operations"]) > 10000
+                or any(not isinstance(item, dict) for item in project["squad"] + project["operations"])
+                or not isinstance(snapshot.get("ui"), dict)):
+            raise ValueError("草稿方案格式无效")
+        ui = snapshot["ui"]
+        if (ui.get("step") not in ("setup", "operations")
+                or ui.get("selectedBuild") is not None and not isinstance(ui["selectedBuild"], str)
+                or any(not isinstance(ui.get(k), dict) for k in ("build", "operation", "options"))
+                or any(type(ui.get(k)) is not bool for k in ("dirty", "buildDirty", "operationDirty"))
+                or type(ui.get("facing")) is not int or not 0 <= ui["facing"] <= 3
+                or type(ui.get("preview")) not in (int, float) or not 0 <= ui["preview"] < float("inf")
+                or ui.get("editIndex") is not None and (type(ui["editIndex"]) is not int or not 0 <= ui["editIndex"] < len(project["operations"]))
+                or ui.get("tile") is not None and (not isinstance(ui["tile"], list) or len(ui["tile"]) != 2 or any(type(v) is not int or v < 0 for v in ui["tile"]))):
+            raise ValueError("草稿表单格式无效")
+
+    def save_draft(self, draft: dict) -> dict:
+        self.validate_draft(draft)
+        with self.draft_lock:
+            previous = self.latest_draft(draft["session"])
+            if previous and previous["session"] == draft["session"] and previous["revision"] >= draft["revision"]:
+                return {"revision": previous["revision"], "savedAt": previous["savedAt"]}
+            saved_at = datetime.now(timezone.utc)
+            folder = self.output_root / "editor" / "drafts"
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / (saved_at.strftime("%Y%m%d_%H%M%S_%f_") + draft["session"] + "_" + uuid4().hex[:8] + ".json")
+            value = {"session": draft["session"], "revision": draft["revision"],
+                     "savedAt": saved_at.isoformat(), "snapshot": draft["snapshot"]}
+            encoded = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
+            with path.open("x", encoding="utf-8") as stream:
+                stream.write(encoded)
+            return {"revision": value["revision"], "savedAt": value["savedAt"]}
 
     def save(self, compiled: dict) -> dict:
         key = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_") + uuid4().hex[:8]
         folder = self.output_root / "plans" / "editor" / key
         folder.mkdir(parents=True, exist_ok=False)
-        for name, value in (("project.json", compiled["project"]), ("plan.json", compiled["plan"])):
+        for name, value in (("project.json", compiled["project"]), ("plan.json", compiled["plan"]),
+                            ("squad.json", compiled["project"]["squad"])):
             (folder / name).write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
         with self.job_lock:
             self.saved[key] = folder
         return {"folder": str(folder), "projectFile": str(folder / "project.json"),
                 "planFile": str(folder / "plan.json"),
+                "squadFile": str(folder / "squad.json"),
                 "projectUrl": f"/api/saved?save={key}&name=project.json",
                 "planUrl": f"/api/saved?save={key}&name=plan.json"}
 
@@ -53,7 +121,8 @@ class EditorServer(ThreadingHTTPServer):
             job_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_") + uuid4().hex[:8]
             folder = self.output_root / "editor" / "runs" / job_id
             folder.mkdir(parents=True, exist_ok=False)
-            for name, value in (("plan.json", compiled["plan"]), ("project.json", compiled["project"])):
+            for name, value in (("plan.json", compiled["plan"]), ("project.json", compiled["project"]),
+                                ("squad.json", compiled["project"]["squad"])):
                 (folder / name).write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
             job = {"id": job_id, "status": "running", "message": "正在模拟…"}
             self.jobs[job_id] = job
@@ -64,11 +133,14 @@ class EditorServer(ThreadingHTTPServer):
         opts = project["options"]
         command = [sys.executable, str(ROOT / "tools/simulate.py"), "--data-dir", str(self.data.data_dir),
                    "--stage", project["stage"], "--plan", str(folder / "plan.json"),
+                   "--squad", str(folder / "squad.json"),
                    "--spawn-timing", opts["spawn_timing"], "--enemy-attack-timing", opts["enemy_attack_timing"],
                    "--seed", str(opts["seed"]), "--output-dir", str(self.output_root)]
         for key in ("enemy_muzzle", "enemy_turning"):
             if opts[key]:
                 command.append("--" + key.replace("_", "-"))
+        for rune in opts.get("optional_runes", []):
+            command.extend(["--rune", rune])
         try:
             result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, encoding="utf-8",
                                     errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -123,9 +195,13 @@ class EditorHandler(BaseHTTPRequestHandler):
             if url.path == "/api/catalog":
                 return self.respond({**self.server.data.catalog(), "engineVersion": __version__})
             if url.path == "/api/stage":
-                return self.respond(self.server.data.stage(params.get("id", [""])[0]))
+                return self.respond(self.server.data.stage(params.get("id", [""])[0], params.get("rune", [])))
             if url.path == "/api/operator":
                 return self.respond(self.server.data.operator(params.get("id", [""])[0]))
+            if url.path == "/api/draft":
+                with self.server.draft_lock:
+                    draft = self.server.latest_draft(params.get("session", [""])[0])
+                return self.respond({"draft": draft})
             if url.path == "/api/saved":
                 key, name = params.get("save", [""])[0], params.get("name", [""])[0]
                 with self.server.job_lock:
@@ -178,6 +254,8 @@ class EditorHandler(BaseHTTPRequestHandler):
             if not 0 < length <= 2_000_000:
                 raise ValueError("请求为空或超过2MB")
             payload = json.loads(self.rfile.read(length))
+            if self.path == "/api/draft":
+                return self.respond(self.server.save_draft(payload))
             if self.path == "/api/build":
                 config, summary = self.server.data.build(payload)
                 return self.respond({"config": config, "summary": summary})

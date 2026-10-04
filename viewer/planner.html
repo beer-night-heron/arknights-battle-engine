@@ -11,7 +11,11 @@
     <div class="file-actions"><button id="importBtn">导入</button><button id="saveBtn">保存方案</button><button id="exportBtn">导出操作 JSON</button><a href="index.html" class="button">回放页 ↗</a></div>
     <input id="importFile" type="file" accept=".json,application/json" hidden>
   </header>
-  <div class="status-strip"><span id="connection">正在连接本地数据…</span><span id="saveState">未保存方案</span></div>
+  <div class="status-strip"><span id="connection">正在连接本地数据…</span><span id="saveState">未保存方案</span><span id="draftState" role="status" aria-live="polite">正在检查本地草稿…</span></div>
+  <section id="draftRecovery" class="draft-recovery" aria-label="恢复编辑草稿" hidden>
+    <div><strong>继续上次编排</strong><p id="draftDescription"></p><small>草稿包含尚未加入的表单；正式方案仍需点击“保存方案”。</small></div>
+    <div class="form-buttons"><button id="restoreDraftBtn" class="primary">恢复草稿</button><button id="skipDraftBtn">开始新方案</button></div>
+  </section>
   <main>
     <section id="setupView" class="setup-layout">
       <aside class="panel stage-panel">
@@ -19,6 +23,7 @@
         <label>搜索关卡<input id="stageSearch" type="search" placeholder="关卡编号、名称或 ID"></label>
         <label>关卡<select id="stageSelect"><option value="">请选择关卡</option></select></label>
         <div id="stageInfo" class="stage-info">尚未选择地图</div>
+        <div id="runeOptions" hidden></div>
         <div class="mini-map" id="miniMap"></div>
         <details class="run-options"><summary>模拟选项</summary>
           <label>出怪时序<select id="spawnTiming"><option value="fast">标称时序</option><option value="client">逐帧时序</option><option value="frame_core">动作队列时序</option></select></label>

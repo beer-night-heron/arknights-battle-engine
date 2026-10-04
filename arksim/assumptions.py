@@ -29,8 +29,11 @@ class SimulationAssumptions:
     headb2_periodic_sp_recovery: bool = True
     operator_target_selector_before_enemy_movement: bool = False
     operator_block_scan_from_deploy_frame: bool = True
+    form_block_resume_next_frame: bool = True
     mortar_first_attack_extra_frames: int = 2
     retime_enemy_attack_cooldown: bool = True
+    enemy_attack_animation_rearm: bool = True
+    melee_attack_animation_interval_scale: bool = True
     ranged_attack_move_transition_frames: int = 2
     # Highland echo is committed after the current frame's movement.  When
     # the receiving frame has already consumed its movement, two extra
@@ -39,6 +42,7 @@ class SimulationAssumptions:
     sluggish_extra_frames: int = 2
     portal_wait_extra_frames: int = 1
     route_wait_expiry_epsilon: float = 1e-9
+    initial_wait_zero_move_handoff: bool = True
 
 
 DEFAULT_ASSUMPTIONS = SimulationAssumptions()
@@ -54,6 +58,7 @@ ASSUMPTION_NOTES = {
     "REVERSE_ENGINEERED_NEXT_NODE": "路径采用四方向加权搜索、nextNode平整化与路线级转向模式；特殊导航仍有限制。",
     "REVERSE_ENGINEERED_BLOCKING": "阻挡点以二次ease-out轨迹在0.2秒内到达；同帧阻挡争抢按单位创建顺序处理，特殊情形仍待完善。",
     "OPERATOR_BLOCK_SCAN_DEPLOYMENT_PHASE": "干员从部署帧的下一帧开始每3帧阻挡扫描；新关系在对应敌人后续实体更新中消费，该周期仍是可替换模型。",
+    "FORM_BLOCK_RESUME_NEXT_FRAME": "形态切换将零阻挡恢复为正阻挡时，从下一逻辑帧恢复扫描；实战恢复阶段支持该候选，其他形态与通知顺序仍待完善。",
     "STEERING_FOOT_POSITION": "缺少逐单位避障形状时，FootPoint采用实体下方0.2格、半宽0.2格的近似。",
     "ENEMY_SPAWN_FRAME_NO_MOVE": "出生逻辑帧与紧接的状态过渡帧不执行自主移动；其他出生动作仍需独立适配。",
     "ENEMY_SPAWN_ACTION_LOCK": "普通攻击敌人出生后的两个30Hz逻辑帧不开始新攻击；该时序是当前近似模型。",
@@ -64,6 +69,8 @@ ASSUMPTION_NOTES = {
     "OPERATOR_SELECTOR_PRE_MOVEMENT_SEARCH": "可选分组模式在全部敌人移动前搜索；默认创建序模式中，查询可见位置取决于双方更新顺序。",
     "MORTAR_FIRST_ATTACK_EXTRA_FRAMES": "部分炮兵首轮攻击后的冷却比后续节奏额外跨2个逻辑帧；适用范围有限，不是通用敌人规则。",
     "ENEMY_ATTACK_COOLDOWN_RETIME": "有效攻击间隔变化时，活动冷却按新旧间隔比例缩放；不同敌人或效果的适用性仍需完善。",
+    "ENEMY_ATTACK_ANIMATION_REARM": "敌人普通攻击需先播放完动画；结束时剩余冷却小于半帧则当帧可续攻，否则将余量向上取整并在归零下一帧可起手。规则依据用户确认，动态动画速度、打断及特殊能力交接仍未完整覆盖。",
+    "MELEE_ATTACK_ANIMATION_INTERVAL_SCALE": "普通近战攻击间隔短于原攻击动画时，加速动画并同步缩短前摇；实测压缩间隔支持该候选，动态攻速变化、特殊动作及远程动画不在此规则内。",
     "RANGED_ATTACK_MOVE_TRANSITION": "普通远程敌人的攻击动画时长转换为整数逻辑帧，随后跨2帧状态衔接才恢复自主位移；多单位观察支持该候选模型，特殊动作、打断和不同攻速仍待验证。",
     "HEADB2_ECHO_TARGET_AT_EXECUTION": "高台回响保存触发格，0.1秒后按执行帧的敌人当前位置查询影响格并结算；不预缓存受击目标。",
     "SLUGGISH_DURATION_EXTRA_FRAME": "移动后提交的高台停顿若未在接收帧消费，时长补入2个逻辑帧以表达当前状态阶段模型；不可直接推广到其他控制效果。",
@@ -71,6 +78,7 @@ ASSUMPTION_NOTES = {
     "HEADB2_HAMMER_POST_MOVEMENT_HIT": "凛冬锤击在到期帧的普通实体移动完成后、回响和Buff计时前结算；该阶段不推广到所有伤害事件。",
     "ROUTE_WAIT_EXPIRY_EPSILON": "可见路线等待剩余量不超过1e-9秒时结束以消除浮点尾差；隐藏和传送等待保留严格计时。",
     "INITIAL_ROUTE_WAIT_SAME_FRAME_MOVE": "可见出生路线的首个WAIT可在归零帧恢复移动；途中等待及隐藏等待保留各自阶段，该规则仍为候选模型。",
+    "INITIAL_WAIT_ZERO_MOVE_HANDOFF": "可见出生等待结束后若紧接当前位置的MOVE，本帧消费该原地节点，下一帧才继续向后续节点运动；实战路径游标与首位移支持该候选，内部等待计时及其他路线仍待完善。",
     "MORTAR_ATTACK_INTERVAL_LOGIC_FRAMES": "可选炮兵整数帧模型按30Hz四舍五入有效攻击间隔；默认采用浮点路径，模式不表示通用精确时序。",
     "ENEMY_TARGET_COLLISION_RADIUS": "普通范围索敌和圆形溅射采用0.1格实体圆近似；凛冬高台回响使用离散影响格规则。",
     "CLIENT_COROUTINE_SPAWN_TIMING": "逐帧出怪模型为Fragment进入、敌人生成和路线预览累积调度帧；未覆盖动作仍采用近似。",

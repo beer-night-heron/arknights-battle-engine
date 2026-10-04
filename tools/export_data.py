@@ -1,8 +1,8 @@
 """Extract the JSON tables/levels we need from a local ArknightsGameData clone.
 
 The ArknightsGameData repo is cloned with `--filter=blob:none --no-checkout`,
-so files are not present on disk.  We use `git show HEAD:<path>` to materialize
-only the blobs the simulator needs.
+so files are not present on disk. We use `git show <ref>:<path>` to materialize
+only the blobs the simulator needs, without changing the clone's checkout.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ TABLES = [
     BEHAVIOR_TABLE,
 ]
 
-def git_show(repo: Path, rel_path: str) -> bytes:
+def git_show(repo: Path, rel_path: str, ref: str = "HEAD") -> bytes:
     proc = subprocess.run(
         [
             "git",
@@ -38,7 +38,7 @@ def git_show(repo: Path, rel_path: str) -> bytes:
             "-C",
             str(repo),
             "show",
-            f"HEAD:{rel_path}",
+            f"{ref}:{rel_path}",
         ],
         check=True,
         capture_output=True,
@@ -49,6 +49,7 @@ def git_show(repo: Path, rel_path: str) -> bytes:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True, help="path to the local data Git repository")
+    parser.add_argument("--ref", default="HEAD", help="local data revision to export; default HEAD")
     parser.add_argument("--out", default=str(DEFAULT_OUT))
     parser.add_argument(
         "--level",
@@ -82,14 +83,14 @@ def main() -> None:
         else ([BEHAVIOR_TABLE] if args.only_behaviors else TABLES)
     )
     for rel in tables:
-        data = git_show(repo, rel)
+        data = git_show(repo, rel, args.ref)
         dest = out / Path(rel).name
         dest.write_bytes(data)
         print(f"exported {dest.name} ({len(data)} bytes)")
 
     levels = [] if args.only_behaviors else args.level
     for rel in levels:
-        data = git_show(repo, rel)
+        data = git_show(repo, rel, args.ref)
         dest = out / Path(rel).name
         dest.write_bytes(data)
         print(f"exported {dest.name} ({len(data)} bytes)")
