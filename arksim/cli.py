@@ -75,6 +75,7 @@ def build_config(
         "skills": skills,
         "attack_timing": D.load_attack_timing(),
         "operator_forms": D.load_operator_forms(),
+        "operator_graphics": D.load_operator_graphics(),
         "behavior_templates": D.load_behavior_templates(),
         "battle_equips": equips,
         "module_index": module_index,
@@ -131,6 +132,8 @@ def _run_once(config: dict[str, Any], seed: int):
         assumptions=config.get("assumptions"),
         squad=config.get("squad"),
         operator_forms=config.get("operator_forms"),
+        operator_graphics=config.get("operator_graphics"),
+        module_context=config.get("module_context"),
     )
     return battle.run()
 

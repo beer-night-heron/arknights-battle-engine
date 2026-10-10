@@ -96,6 +96,7 @@ class MakotoS3:
         op.attack_cd = 0
         op.attack_chain_active = False
         op.statuses.durations.clear()
+        op.statuses.grants.clear()
         op.statuses.immunities = set(self.base_immunities)
         op.damage_rules.clear()
         op.element_burst = None

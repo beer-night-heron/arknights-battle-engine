@@ -162,7 +162,8 @@ def _merge_candidate(base: dict | None, override: dict) -> dict:
 
 
 def select_abilities(char: dict, elite: int, level: int, potential_rank: int,
-                     module: dict | None) -> tuple[dict | None, dict[int, dict], list[str]]:
+                     module: dict | None, *, game_tags: tuple[str, ...] = (),
+                     map_tags: tuple[str, ...] = ()) -> tuple[dict | None, dict[int, dict], list[str]]:
     trait = select_candidate((char.get("trait") or {}).get("candidates"), elite, level, potential_rank)
     talents = {}
     for index, bundle in enumerate(char.get("talents") or []):
@@ -171,15 +172,17 @@ def select_abilities(char: dict, elite: int, level: int, potential_rank: int,
             talents[index] = candidate
     deferred = []
     for index, part in enumerate((module or {}).get("parts", [])):
-        if (part.get("isToken") or part.get("validInGameTag") is not None
-                or part.get("validInMapTag") is not None):
-            deferred.append(f"part:{index}:conditional_or_token")
+        if part.get("isToken"):
+            deferred.append(f"part:{index}:token")
+            continue
+        if ((part.get("validInGameTag") is not None and part["validInGameTag"] not in game_tags)
+                or (part.get("validInMapTag") is not None and part["validInMapTag"] not in map_tags)):
             continue
         override = select_candidate((part.get("overrideTraitDataBundle") or {}).get("candidates"),
                                     elite, level, potential_rank)
         if override is not None:
             trait = _merge_candidate(trait, override)
-        groups: dict[int, list[dict]] = {}
+        groups: dict[tuple[int, str | None], list[dict]] = {}
         for candidate in (part.get("addOrOverrideTalentDataBundle") or {}).get("candidates") or []:
             if candidate.get("validModeIndices") is not None:
                 deferred.append(f"part:{index}:mode_condition")
@@ -187,9 +190,15 @@ def select_abilities(char: dict, elite: int, level: int, potential_rank: int,
             if "talentIndex" not in candidate:
                 deferred.append(f"part:{index}:missing_talent_index")
                 continue
-            groups.setdefault(int(candidate["talentIndex"]), []).append(candidate)
-        for talent_index, candidates in groups.items():
+            hidden = str(candidate.get("prefabKey")) if candidate.get("isHideTalent") else None
+            groups.setdefault((int(candidate["talentIndex"]), hidden), []).append(candidate)
+        for hidden_offset, ((talent_index, hidden), candidates) in enumerate(groups.items()):
             override = select_candidate(candidates, elite, level, potential_rank)
             if override is not None:
-                talents[talent_index] = _merge_candidate(talents.get(talent_index), override)
+                if hidden is not None:
+                    # Auxiliary effects can share the original talentIndex;
+                    # their ATK fields must not replace a token's upgrade ATK.
+                    talents[-1-index*100-hidden_offset] = dict(override)
+                else:
+                    talents[talent_index] = _merge_candidate(talents.get(talent_index), override)
     return trait, talents, deferred

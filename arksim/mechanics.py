@@ -40,6 +40,7 @@ class ApplyWay(str, Enum):
 
 class DamageRuleKind(str, Enum):
     SCALE = "SCALE"
+    RESISTANCE = "RESISTANCE"
     FLAT_REDUCTION = "FLAT_REDUCTION"
     BARRIER = "BARRIER"
     SHIELD = "SHIELD"
@@ -88,6 +89,10 @@ class DamagePacket:
     target_resistance_override: float | None = None
     target_elemental_resistance_override: float | None = None
     weakness: bool = False
+    ignore_heal_free: bool = False
+    modifier_key: str = ""
+    ability_owner: Any = None
+    damage_resistance: float = 0.0
 
     def normalized_damage_type(self) -> DamageType:
         value = str(getattr(self.damage_type, "value", self.damage_type)).upper()
@@ -108,7 +113,8 @@ class DamageRule:
 
     Higher priority runs first; equal-priority rules retain acquisition order.
     This can represent vulnerability, reduction, numeric barriers and
-    count-based shields without hard-coding one global order.
+    count-based shields without hard-coding one global order. RESISTANCE is
+    a nonstackable fraction applied in the preceding taking-damage phase.
     """
 
     kind: DamageRuleKind | str
@@ -143,6 +149,7 @@ class DamageResult:
 
 
 class Status(str, Enum):
+    FEAR = "FEAR"
     STUNNED = "STUNNED"
     DISABLED = "DISABLED"
     ROOT = "ROOT"
@@ -183,20 +190,35 @@ class StatusController:
     immunities: set[Status] = field(default_factory=set)
     resistance: float = 0.0
     resistances: dict[Status, float] = field(default_factory=dict)
+    grants: set[tuple[Status, Any]] = field(default_factory=set)
+
+    def grant(self, status: Status | str, owner: Any) -> bool:
+        """Keep a source-owned flag separate from ordinary timed applications."""
+        effect = _status(status)
+        if effect in self.immunities:
+            return False
+        self.grants.add((effect, owner))
+        return True
+
+    def revoke(self, status: Status | str, owner: Any) -> None:
+        self.grants.discard((_status(status), owner))
+
+    def active_statuses(self) -> set[Status]:
+        return set(self.durations) | {status for status, _ in self.grants}
 
     def has(self, status: Status | str) -> bool:
         effect = _status(status)
         if effect is Status.COLD:
             return any(
-                item in self.durations
+                item in self.active_statuses()
                 for item in (Status.COLD_FRIENDLY, Status.COLD_ENEMY)
             )
         if effect is Status.FROZEN:
             return any(
-                item in self.durations
+                item in self.active_statuses()
                 for item in (Status.FROZEN_FRIENDLY, Status.FROZEN_ENEMY)
             )
-        return effect in self.durations
+        return effect in self.durations or any(item is effect for item, _ in self.grants)
 
     def apply(
         self,
@@ -259,6 +281,7 @@ class StatusController:
 
     def remove(self, status: Status | str) -> None:
         effect = _status(status)
+        self.grants = {(item, owner) for item, owner in self.grants if item is not effect}
         if effect is Status.COLD:
             self.durations.pop(Status.COLD_FRIENDLY, None)
             self.durations.pop(Status.COLD_ENEMY, None)
@@ -477,13 +500,23 @@ def apply_damage(
     target: Any,
     *,
     roll: Callable[[float], bool] | None = None,
+    roll_labeled: Callable[[float, str], bool] | None = None,
+    on_calculate: Callable[[DamagePacket, Any], None] | None = None,
+    on_output: Callable[[DamagePacket, Any], None] | None = None,
+    on_taking_damage: Callable[[DamagePacket, Any], None] | None = None,
+    before_apply: Callable[[DamagePacket, Any], None] | None = None,
 ) -> DamageResult:
     """Resolve and apply one packet to an entity with common combat fields."""
     damage_type = packet.normalized_damage_type()
     statuses: StatusController = getattr(target, "statuses", StatusController())
 
     if damage_type is DamageType.HEAL:
-        if statuses.has(Status.HEAL_FREE) or getattr(target, "dead", False):
+        if getattr(target, "dead", False):
+            return DamageResult(0.0, 0.0, 0.0, cancelled=True, healed=True)
+        if on_output is not None:
+            on_output(packet, target)
+        if ((statuses.has(Status.HEAL_FREE) or getattr(target, "negative_hp_heal_free", False))
+                and not packet.ignore_heal_free):
             return DamageResult(0.0, 0.0, 0.0, cancelled=True, healed=True)
         basic = max(float(packet.amount), 0.0)
         amount = (basic * packet.output_scale * packet.taken_scale
@@ -507,10 +540,11 @@ def apply_damage(
     if critical_chance > 0.0:
         if critical_chance >= 1.0:
             critical = True
-        elif roll is None:
+        elif roll is None and roll_labeled is None:
             raise ValueError("probabilistic damage requires a roll callback")
         else:
-            critical = roll(critical_chance)
+            critical = (roll_labeled(critical_chance, "critical") if roll_labeled
+                        else roll(critical_chance))
     resolved_packet = (
         replace(
             packet,
@@ -538,6 +572,8 @@ def apply_damage(
                 damage_type = DamageType.PHYSICAL if physical > arts else DamageType.ARTS
         resolved_packet = replace(resolved_packet, damage_type=damage_type)
         packet = replace(packet, damage_type=damage_type)
+    if on_calculate is not None and damage_type is not DamageType.LIFE_LOSS:
+        on_calculate(packet, target)
     basic = calculate_basic_damage(
         resolved_packet,
         defense=(
@@ -556,7 +592,23 @@ def apply_damage(
             else float(getattr(target, "elemental_resistance", 0.0))
         ),
     )
-    amount = basic * packet.output_scale
+    if on_output is not None:
+        on_output(packet, target)
+    if on_taking_damage is not None and damage_type is not DamageType.LIFE_LOSS:
+        on_taking_damage(packet, target)
+    if (on_calculate is not None or on_output is not None or on_taking_damage is not None) and getattr(target, "dead", False):
+        return DamageResult(basic, 0.0, 0.0, cancelled=True)
+    resistance = max(0.0, float(packet.damage_resistance))
+    if not packet.bypass_rules and damage_type is not DamageType.LIFE_LOSS:
+        resistance = max([resistance] + [float(rule.value)
+            for rule in getattr(target, "damage_rules", [])
+            if DamageRuleKind(str(getattr(rule.kind, "value", rule.kind)).upper())
+               is DamageRuleKind.RESISTANCE and rule.matches(packet)])
+    # Nonstackable taking-damage reductions share a maximum; ordinary SCALE
+    # judgements still multiply independently. Life removal bypasses modifiers.
+    if damage_type is DamageType.LIFE_LOSS:
+        resistance = 0.0
+    amount = basic * packet.output_scale * max(0.0, 1.0 - resistance)
     absorbed = 0.0
     blocked = False
     cancelled = False
@@ -565,7 +617,7 @@ def apply_damage(
     if not packet.bypass_rules and damage_type is not DamageType.LIFE_LOSS:
         rules: Iterable[DamageRule] = getattr(target, "damage_rules", [])
         ordered = sorted(rules, key=lambda rule: (-rule.priority, rule.acquired_order))
-        for rule in ordered:
+        for rule_index, rule in enumerate(ordered):
             if amount <= 0 or not rule.matches(packet):
                 continue
             kind = DamageRuleKind(str(getattr(rule.kind, "value", rule.kind)).upper())
@@ -594,12 +646,13 @@ def apply_damage(
                         success = False
                     elif probability >= 1.0:
                         success = True
-                    elif roll is None:
+                    elif roll is None and roll_labeled is None:
                         raise ValueError(
                             "probabilistic damage requires a roll callback"
                         )
                     else:
-                        success = roll(probability)
+                        success = (roll_labeled(probability, f"evasion:{rule.acquired_order}:{rule_index}")
+                                   if roll_labeled else roll(probability))
                 if success and not packet.ignore_evasion:
                     amount = 0.0
                     cancelled = True
@@ -611,6 +664,9 @@ def apply_damage(
     amount = max(amount * packet.taken_scale, 0.0)
     if not packet.lethal:
         amount = min(amount, max(float(target.hp) - 1.0, 0.0))
+    if (before_apply is not None and not cancelled and not blocked
+            and damage_type is not DamageType.LIFE_LOSS):
+        before_apply(packet, target)
     target.hp -= amount
     killed = target.hp <= 0
     handler = getattr(target, "lethal_handler", None)

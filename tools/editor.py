@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -18,7 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from arksim import __version__
 from arksim.editor import EditorData
-from arksim.cli import DEFAULT_DATA_DIR
+from arksim.cli import DEFAULT_DATA_DIR, resolve_level_file
+from arksim.replay_edit import frame_number, ordered, validate_edit, runtime_signature
 
 
 class EditorServer(ThreadingHTTPServer):
@@ -32,6 +34,115 @@ class EditorServer(ThreadingHTTPServer):
         self.draft_lock = threading.Lock()
         self.job_lock = threading.Lock()
         super().__init__(address, EditorHandler)
+
+    def job_folder(self, key: str) -> Path:
+        if not isinstance(key, str) or not re.fullmatch(r"\d{8}_\d{6}_[0-9a-f]{8}", key):
+            raise ValueError("运行编号无效")
+        folder = self.output_root / "editor" / "runs" / key
+        if not folder.resolve().is_relative_to(self.output_root) or folder.is_symlink():
+            raise ValueError("运行目录无效")
+        return folder
+
+    def get_job(self, key: str) -> dict:
+        with self.job_lock:
+            if key in self.jobs:
+                return dict(self.jobs[key])
+        folder = self.job_folder(key)
+        if (folder / "job.json").is_file():
+            return json.loads((folder / "job.json").read_text(encoding="utf-8"))
+        if (folder / "replay.json").is_file():
+            replay = json.loads((folder / "replay.json").read_text(encoding="utf-8"))
+            return {"id": key, "status": "completed", "result": replay["cases"][0]["result"],
+                    "replayUrl": f"/api/replay?job={key}", "viewerUrl": f"/index.html?job={key}"}
+        raise ValueError("找不到本次运行；也可以打开本地回放文件")
+
+    def prepare_branch(self, payload: dict) -> dict:
+        job_id = payload.get("job")
+        if job_id:
+            if self.get_job(job_id)["status"] != "completed":
+                raise ValueError("原模拟尚未完成")
+            folder = self.job_folder(job_id)
+            replay = json.loads((folder / "replay.json").read_text(encoding="utf-8"))
+            fallback = json.loads((folder / "project.json").read_text(encoding="utf-8"))
+        else:
+            replay, fallback = payload.get("replay"), payload.get("project")
+        if not isinstance(replay, dict) or replay.get("engineVersion") != __version__:
+            raise ValueError("此回放的引擎版本不同，请先用当前版本运行原方案，再从回放续编")
+        cases = replay.get("cases")
+        case_index = payload.get("case", 0)
+        if not isinstance(cases, list) or type(case_index) is not int or not 0 <= case_index < len(cases):
+            raise ValueError("回放方案无效")
+        case = cases[case_index]
+        if not isinstance(case, dict):
+            raise ValueError("回放方案无效")
+        if case.get("randomDecisions", {}).get("outcome_replay"):
+            raise ValueError("此回放指定了随机结果，暂不支持续编；请先正常运行原方案")
+        frame = payload.get("frame")
+        frames = case.get("frames", [])
+        numbers = [frame_number(item) for item in frames]
+        if (type(frame) is not int or frame not in numbers or frame >= numbers[-1]
+                or any(a >= b for a, b in zip(numbers, numbers[1:]))):
+            raise ValueError("请在战斗结束前选择一个有效回放帧")
+        context = deepcopy(replay.get("editorContext") or {"project": fallback, "edits": []})
+        if not context.get("project"):
+            raise ValueError("此回放没有完整方案，请补选对应的project.json")
+        original = self.data.compile(context["project"])["project"]
+        context["project"] = original
+        retained, previous, at_cut = [], -1, original
+        for change in context.get("edits", []):
+            if type(change.get("frame")) is not int or change["frame"] <= previous:
+                raise ValueError("回放续编记录无效")
+            previous = change["frame"]
+            compiled = self.data.compile(change["project"])["project"]
+            validate_edit(original, compiled, change["frame"])
+            original = compiled
+            if change["frame"] < frame:
+                retained.append({"frame": change["frame"], "project": compiled})
+                at_cut = compiled
+        context["edits"] = retained
+        validate_edit(at_cut, original, frame)
+        if replay.get("stage") != original["stage"]:
+            raise ValueError("回放与方案关卡不一致")
+        seed = case.get("result", {}).get("seed")
+        if seed is not None and seed != original["options"]["seed"]:
+            raise ValueError("回放与原方案的随机种子不一致")
+        for field, option in (("spawnTiming", "spawn_timing"), ("enemyAttackTiming", "enemy_attack_timing"),
+                              ("enemyMuzzle", "enemy_muzzle"), ("enemyTurning", "enemy_turning"),
+                              ("optionalRunes", "optional_runes")):
+            recorded = replay.get(field, case.get(field))
+            if recorded is not None and recorded != original["options"][option]:
+                raise ValueError("回放与原方案的模拟选项不一致")
+        if case.get("squad") is not None and set(case["squad"]) != {item["char_id"] for item in original["squad"]}:
+            raise ValueError("回放与原方案的携带编队不一致")
+        if (replay.get("runtimeSignature") and replay["runtimeSignature"] != runtime_signature(
+                self.data.data_dir, resolve_level_file(self.data.stages, original["stage"]))):
+            raise ValueError("本地运行数据或假设参数已改变，请先重新运行原方案")
+        project = deepcopy(original)
+        project["operations"] = ordered(project["operations"])
+        key = uuid4().hex
+        folder = self.output_root / "editor" / "branches" / key
+        folder.mkdir(parents=True, exist_ok=False)
+        source = {**replay, "cases": [case]}
+        info = {"id": key, "frame": frame, "time": frame / 30, "project": project, "context": context}
+        (folder / "source.json").write_text(json.dumps(source, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        (folder / "branch.json").write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {k: info[k] for k in ("id", "frame", "time", "project")}
+
+    def branch_info(self, key: str) -> tuple[Path, dict]:
+        if not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{32}", key):
+            raise ValueError("续编编号无效")
+        folder = self.output_root / "editor" / "branches" / key
+        if not folder.resolve().is_relative_to(self.output_root) or folder.is_symlink():
+            raise ValueError("续编目录无效")
+        return folder, json.loads((folder / "branch.json").read_text(encoding="utf-8"))
+
+    def simulate_branch(self, payload: dict) -> dict:
+        folder, info = self.branch_info(payload["branch"])
+        compiled = self.data.compile(payload["project"])
+        validate_edit(info["project"], compiled["project"], info["frame"])
+        context = deepcopy(info["context"])
+        context["edits"].append({"frame": info["frame"], "project": compiled["project"]})
+        return self.simulate(compiled, continuation={"context": context, "source": folder / "source.json"})
 
     def latest_draft(self, session: str = "") -> dict | None:
         if session and not re.fullmatch(r"[0-9a-f]{32}", session):
@@ -112,9 +223,10 @@ class EditorServer(ThreadingHTTPServer):
                 "projectUrl": f"/api/saved?save={key}&name=project.json",
                 "planUrl": f"/api/saved?save={key}&name=plan.json"}
 
-    def simulate(self, compiled: dict) -> dict:
+    def simulate(self, compiled: dict, continuation: dict | None = None) -> dict:
         if not compiled["plan"]:
             raise ValueError("请先添加至少一条操作")
+        root = self.data.compile(continuation["context"]["project"]) if continuation else None
         with self.job_lock:
             if any(j["status"] == "running" for j in self.jobs.values()):
                 raise ValueError("已有模拟正在运行，请等待完成")
@@ -126,16 +238,27 @@ class EditorServer(ThreadingHTTPServer):
                 (folder / name).write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
             job = {"id": job_id, "status": "running", "message": "正在模拟…"}
             self.jobs[job_id] = job
-            threading.Thread(target=self._run, args=(job_id, folder, compiled["project"]), daemon=True).start()
+            if continuation:
+                context = continuation["context"]
+                (folder / "original-plan.json").write_text(json.dumps(root["plan"], ensure_ascii=False), encoding="utf-8")
+                (folder / "continuation.json").write_text(json.dumps(context, ensure_ascii=False), encoding="utf-8")
+                shutil.copyfile(continuation["source"], folder / "source-replay.json")
+            threading.Thread(target=self._run, args=(job_id, folder, compiled["project"], bool(continuation)), daemon=True).start()
             return dict(job)
 
-    def _run(self, job_id: str, folder: Path, project: dict) -> None:
+    def _run(self, job_id: str, folder: Path, project: dict, continuation: bool = False) -> None:
         opts = project["options"]
         command = [sys.executable, str(ROOT / "tools/simulate.py"), "--data-dir", str(self.data.data_dir),
-                   "--stage", project["stage"], "--plan", str(folder / "plan.json"),
+                   "--stage", project["stage"], "--plan", str(folder / ("original-plan.json" if continuation else "plan.json")),
                    "--squad", str(folder / "squad.json"),
                    "--spawn-timing", opts["spawn_timing"], "--enemy-attack-timing", opts["enemy_attack_timing"],
-                   "--seed", str(opts["seed"]), "--output-dir", str(self.output_root)]
+                   "--seed", str(opts["seed"]), "--output-dir", str(folder / "output")]
+        if continuation:
+            source = json.loads((folder / "source-replay.json").read_text(encoding="utf-8"))
+            command += ["--continuation", str(folder / "continuation.json"), "--source-replay", str(folder / "source-replay.json"),
+                        "--sample-interval", str(source["cases"][0].get("sampleInterval", 1 / 30))]
+        else:
+            command += ["--editor-project", str(folder / "project.json")]
         for key in ("enemy_muzzle", "enemy_turning"):
             if opts[key]:
                 command.append("--" + key.replace("_", "-"))
@@ -147,9 +270,17 @@ class EditorServer(ThreadingHTTPServer):
             (folder / "run.log").write_text(result.stdout + result.stderr, encoding="utf-8")
             if result.returncode:
                 raise ValueError((result.stderr or result.stdout or "模拟失败")[-4000:])
-            latest = self.output_root / "最新模拟"
+            latest = folder / "output" / "最新模拟"
             # Preserve this job's replay even when another job rotates latest.
             shutil.copyfile(latest / "replay.json", folder / "replay.json")
+            from tools.simulate import promote
+            history = self.output_root / "模拟历史"
+            if history.is_symlink() or not history.resolve().is_relative_to(self.output_root):
+                raise ValueError("历史目录超出输出目录")
+            history.mkdir(parents=True, exist_ok=True)
+            staged = history / ("_编辑器_" + job_id)
+            shutil.copytree(latest, staged)
+            promote(staged, self.output_root)
             summary = json.loads((latest / "result.json").read_text(encoding="utf-8"))
             update = {"status": "completed", "message": "模拟完成", "result": summary,
                       "replayUrl": f"/api/replay?job={job_id}",
@@ -158,6 +289,7 @@ class EditorServer(ThreadingHTTPServer):
             update = {"status": "failed", "message": str(error)}
         with self.job_lock:
             self.jobs[job_id].update(update)
+            (folder / "job.json").write_text(json.dumps(self.jobs[job_id], ensure_ascii=False), encoding="utf-8")
 
 
 class EditorHandler(BaseHTTPRequestHandler):
@@ -211,18 +343,19 @@ class EditorHandler(BaseHTTPRequestHandler):
                 return self.send_file(folder / name, "application/json; charset=utf-8", name)
             if url.path in ("/api/job", "/api/replay"):
                 key = params.get("job", [""])[0]
-                with self.server.job_lock:
-                    job = dict(self.server.jobs.get(key, {}))
-                if not job:
+                try:
+                    job = self.server.get_job(key)
+                except ValueError:
                     return self.respond({"error": "找不到本次运行，请回编辑页重新生成或读取本地回放"}, 404)
                 if url.path == "/api/job":
                     return self.respond(job)
                 if job["status"] != "completed":
                     return self.respond({"error": "模拟尚未完成"}, 409)
-                path = self.server.output_root / "editor" / "runs" / key / "replay.json"
+                path = self.server.job_folder(key) / "replay.json"
                 return self.send_file(path, "application/json; charset=utf-8")
-            files = {"/": "planner.html", "/planner.html": "planner.html", "/planner.css": "planner.css",
-                     "/planner.js": "planner.js", "/index.html": "index.html"}
+            files = {"/": "index.html", "/planner.html": "planner.html", "/planner.css": "planner.css",
+                     "/planner.js": "planner.js", "/index.html": "index.html",
+                     "/workspace.js": "workspace.js", "/workspace.css": "workspace.css"}
             if url.path not in files:
                 return self.respond({"error": "找不到页面"}, 404)
             path = ROOT / "viewer" / files[url.path]
@@ -251,9 +384,14 @@ class EditorHandler(BaseHTTPRequestHandler):
             if self.headers.get_content_type() != "application/json":
                 raise ValueError("请求须使用JSON")
             length = int(self.headers.get("Content-Length", "0"))
-            if not 0 < length <= 2_000_000:
-                raise ValueError("请求为空或超过2MB")
+            limit = 128_000_000 if self.path == "/api/branch/prepare" else 2_000_000
+            if not 0 < length <= limit:
+                raise ValueError("请求为空或超过大小限制")
             payload = json.loads(self.rfile.read(length))
+            if self.path == "/api/branch/prepare":
+                return self.respond(self.server.prepare_branch(payload))
+            if self.path == "/api/branch/simulate":
+                return self.respond(self.server.simulate_branch(payload))
             if self.path == "/api/draft":
                 return self.respond(self.server.save_draft(payload))
             if self.path == "/api/build":
@@ -285,7 +423,7 @@ def main() -> None:
         server = EditorServer(("127.0.0.1", args.port), args.data_dir, args.output_dir)
     except (OSError, ValueError, KeyError) as error:
         parser.error(f"无法启动编辑器：{error}")
-    print(f"计划编辑器：http://127.0.0.1:{server.server_port}/planner.html", flush=True)
+    print(f"战术工作台：http://127.0.0.1:{server.server_port}/index.html", flush=True)
     print("保持此窗口运行；结束时按 Ctrl+C。", flush=True)
     try:
         server.serve_forever()

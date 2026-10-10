@@ -14,27 +14,29 @@ from .loadout import module_phase, resolve_plan, select_abilities
 BUILD_FIELDS = frozenset(("char_id", "elite", "level", "trust", "potential_rank",
                           "skill_id", "skill_level", "module_id", "module_level", "auto_skill"))
 TALENT_INDICES = {
+    "char_172_svrash": 0,
     "char_180_amgoat": 0, "char_340_shwaz": 1, "char_102_texas": 0,
     "char_4228_closur": 1, "char_197_poca": 1, "char_2014_nian": 0,
     "char_2025_shu": 1, "char_263_skadi": 0, "char_1023_ghost2": 1,
     "char_218_cuttle": 0, "char_249_mlyss": 1, "char_298_susuro": 0,
     "char_4141_marcil": 1,
+    "char_1038_whitw2": 1,
 }
 
 
 def resolve_squad(plan: list[Any], squad: list[Any] | None, characters: dict,
                   skills: dict, modules: dict, module_index: dict,
                   favor_table: dict) -> tuple[list[Any], set[str]]:
+    from .operator_skills import TOKEN_SKILLS, token_builds
     carried, ambiguous = {}, set()
     if squad is None:
         for item in sorted(plan, key=lambda item: item.time):
-            if item.action != "DEPLOY":
+            if item.action != "DEPLOY" or item.char_id in TOKEN_SKILLS:
                 continue
             previous = carried.setdefault(item.char_id, item)
             if any(getattr(previous, key) != getattr(item, key) for key in BUILD_FIELDS):
                 ambiguous.add(item.char_id)
-        return list(carried.values()), ambiguous
-    for index, item in enumerate(squad, 1):
+    for index, item in enumerate(squad or [], 1):
         if item.action != "DEPLOY" or not item.char_id.startswith("char_"):
             raise ValueError(f"squad item {index}: must identify an operator build")
         if item.char_id in carried:
@@ -43,10 +45,18 @@ def resolve_squad(plan: list[Any], squad: list[Any] | None, characters: dict,
             carried[item.char_id] = resolve_plan(item, characters, skills, modules, module_index, favor_table)
         except ValueError as error:
             raise ValueError(f"squad item {index}: {error}") from error
+    tokens = token_builds([vars(item) for item in carried.values()], characters)
     for item in plan:
+        if item.char_id in TOKEN_SKILLS:
+            expected = tokens.get(item.char_id)
+            if expected is None:
+                raise ValueError(f"token {item.char_id} has no carried owner with its required skill")
+            if item.action == "DEPLOY" and any(getattr(item, key) != expected[key] for key in BUILD_FIELDS):
+                raise ValueError(f"token build for {item.char_id} must inherit the owner's phase/level")
+            continue
         if item.char_id not in carried:
             raise ValueError(f"plan operator {item.char_id} is not carried in squad")
-        if item.action == "DEPLOY" and any(
+        if squad is not None and item.action == "DEPLOY" and any(
             getattr(item, key) != getattr(carried[item.char_id], key) for key in BUILD_FIELDS
         ):
             raise ValueError(f"plan build for {item.char_id} differs from squad")
@@ -56,6 +66,11 @@ def resolve_squad(plan: list[Any], squad: list[Any] | None, characters: dict,
 def board(candidate: dict | None) -> dict[str, float]:
     return {item["key"]: float(item["value"]) for item in (candidate or {}).get("blackboard") or []
             if item.get("value") is not None}
+
+
+def skill_in_effect(op: Any) -> bool:
+    """A permanent skill remains in effect after its charging lifecycle ends."""
+    return op.skill_active or getattr(op, "skill_end_reason", None) == "PERMANENT"
 
 
 @dataclass(frozen=True)
@@ -75,6 +90,7 @@ class SquadEffects:
         self.boards: dict[str, dict[str, float]] = {}
         self.traits: dict[str, dict[str, float]] = {}
         self.extra: dict[str, dict[str, float]] = {}
+        self.shu_extra_index: int | None = None
         for cid, item in self.builds.items():
             if cid not in TALENT_INDICES:
                 continue
@@ -87,9 +103,17 @@ class SquadEffects:
             self.boards[cid] = board(candidate)
             self.traits[cid] = board(trait)
             self.extra[cid] = board(talents.get(-1))
+            if cid == "char_2025_shu" and item.module_id == "uniequip_003_shu":
+                for index, auxiliary in talents.items():
+                    if auxiliary.get("prefabKey") == "20_root":
+                        self.extra[cid] = board(auxiliary)
+                        self.shu_extra_index = index
+                        break
         self.initial_cost = self.boards.get("char_102_texas", {}).get("cost", 0.0)
         self.cost_lower_bound = self.boards.get("char_4228_closur", {}).get("cost", 0.0)
         self.first_rhine_used = False
+        self.skill_started: set[str] = set()
+        self.respawn_modifier = self.boards.get("char_172_svrash", {}).get("respawn_time", 0)
         shu = self.boards.get("char_2025_shu", {})
         self.sui_active = bool(shu) and self.count("groupId", "sui") >= 4
         self.sp_interval = shu.get("interval", 0.0) if self.sui_active else 0.0
@@ -105,7 +129,9 @@ class SquadEffects:
     def handled_talent(self, cid: str, index: int) -> bool:
         return cid in self.boards and (index == TALENT_INDICES[cid]
             or (cid == "char_197_poca" and index == -1
-                and self.upgraded(cid, "uniequip_003_poca")))
+                and self.upgraded(cid, "uniequip_003_poca"))
+            or (cid == "char_2025_shu" and index == self.shu_extra_index
+                and self.upgraded(cid, "uniequip_003_shu")))
 
     def partial_talent(self, cid: str) -> bool:
         # The team portion is supported, but these candidates also describe
@@ -124,6 +150,14 @@ class SquadEffects:
         if "char_249_mlyss" in self.boards and self.characters[cid].get("groupId") == "rhine":
             self.first_rhine_used = True
 
+    def initial_sp_bonus(self, cid: str) -> float:
+        if self.characters[cid].get("nationId") == "siracusa":
+            return self.boards.get("char_1038_whitw2", {}).get("sp", 0)
+        return 0.0
+
+    def skill_started_by(self, cid: str) -> None:
+        self.skill_started.add(cid)
+
     def bonus(self, cid: str, initial_cost: float, field: list[Any]) -> SquadBonus:
         if not cid.startswith("char_"):
             return SquadBonus()
@@ -134,7 +168,9 @@ class SquadEffects:
         field_ids = {op.char_id for op in field}
         atk = hp = defense = speed = heal = recovery = 0.0
         for source, data in self.boards.items():
-            if source == "char_180_amgoat" and profession == "CASTER":
+            if source == "char_172_svrash" and cid == source:
+                atk += data.get("atk", 0.0)
+            elif source == "char_180_amgoat" and profession == "CASTER":
                 if self.upgraded(source, "uniequip_002_amgoat") or source in field_ids:
                     atk += data.get("atk", 0.0)
             elif source == "char_340_shwaz" and profession == "SNIPER":
@@ -148,7 +184,7 @@ class SquadEffects:
             elif source == "char_197_poca" and char.get("teamId") == "student":
                 atk += data.get("atk", 0.0)
                 extra = self.extra[source]
-                active = sum(op.skill_active and self.characters[op.char_id].get("teamId") == "student"
+                active = sum(skill_in_effect(op) and self.characters[op.char_id].get("teamId") == "student"
                              for op in field)
                 atk += min(extra.get("max_atk", 0.0), extra.get("init_atk", 0.0) * active)
             elif source == "char_2014_nian":
@@ -160,13 +196,16 @@ class SquadEffects:
                     hp += trait.get("max_hp", 0.0) * count
                     heal += trait.get("heal_scale_addition", 0.0) * count
             elif source == "char_2025_shu":
-                if source in field_ids:
-                    if len(professions) >= 3:
-                        hp += data.get("max_hp", 0.0)
-                    if max(professions.values(), default=0) >= 3:
-                        speed += data.get("attack_speed", 0.0)
+                diverse = source in field_ids and len(professions) >= 3
+                same = source in field_ids and max(professions.values(), default=0) >= 3
+                if diverse:
+                    hp += data.get("max_hp", 0.0)
+                if same:
+                    speed += data.get("attack_speed", 0.0)
                 if self.sui_active:
                     atk += data.get("atk", 0.0)
+                if sum((diverse, same, self.sui_active)) >= 2:
+                    atk += self.extra[source].get("atk", 0.0)
             elif source in ("char_263_skadi", "char_1023_ghost2", "char_218_cuttle"):
                 if char.get("groupId") == "abyssal":
                     atk += data.get("atk", 0.0)
@@ -179,4 +218,6 @@ class SquadEffects:
                 if self.count("teamId", "laios") >= 4:
                     defense += data.get("def", 0.0)
                     speed += data.get("attack_speed", 0.0)
+            elif source == "char_1038_whitw2" and char.get("nationId") == "siracusa" and cid in self.skill_started:
+                speed += data.get("attack_speed", 0.0)
         return SquadBonus(atk, defense, hp, speed, heal, recovery)

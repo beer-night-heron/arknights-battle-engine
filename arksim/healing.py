@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 import math
 from typing import Any
 
-from .mechanics import DamageRule, DamageType, Status
+from .mechanics import DamageRule, DamageRuleKind, DamageType, Status
 
 SHU = "char_2025_shu"
 SHU_S1 = "skchr_shu_1"
@@ -32,6 +32,13 @@ class ShuHealing:
         range_id = self.talent.get("born_range_id")
         if range_id:
             self.sow(self.owner, str(range_id))
+
+    def own_damage_resistance(self, kind: DamageType) -> float:
+        # GUA-Y uses the nonstackable IncludePure resistance template.
+        if (self.owner.module_id == "uniequip_003_shu"
+                and kind in {DamageType.PHYSICAL, DamageType.ARTS, DamageType.TRUE, DamageType.ELEMENTAL}):
+            return float(self.owner.trait_blackboard.get("damage_resistance", 0))
+        return 0.0
 
     def sow(self, target: Any, range_id: str = "x-5") -> None:
         if not self.talent or self.owner.dead:
@@ -66,21 +73,23 @@ class ShuHealing:
                 if not any(item is rule for item in unit.damage_rules):
                     unit.damage_rules.append(rule)
             else:
-                rule = DamageRule("SCALE", damage_types=frozenset({DamageType.PHYSICAL, DamageType.ARTS}))
+                rule = DamageRule(DamageRuleKind.RESISTANCE,
+                                  damage_types=frozenset({DamageType.PHYSICAL, DamageType.ARTS}))
                 unit.damage_rules.append(rule)
                 self.recipients[identity] = (unit, rule)
-            rule.value = max(0.0, 1.0 - resistance)
+            rule.value = max(0.0, resistance)
 
     def tick_tiles(self) -> None:
         if self.owner.dead:
             self.depart()
             return
         self.refresh()
-        amount = float(self.talent.get("hp_recovery_per_sec", 0)) * self.battle.dt
-        for unit, _ in self.recipients.values():
-            # HP recovery is not a healing packet and does not multiply by
-            # received-heal bonuses or trigger another sow operation.
-            unit.hp = min(unit.max_hp, unit.hp + max(0.0, amount))
+
+    def passive_hp_recovery_for(self, target: Any) -> float:
+        entry = self.recipients.get(target.deployment_index)
+        if self.owner.dead or target.dead or entry is None or entry[0] is not target:
+            return 0.0
+        return max(0.0, float(self.talent.get("hp_recovery_per_sec", 0)))
 
     def start_s1(self) -> bool:
         op, battle = self.owner, self.battle
@@ -104,7 +113,8 @@ class ShuHealing:
         op.skill_end_reason = None
         interval = battle._effective_attack_interval(op)
         op.attack_cd = interval
-        self.finish_frame = battle.frame_index + max(1, math.ceil(interval / battle.dt - 1e-9))
+        duration = battle._operator_action_duration(op)
+        self.finish_frame = battle.frame_index + max(1, math.ceil(duration / battle.dt - 1e-9))
         battle._begin_operator_heal(op, targets[:1], float(op.skill_blackboard.get("heal_scale", 1)))
         if op.pending_attack is not None:
             self.finish_frame = max(self.finish_frame, op.pending_attack.execute_frame)
@@ -117,7 +127,8 @@ class ShuHealing:
             self.spent_sp = 0.0
 
     def tick_skill(self) -> None:
-        if self.finish_frame is not None and self.battle.frame_index >= self.finish_frame:
+        if (self.finish_frame is not None and self.battle.frame_index >= self.finish_frame
+                and self.owner.pending_attack is None):
             self.finish_frame = None
             self.spent_sp = 0.0
             if abs(self.owner.attack_cd) < 1e-9:

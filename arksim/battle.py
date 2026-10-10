@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 import struct
 from collections import Counter, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cmp_to_key, lru_cache
 from typing import Any
 
@@ -58,15 +58,21 @@ from .mechanics import (
     operator_target_key,
 )
 from .randomness import DeterministicRng
+from .random_trace import RandomDecisionRng, uniform_bounds, uniform_value
 from .graphics import (
-    EnemyGraphicProfile, FacingRuntime, ProjectileMotionProfile, map_offset,
+    EnemyGraphicProfile, OperatorGraphicProfile, FacingRuntime, ProjectileMotionProfile, map_offset,
 )
 from .targeting import FramePeriodicTicker, TargetSelectorRuntime
 from .loadout import module_phase, resolve_plan, select_abilities
 from .forms import MAKOTO, MakotoS3
 from .healing import SHU, SHU_S1, ShuHealing
+from .operator_skills import (SUPPORTED as ROSTER_SKILLS, TOKEN_SKILLS,
+                             AttackProfile, OperatorSkillRuntime, SoulWardRuntime, SOUL_WARD,
+                             live_runtimes, effect_runtimes)
+from .induced_movement import temporary_move
+from .funnels import WHITW2_S1, Whitw2S1Runtime
 from .runes import blackboard as rune_blackboard, forbidden_locations, select_runes
-from .squad import SquadBonus, SquadEffects, resolve_squad
+from .squad import SquadBonus, SquadEffects, resolve_squad, skill_in_effect
 from .operations import OperationAttempt, OperationLog
 from .waves import DynamicWaveScheduler, SpawnFragment
 from .spawn_core import PREVIEW_CURSOR_COUNT, PREVIEW_CURSOR_INTERVAL
@@ -255,6 +261,20 @@ class _ScheduledHighlandEffect:
 
 
 @dataclass
+class _PullForce:
+    origin_row: float
+    origin_col: float
+    initial_distance: float
+    force: float
+    remaining: float
+    interrupt_source: _Operator | None = None
+    stop_radius: float | None = None
+    stop_after_reached: bool = False
+    velocity_stopped: bool = False
+    stop_within_source_block_range: bool = False
+
+
+@dataclass
 class _Enemy:
     key: str
     name: str
@@ -314,6 +334,8 @@ class _Enemy:
     pull_initial_distance: float = 0.0
     pull_force: float = 0.0
     pull_remaining: float = 0.0
+    pull_interrupt_source: _Operator | None = None
+    pull_sources: dict[int | None, _PullForce] = field(default_factory=dict)
     remaining_path_distance: float = 0.0
     attack_cd: float = 0.0
     attack_cd_frames: int = 0
@@ -323,6 +345,7 @@ class _Enemy:
     attack_waits_for_cooldown: bool | None = None
     attack_count: int = 0
     blocked_by: "_Operator | None" = None
+    wisdel_remnant_source: "_Operator | None" = None
     block_stable_row: float | None = None
     block_stable_col: float | None = None
     block_shift_target_row: float | None = None
@@ -369,6 +392,7 @@ class _Enemy:
     mode_index: int = 0
     shell_active: bool = False
     shell_reflect: float = 0.0
+    enemy_tags: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         self.buffs.owner = self
@@ -394,6 +418,10 @@ class _PendingOperatorAttack:
     source_atk_scale: float
     sp_recovery_locked: bool
     will_hit: bool
+    profile: Any = None
+    followup_frames: tuple[int, ...] = ()
+    animation_events: tuple[float, ...] = ()
+    minimum_execute_at: float = -1.0
 
 
 @dataclass
@@ -415,6 +443,13 @@ class _Projectile:
     travelled: float = 0.0
     position_z: float = 0.0
     motion_profile: ProjectileMotionProfile | None = None
+    impact_at: float | None = None
+    origin: tuple[float, float, float] | None = None
+    mount_point: str | None = None
+    fixed_destination: tuple[float, float, float] | None = None
+    lifecycle: dict[str, Any] = field(default_factory=dict)
+    last_destination: tuple[float, float, float] | None = None
+    born_at: float | None = None
 
     def position(self) -> tuple[float, float]:
         return self.position_row, self.position_col
@@ -437,6 +472,14 @@ class _Operator:
     attack_duration: float = 0.0
     attack_hit_time: float = 0.0
     projectile_key: str | None = None
+    graphic_animation: str = "Idle"
+    graphic_started_at: float = 0.0
+    graphic_rate: float = 1.0
+    graphic_timing: dict[str, Any] | None = None
+    graphic_face: str = "front"
+    graphic_sign: float = 1.0
+    last_projectile_mount: str = "MUZZLE"
+    mount_group_indices: dict[str, int] = field(default_factory=dict)
     skill_attack_timing: dict[str, dict[str, float]] = field(default_factory=dict)
     pending_attack: _PendingOperatorAttack | None = None
     facing: int = 0
@@ -444,6 +487,7 @@ class _Operator:
     atk_scale: float = 1.0
     def_scale: float = 1.0
     attack_cd: float = 0.0
+    attack_cd_interval: float = 0.0
     dead: bool = False
     elemental_resistance: float = 0.0
     taunt_level: int = 0
@@ -477,6 +521,11 @@ class _Operator:
     plan_profile: int | None = None
     trait_blackboard: dict[str, Any] = field(default_factory=dict)
     talent_blackboards: dict[str, dict[str, Any]] = field(default_factory=dict)
+    talent_blackboards_by_index: dict[int, dict[str, Any]] = field(default_factory=dict)
+    hp_recovery_interval: float = 0.0
+    hp_recovery_remaining: float = 0.0
+    hp_recovery_frame: int = -1
+    negative_hp_heal_free: bool = False
     base_range_cells: set[tuple[int, int]] = field(default_factory=set)
     deployed_at: float = 0.0
     death_time: float | None = None
@@ -530,12 +579,15 @@ class _Operator:
     # selector_resume_frame, which belongs to AttackState target departure.
     selector_pause_until_frame: int | None = None
     base_max_hp: float = 0.0
+    max_hp_final_scale: float = 1.0
     base_attack_speed: float = 100.0
     squad_bonus: SquadBonus = field(default_factory=SquadBonus)
     received_heal_scale: float = 1.0
     squad_sp_ticks: int = 0
     form_runtime: MakotoS3 | None = None
     healing_runtime: ShuHealing | None = None
+    skill_runtime: OperatorSkillRuntime | None = None
+    air_blocking: bool = False
     lethal_handler: Any = None
 
     @property
@@ -582,14 +634,28 @@ class Battle:
         spawn_timing: str = SPAWN_TIMING_FAST,
         enemy_attack_timing: str = ENEMY_ATTACK_TIMING_FLOAT,
         enemy_graphics: dict[str, Any] | None = None,
+        operator_graphics: dict[str, Any] | None = None,
         module_index: dict[str, Any] | None = None,
         favor_table: dict[str, Any] | None = None,
         squad: list[OperatorPlan] | None = None,
         operator_forms: dict[str, Any] | None = None,
+        random_trace: bool = False,
+        random_tape: dict | None = None,
+        module_context: dict[str, Any] | None = None,
     ) -> None:
         if "selectedDifficulty" not in level:
             level = select_runes(level)
         self.level = level
+        self.module_context = dict(module_context or {})
+        if set(self.module_context) - {"game_tags", "map_tags", "ingots"}:
+            raise ValueError("unknown module_context field")
+        for key in ("game_tags", "map_tags"):
+            tags = self.module_context.get(key, ())
+            if not isinstance(tags, (list, tuple)) or any(not isinstance(tag, str) for tag in tags):
+                raise ValueError(f"module_context.{key} must be a list of strings")
+        ingots = self.module_context.get("ingots", 0)
+        if type(ingots) is not int or ingots < 0:
+            raise ValueError("module_context.ingots must be a nonnegative integer")
         self.forbidden_locations = forbidden_locations(level)
         self.operator_forms = (D.load_operator_forms() if operator_forms is None and D.DATA_DIR is not None
                                else operator_forms or {})
@@ -643,9 +709,17 @@ class Battle:
         self.operation_log = OperationLog(self.plan, [source_indices[id(item)] for item in self.plan])
         self.dt = dt
         self.seed = int(seed)
-        self.rng = DeterministicRng(self.seed)
+        self.rng = (RandomDecisionRng(self.seed, tape=random_tape)
+                    if random_trace or random_tape is not None else DeterministicRng(self.seed))
         self.assumptions = assumptions or DEFAULT_ASSUMPTIONS
         self.enemy_graphics: dict[str, EnemyGraphicProfile] = {}
+        if operator_graphics is None and D.DATA_DIR is not None:
+            operator_graphics = D.load_operator_graphics()
+        operator_profiles = (operator_graphics or {}).get("operators", {})
+        if not isinstance(operator_profiles, dict):
+            raise ValueError("operator graphics 'operators' must be an object")
+        self.operator_graphics = {key: OperatorGraphicProfile.from_dict(spec)
+                                  for key, spec in operator_profiles.items()}
         self.operator_hit_offsets: dict[str, tuple[float, float, float]] = {}
         self.projectile_motion_profiles: dict[str, ProjectileMotionProfile] = {}
         if (self.assumptions.enemy_projectile_muzzle
@@ -716,6 +790,7 @@ class Battle:
         self.time = 0.0
         self.frame_index = 0
         self.enemies: list[_Enemy] = []
+        self._lemuen_survivor_sp: dict[int, tuple[_Enemy, list[tuple[_Operator, float]]]] = {}
         self.operators: list[_Operator] = []
         self.plan_index = 0
         self.enemies_spawned = 0
@@ -737,39 +812,80 @@ class Battle:
         for cid in self.squad_effects.boards:
             if self.squad_effects.partial_talent(cid):
                 self.mechanic_diagnostics[f"OPERATOR_TALENT_PARTIAL:{cid}"] = 1
+        if self.squad_effects.shu_extra_index is not None:
+            self.mechanic_diagnostics["SHU_Y_COMBINED_CONDITION_CANDIDATE"] = 1
         if "char_249_mlyss" in self.squad_effects.boards:
             self.mechanic_diagnostics["MLYSS_FIRST_DEPLOY_COST_LIFETIME_CANDIDATE"] = 1
 
     def _sync_squad_effects(self) -> None:
         live = [op for op in self.operators if not op.dead]
-        signature = tuple((op.deployment_index, op.skill_active) for op in live)
+        signature = tuple((op.deployment_index, skill_in_effect(op), op.tile,
+                           op.char_id == "char_1045_svash2" and self.time - op.deployed_at >=
+                           float(op.talent_blackboards.get("2", {}).get("interval", 15))) for op in live)
         if signature == self._squad_field_signature:
             return
         self._squad_field_signature = signature
         for op in live:
             bonus = self.squad_effects.bonus(op.char_id, op.base_cost, live)
             maximum = op.base_max_hp * (1.0 + bonus.max_hp +
-                                        (op.form_runtime.hp_bonus if op.form_runtime else 0))
+                                        (op.form_runtime.hp_bonus if op.form_runtime else 0) +
+                                        (op.skill_runtime.hp_bonus if op.skill_runtime else 0) +
+                                        sum(r.aura_hp(op) for r in live_runtimes(self)) +
+                                        float(getattr(op, "roster_hp_bonus", 0))) * op.max_hp_final_scale
             if maximum != op.max_hp:
                 ratio = op.hp / op.max_hp if op.max_hp > 0 else 0.0
                 op.max_hp = maximum
-                op.hp = max(0.0, min(maximum, ratio * maximum))
+                op.hp = min(maximum, ratio * maximum)
+                if not (op.skill_runtime and op.char_id == "char_1044_hsgma2"):
+                    op.hp = max(0.0, op.hp)
             op.squad_bonus = bonus
-            op.received_heal_scale = 1.0 + bonus.heal
+            op.received_heal_scale = (1.0 + bonus.heal) * (
+                float(op.trait_blackboard.get("heal_scale", 1)) if op.char_id == "char_4145_ulpia" else 1)
+            immune = any(r.op.char_id == "char_1045_svash2" and r.sjerag_ally(op)
+                         for r in live_runtimes(self))
+            if immune and Status.FROZEN not in op.statuses.immunities:
+                op.statuses.immunities.add(Status.FROZEN)
+                op.roster_freeze_immunity_added = True
+            elif not immune and getattr(op, "roster_freeze_immunity_added", False):
+                op.statuses.immunities.discard(Status.FROZEN)
+                op.roster_freeze_immunity_added = False
 
     def operator_attack_power(self, op: _Operator, scale: float | None = None) -> float:
         self._sync_squad_effects()
-        return op.atk * ((op.atk_scale if scale is None else scale) + op.squad_bonus.atk
-                        + (op.form_runtime.atk_bonus if op.form_runtime else 0))
+        runtime = op.skill_runtime
+        return (op.atk + (runtime.flat_attack() if runtime else 0)) * (
+            (op.atk_scale if scale is None else scale) + op.squad_bonus.atk
+            + (op.form_runtime.atk_bonus if op.form_runtime else 0)
+            + (runtime.attack_bonus() if runtime else 0)
+            + float(getattr(op, "roster_atk_bonus", 0))
+            + sum(r.aura_atk(op) for r in live_runtimes(self)))
 
     def operator_defense(self, op: _Operator) -> float:
         self._sync_squad_effects()
-        return op.defense * (op.def_scale + op.squad_bonus.defense)
+        return op.defense * (op.def_scale + op.squad_bonus.defense
+            + (op.skill_runtime.defense_bonus() if op.skill_runtime else 0)
+            + sum(r.aura_def(op) for r in live_runtimes(self))) + sum(
+                runtime.flat_defense_for(op) for runtime in effect_runtimes(self))
+
+    def _module_ability_tags(self, module_id: str | None) -> dict[str, Any]:
+        # Keep ISW-A effects paused until integrated strategy is in scope.
+        if module_id == "uniequip_004_swire2":
+            return {}
+        return {key: self.module_context.get(key, ()) for key in ("game_tags", "map_tags")}
 
     def deployment_cost(self, char_id: str, base_cost: float) -> int:
         penalty = self.redeploy_penalty.get(char_id, 0)
         value = math.floor(base_cost * (1.0 + .5 * penalty) + self.squad_effects.cost_modifier(char_id))
-        return max(0, min(value, self.max_cost))
+        discount = sum(r.deck_discounts.get(char_id, 0) for r in live_runtimes(self))
+        scale = 1.0
+        carried = next((p for p in self.squad if p.char_id == char_id), None)
+        if carried and carried.module_id:
+            phase = module_phase(self.battle_equips[carried.module_id], carried.module_level)
+            _, talents, _ = select_abilities(self.characters[char_id], carried.elite, carried.level,
+                carried.potential_rank, phase, **self._module_ability_tags(carried.module_id))
+            scale = next((float(self._blackboard(c).get("cost_scale", 1)) for c in talents.values()
+                          if c.get("prefabKey") == "14_root"), 1.0)
+        return max(0, min(math.floor((value - discount) * scale), self.max_cost))
 
     # ------------------------------------------------------------------ setup
     def _build_routes(
@@ -1714,11 +1830,11 @@ class Battle:
             if facing % 4 == 0:  # right (identity)
                 rr, cc = dr, dc
             elif facing % 4 == 1:  # down
-                rr, cc = dc, -dr
+                rr, cc = -dc, dr
             elif facing % 4 == 2:  # left
                 rr, cc = -dr, -dc
             else:  # up
-                rr, cc = -dc, dr
+                rr, cc = dc, -dr
             cells.add((tile[0] + rr, tile[1] + cc))
         return cells
 
@@ -1782,6 +1898,7 @@ class Battle:
             motion=motion,
             path=path,
             route=route,
+            enemy_tags=frozenset(str(tag) for tag in (D.mdef(enemy_data.get("enemyTags"), []) or [])),
             apply_way=apply_way,
             can_normal_attack=apply_way != ApplyWay.NONE.value,
             unblockable=key in UNBLOCKABLE_KEYS,
@@ -1946,13 +2063,17 @@ class Battle:
             deployment_index=self.deployment_counter,
             base_cost=int(attrs.get("cost", 0)),
             deployed_cost=deployed_cost,
-            respawn_time=float(attrs.get("respawnTime", 70.0)),
+            respawn_time=float(attrs.get("respawnTime", 70.0)) * max(0, 1 + self.squad_effects.respawn_modifier),
         )
         op.plan_profile = next((index for index, item in enumerate(self.plan) if item is plan), None)
+        op.build_plan = plan
         equipped_phase = module_phase(module, plan.module_level) if module is not None else None
         trait, talents, deferred = select_abilities(
             char, plan.elite, plan.level, plan.potential_rank, equipped_phase,
+            **self._module_ability_tags(plan.module_id),
         )
+        if plan.module_id == "uniequip_004_swire2":
+            self.mechanic_diagnostics["OPERATOR_MODULE_EFFECT_PAUSED:uniequip_004_swire2"] = 1
         op.trait_blackboard = self._blackboard(trait) if trait is not None else {}
         shu_module = op.char_id == SHU and plan.module_id == "uniequip_002_shu"
         if op.trait_blackboard and op.subprofession != "hammer" and not shu_module:
@@ -1965,6 +2086,7 @@ class Battle:
                     if item.get("key") == "born_range_id" and item.get("valueStr"):
                         board["born_range_id"] = item["valueStr"]
             op.talent_blackboards[prefab] = board
+            op.talent_blackboards_by_index[index] = board
             if self.squad_effects.handled_talent(op.char_id, index):
                 pass
             elif op.char_id == SHU and prefab == "1":
@@ -1978,12 +2100,16 @@ class Battle:
                 ):
                     self.mechanic_diagnostics[f"OPERATOR_TALENT_SCOPE:{op.char_id}:{index}"] += 1
         for part in deferred:
-            self.mechanic_diagnostics[f"OPERATOR_MODULE_CONDITION:{plan.module_id}:{part}"] += 1
+            if op.char_id == "char_450_necras" and plan.module_id == "uniequip_002_necras" and part.endswith(":token"):
+                self.mechanic_diagnostics["NECRAS_TOKEN_DEATH_LISTENER_CANDIDATE"] = 1
+            else:
+                self.mechanic_diagnostics[f"OPERATOR_MODULE_CONDITION:{plan.module_id}:{part}"] += 1
         if equipped_phase and not (shu_module or (op.char_id == "char_1051_headb2" and plan.module_id == "uniequip_002_headb2")):
             if equipped_phase.get("parts"):
                 self.mechanic_diagnostics[f"OPERATOR_MODULE_EFFECT:{plan.module_id}"] += 1
         if plan.skill_id:
             self._attach_skill(op, plan.skill_id, plan.skill_level)
+            op.sp = min(op.sp_max, op.sp + self.squad_effects.initial_sp_bonus(op.char_id))
             op.auto = op.skill_type == "AUTO" or plan.auto_skill
         if op.char_id == MAKOTO and op.skill_prefab_id == "skchr_makoto_3":
             profile = self.operator_forms.get(MAKOTO, {})
@@ -2004,9 +2130,17 @@ class Battle:
                 self.mechanic_diagnostics["SHU_S1_ACTION_TIMING_CANDIDATE"] = 1
             elif op.skill_prefab_id:
                 self.mechanic_diagnostics[f"SHU_SKILL_INCOMPLETE:{op.skill_prefab_id}"] = 1
+        if op.char_id == SOUL_WARD:
+            op.skill_runtime = SoulWardRuntime(self, op)
+        elif op.skill_prefab_id == WHITW2_S1:
+            op.skill_runtime = Whitw2S1Runtime(self, op)
+        elif op.skill_prefab_id in ROSTER_SKILLS or op.char_id == "char_1035_wisdel":
+            op.skill_runtime = OperatorSkillRuntime(self, op)
         self.initialize_operator_target_selector(
             op, first_search_frame=self.frame_index + 32
         )
+        self._face_operator_graphic(op)
+        op.graphic_started_at = self.time
         return op
 
     def _attach_skill(self, op: _Operator, skill_id: str, skill_level: int | None = None) -> None:
@@ -2043,6 +2177,8 @@ class Battle:
         op.behavior_template_key = resolve_behavior_template(
             prefab_id, self.behavior.templates
         )
+        if prefab_id in ROSTER_SKILLS:
+            op.behavior_template_key = None
         if op.behavior_template_key:
             supported_events = {
                 "ON_BUFF_START",
@@ -2063,7 +2199,7 @@ class Battle:
                             f"{op.behavior_template_key!r}"
                         )
         if sp_type in ("PASSIVE", "NO_CHARGE", "INCREASE_WHEN_NONE"):
-            self._cast_skill(op)
+            self._cast_skill(op, automatic=True)
 
     # ------------------------------------------------------------- loop
     def step(self) -> None:
@@ -2076,6 +2212,8 @@ class Battle:
                 self._tick_element_burst(unit)
                 if unit.elements.tick(self.dt) is not None:
                     unit.element_burst = None
+                    for runtime in live_runtimes(self):
+                        runtime.element_break_finished(unit)
 
         # Losing block capability immediately releases held enemies.
         for op in self.operators:
@@ -2087,6 +2225,10 @@ class Battle:
         for op in self.operators:
             if op.healing_runtime is not None:
                 op.healing_runtime.tick_tiles()
+            if op.skill_runtime is not None and op.skill_runtime.notes:
+                op.skill_runtime.tick_notes()
+            if op.dead and op.skill_runtime is not None:
+                op.skill_runtime.tick_detached()
 
         self._sync_squad_effects()
         self.dp_timer += self.dt * (0.5 if self.dp < 0 else 1.0)
@@ -2230,7 +2372,10 @@ class Battle:
             return
         if op.skill_prefab_id == "skchr_huang_3" and op.behavior_active:
             return
+        self._sync_operator_attack_clock(op)
         if op.pending_attack is not None and not op.statuses.can_attack:
+            if op.skill_runtime is not None:
+                op.skill_runtime.cancel_attack_sequence(op.pending_attack)
             op.pending_attack = None
         if (
             op.pending_attack is not None
@@ -2248,6 +2393,7 @@ class Battle:
     def _tick_enemy(self, enemy: _Enemy) -> None:
         if enemy.dead or enemy.leaked:
             return
+        self._tick_lemuen_survivor_sp(enemy)
         spawn_move_locked = enemy.spawn_move_lock_frames > 0
         if spawn_move_locked:
             enemy.spawn_move_lock_frames -= 1
@@ -2344,6 +2490,8 @@ class Battle:
 
         # A live block relation prevents route movement; its offset was
         # applied above, including relations from earlier receivers.
+        if enemy.statuses.has(Status.FEAR) and enemy.blocked_by is not None:
+            self._release_enemy_block(enemy)
         if enemy.blocked_by and not enemy.blocked_by.dead:
             return
         if enemy.blocked_by is not None:
@@ -2358,6 +2506,18 @@ class Battle:
             return
         if not enemy.statuses.can_move:
             return
+        lure = getattr(enemy, "lure_target", None)
+        if lure is not None and self.time < lure[1]:
+            arrived = math.dist(enemy.position(), lure[0]) <= .4 or temporary_move(self, enemy, lure[0])
+            arrived = arrived or math.dist(enemy.position(), lure[0]) <= .4
+            if arrived:
+                lure[2].lure_arrived(enemy)
+            return
+        if enemy.statuses.has(Status.FEAR):
+            temporary_move(self, enemy, source=getattr(enemy, "fear_origin", None))
+            self.mechanic_diagnostics["FEAR_TEMPORARY_NAVIGATION_CANDIDATE"] = 1
+            return
+        enemy.induced_path = None
         self._request_enemy_route_facing(enemy)
         self._move_enemy(enemy)
 
@@ -2371,6 +2531,9 @@ class Battle:
         if not op.statuses.can_attack:
             return
         if op.attack_cd > 0 or op.pending_attack is not None:
+            return
+
+        if op.skill_runtime is not None and op.skill_runtime.override_action():
             return
 
         if op.healing_runtime is not None and op.skill_prefab_id == SHU_S1 and op.skill_active:
@@ -2434,6 +2597,8 @@ class Battle:
                 break
         if not self.end_reason:
             self.end_reason = "timeout"
+        if isinstance(getattr(self, "rng", None), RandomDecisionRng):
+            self.rng.assert_consumed()
         return self.result()
 
     def result(self) -> Result:
@@ -2486,7 +2651,36 @@ class Battle:
     def _skill_starting(op: _Operator) -> bool:
         return op.skill_startup_until >= 0.0
 
+    def _update_operator_hp_recovery(self, op: _Operator) -> None:
+        if op.dead or op.hp_recovery_frame == self.frame_index:
+            return
+        op.hp_recovery_frame = self.frame_index
+        rate = sum(runtime.passive_hp_recovery_for(op) for runtime in effect_runtimes(self))
+        rate += sum(unit.healing_runtime.passive_hp_recovery_for(op) for unit in self.operators
+                    if unit.healing_runtime is not None)
+        if op.skill_runtime is not None and op.skill_runtime.anchor_move is not None:
+            # The transporting mode scales both HP-recovery attributes to zero.
+            rate = 0.0
+        if rate <= 0:
+            op.hp_recovery_interval = op.hp_recovery_remaining = 0.0
+            return
+        interval = 1.0 / rate
+        if interval != op.hp_recovery_interval:
+            # ResetButKeepPastTime keeps elapsed seconds, not fractional progress.
+            past = op.hp_recovery_interval - op.hp_recovery_remaining
+            op.hp_recovery_remaining = max(0.0, interval - past)
+            op.hp_recovery_interval = interval
+        op.hp_recovery_remaining -= self.dt
+        if op.hp_recovery_remaining <= 1e-9:
+            count = math.floor((1e-9 - op.hp_recovery_remaining) / interval) + 1
+            op.hp_recovery_remaining += count * interval
+            op.hp = min(op.max_hp, op.hp + count)
+        self.mechanic_diagnostics["OPERATOR_HP_RECOVERY_TIMER_PHASE_CANDIDATE"] = 1
+
     def _update_skill(self, op: _Operator) -> None:
+        if op.skill_runtime is not None:
+            op.skill_runtime.tick()
+        self._update_operator_hp_recovery(op)
         if op.form_runtime is not None:
             op.form_runtime.tick()
         if op.healing_runtime is not None:
@@ -2540,10 +2734,10 @@ class Battle:
             self._skill_ready(op)
             and not op.skill_active
             and not self._skill_starting(op)
-            and op.auto
+            and (op.skill_runtime.auto_ready() if op.skill_runtime else op.auto)
             and op.statuses.can_use_skill
         ):
-            self._cast_skill(op)
+            self._cast_skill(op, automatic=True)
 
     def _recover_time_sp(
         self, op: _Operator, *, recovery_was_stopped: bool
@@ -2559,7 +2753,8 @@ class Battle:
             and op.sp_increment == 1.0
             and op.squad_bonus.sp_recovery == 0.0
         ):
-            self._gain_sp(op, (op.sp_increment + op.squad_bonus.sp_recovery) * self.dt)
+            extra = op.skill_runtime.sp_recovery_bonus() if op.skill_runtime else 0
+            self._gain_sp(op, (op.sp_increment + op.squad_bonus.sp_recovery + extra) * self.dt)
             return
         self.used_assumptions.add("HEADB2_PERIODIC_SP_RECOVERY")
         # SpController sees the old lock before the skill's expiry transition.
@@ -2590,7 +2785,8 @@ class Battle:
         if count:
             self._gain_sp(op, count * self.squad_effects.sp_amount)
 
-    def _cast_skill(self, op: _Operator, *, switch_mode: bool = False) -> bool:
+    def _cast_skill(self, op: _Operator, *, switch_mode: bool = False,
+                    automatic: bool = False) -> bool:
         if op.form_runtime is not None and op.form_runtime.mode == "THANATOS":
             return op.form_runtime.manual_switch()
         level = op.skill
@@ -2602,9 +2798,14 @@ class Battle:
             return False
         if not op.statuses.can_use_skill and not no_charge:
             return False
+        if op.skill_runtime is not None and not op.skill_runtime.can_cast():
+            return False
+        if op.skill_runtime is not None:
+            op.skill_runtime.cast_automatic = automatic
         if op.healing_runtime is not None and op.skill_prefab_id == SHU_S1:
             return op.healing_runtime.start_s1()
-        if not no_charge:
+        free_cast = op.skill_runtime is not None and op.skill_runtime.free_cast()
+        if not no_charge and not free_cast:
             op.sp = max(0.0, op.sp - self._skill_cost(op))
         if op.skill_controls.can_switch:
             op.skill_mode_target = 1 - op.skill_mode
@@ -2632,6 +2833,10 @@ class Battle:
             return True
         if level is None or op.skill_active:
             return False
+        self.squad_effects.skill_started_by(op.char_id)
+        self._squad_field_signature = None
+        if op.skill_runtime is not None and op.skill_runtime.sid in ROSTER_SKILLS:
+            return op.skill_runtime.activate()
         if op.form_runtime is not None:
             op.form_runtime.begin("THANATOS", "SKILL")
             op.skill_end_reason = "FORM_SWITCH"
@@ -2660,6 +2865,8 @@ class Battle:
             )
             if op.target_selector is not None:
                 op.target_selector.mark_dirty()
+        if op.char_id == "char_1035_wisdel" and op.skill_runtime is not None:
+            op.skill_runtime.soul_ward_skill_started()
         if op.skill_controls.can_switch:
             op.skill_mode = 1
             op.skill_mode_target = None
@@ -2731,6 +2938,8 @@ class Battle:
         return op.sp_cost if op.sp_cost > 0 else op.sp_max
 
     def _skill_ready(self, op: _Operator) -> bool:
+        if op.skill_runtime is not None and op.skill_runtime.free_cast():
+            return True
         cost = self._skill_cost(op)
         return cost <= 0 or op.sp + 1e-9 >= cost
 
@@ -2780,10 +2989,10 @@ class Battle:
                 return capacity
         return None
 
-    @staticmethod
     def configure_skill_ammo(
-        op: _Operator, capacity: float, *, cost_per_attack: float = 1.0
+        self, op: _Operator, capacity: float, *, cost_per_attack: float = 1.0
     ) -> None:
+        capacity += sum(runtime.ammo_capacity_bonus(op) for runtime in live_runtimes(self))
         op.ammo_capacity = max(0.0, float(capacity))
         op.ammo = op.ammo_capacity
         op.ammo_cost_per_attack = max(0.0, float(cost_per_attack))
@@ -2796,6 +3005,8 @@ class Battle:
         cost = op.ammo_cost_per_attack if amount is None else max(0.0, amount)
         if op.ammo is not None:
             op.ammo -= cost
+            for runtime in live_runtimes(self):
+                runtime.ammo_used(op, cost)
         return op.ammo
 
     def interrupt_skill(self, op: _Operator, reason: str = "INTERRUPTED") -> bool:
@@ -2807,6 +3018,8 @@ class Battle:
     def _finish_skill(self, op: _Operator, reason: str) -> None:
         if not op.skill_active:
             return
+        if op.skill_runtime is not None:
+            op.skill_runtime.finish(reason)
         if not op.behavior_finish_dispatched:
             self._dispatch_skill_event(op, "ON_SKILL_FINISH")
             op.behavior_finish_dispatched = True
@@ -2840,7 +3053,7 @@ class Battle:
     @staticmethod
     def _blackboard(level: dict[str, Any]) -> dict[str, Any]:
         return {
-            str(item.get("key")): item.get("value")
+            str(item.get("key")): item.get("valueStr") if item.get("valueStr") is not None else item.get("value")
             for item in level.get("blackboard", [])
             if item.get("key") is not None
         }
@@ -2917,37 +3130,55 @@ class Battle:
     def _operator_heal_targets(
         self, op: _Operator, *, cells: set[tuple[int, int]] | None = None,
         hp_ratio: float = 1.0, include_equal: bool = False,
+        include_element_damage: bool = False,
     ) -> list[_Operator]:
         cells = op.range_cells if cells is None else cells
+        heal_free_exception = self.attack_timing.get(op.char_id, {}).get("heal_free_target_exception")
         targets = [target for target in self.operators
-                   if not target.dead and target.hp < target.max_hp
+                   if not target.dead and (target.hp < target.max_hp or
+                       (include_element_damage and target.elements.current_damaged_element is not None))
                    and target.tile in cells
-                   and not target.statuses.has(Status.HEAL_FREE)
+                   and (not target.statuses.has(Status.HEAL_FREE) or target.char_id == heal_free_exception)
                    and not target.statuses.has(Status.UNTARGETABLE)
-                   and target.subprofession not in ("musha", "unyield", "reaper")]
+                   and (target.subprofession not in ("musha", "unyield", "reaper")
+                        or target.char_id == heal_free_exception)
+                   and not (target.char_id == "char_1044_hsgma2" and target.hp <= 0)]
         targets = [target for target in targets
                    if (target.hp / target.max_hp <= hp_ratio if include_equal
-                       else target.hp / target.max_hp < hp_ratio)]
+                       else target.hp / target.max_hp < hp_ratio)
+                   or (include_element_damage and hp_ratio == 1.0
+                       and target.elements.current_damaged_element is not None)]
         return sorted(targets, key=lambda unit: (unit.hp / unit.max_hp, unit.creation_index))
 
     def _begin_operator_heal(self, op: _Operator, targets: list[_Operator], scale: float) -> None:
         execute_frame, execute_at = self._operator_attack_deadline(op)
+        timing = self.attack_timing.get(op.char_id, {})
+        if op.skill_active:
+            timing = op.skill_attack_timing.get(op.skill_prefab_id, timing)
+        profile = AttackProfile(payload={"ignore_heal_free": True}) if timing.get("ignore_heal_free") else None
         op.pending_attack = _PendingOperatorAttack(
             execute_at, execute_frame, "HEAL", targets[0], targets, scale,
             op.atk_scale, op.skill_active and not op.skill_controls.can_switch, True,
+            profile=profile,
         )
+        self._mark_operator_attack_started(op, not op.attack_chain_active)
         self._land_zero_delay_operator_attack(op)
 
-    def _resolve_operator_heal(self, op: _Operator, target: _Operator, amount: float) -> Any:
+    def _resolve_operator_heal(self, op: _Operator, target: _Operator, amount: float,
+                               *, secondary: bool = False, ignore_heal_free: bool = False) -> Any:
         self._sync_squad_effects()
         output_scale = 1.0
-        if op.healing_runtime is not None and op.module_id == "uniequip_002_shu":
+        if op.module_id in {"uniequip_002_shu", "uniequip_002_demkni"}:
             if target.hp / target.max_hp < float(op.trait_blackboard.get("hp_ratio", 0)):
                 output_scale = float(op.trait_blackboard.get("heal_scale", 1))
         result = apply_damage(DamagePacket(amount=amount, damage_type=DamageType.HEAL,
-                                          source=op, output_scale=output_scale), target)
+                                          source=op, output_scale=output_scale,
+                                          ignore_heal_free=ignore_heal_free), target,
+                              on_output=op.skill_runtime.output_modifier if op.skill_runtime else None)
         if op.healing_runtime is not None and not result.cancelled:
             op.healing_runtime.sow(target)
+        if op.skill_runtime is not None and not secondary:
+            op.skill_runtime.heal_landed(target, amount, result)
         return result
 
     def _huang_s3_cut(self, op: _Operator) -> None:
@@ -2968,6 +3199,8 @@ class Battle:
     ) -> bool:
         if first_attack is None:
             first_attack = not op.attack_chain_active
+        if op.skill_runtime is not None:
+            return op.skill_runtime.begin_attack(first_attack)
         if op.form_runtime is not None and op.form_runtime.mode == "THANATOS":
             target = self._current_operator_target(op)
             if target is None:
@@ -3053,10 +3286,28 @@ class Battle:
         return True
 
     def _mark_operator_attack_started(
-        self, op: _Operator, first_attack: bool
+        self, op: _Operator, first_attack: bool, *, timing: dict | None = None
     ) -> None:
         op.attack_chain_active = True
         op.attack_first_cast = bool(first_attack)
+        if timing is None:
+            timing = self.attack_timing.get(op.char_id, {})
+            if op.skill_active or op.skill_end_reason == "PERMANENT":
+                timing = op.skill_attack_timing.get(op.skill_prefab_id, timing)
+        op.graphic_animation = str(timing.get("animation_name") or timing.get("anim_key", "Attack"))
+        op.graphic_started_at = self.time
+        op.graphic_rate = 1.0 / self._operator_animation_duration_scale(op, timing)
+        op.attack_cd_interval = self._effective_attack_interval(op)
+        op.graphic_timing = (dict(timing) if "max_anim_duration_scale" in timing
+                             and timing.get("timing_scale") != "FIXED" else None)
+        attack = op.pending_attack
+        if attack is not None and op.graphic_timing is not None and op.form_runtime is None:
+            attack.minimum_execute_at = self.time + max(0.0, float(timing.get("min_hit_time", 0)))
+            events = tuple(float(v) for v in timing.get("attack_hit_times", ()))
+            attack.animation_events = (events if len(events) == len(attack.followup_frames)+1
+                                       else (float(timing.get("attack_hit_time") or op.attack_hit_time),))
+        target = op.pending_attack.primary if op.pending_attack is not None else None
+        self._face_operator_graphic(op, target)
         self._record_targeting_diagnostic(
             op,
             first_attack=bool(first_attack),
@@ -3091,18 +3342,97 @@ class Battle:
         self._land_zero_delay_operator_attack(op)
         return True
 
-    def _operator_attack_hit_delay(self, op: _Operator) -> float:
-        timing = None
+    def _sync_operator_attack_clock(self, op: _Operator) -> None:
+        # Static default OnAttackTimeChanged keeps the cooldown's progress.
+        # Observe changes at this unit's update; exact attribute callback phase
+        # and Hotfix dispatch remain candidates. Calibrated forms are separate.
+        if op.form_runtime is not None or op.attack_cd_interval <= 0:
+            return
+        timing = self.attack_timing.get(op.char_id, {})
         if op.skill_active or op.skill_end_reason == "PERMANENT":
-            timing = op.skill_attack_timing.get(op.skill_prefab_id)
+            timing = op.skill_attack_timing.get(op.skill_prefab_id, timing)
+        if "max_anim_duration_scale" not in timing or timing.get("timing_scale") == "FIXED":
+            return
+        interval = self._effective_attack_interval(op)
+        if interval <= 0 or math.isclose(interval, op.attack_cd_interval, rel_tol=1e-12):
+            return
+        progress_remaining = max(0.0, min(1.0, op.attack_cd / op.attack_cd_interval))
+        op.attack_cd = interval * progress_remaining
+        op.attack_cd_interval = interval
+        self.mechanic_diagnostics["OPERATOR_ATTACK_TIME_CHANGE_PHASE_CANDIDATE"] = 1
+        graphic = op.graphic_timing
+        if graphic is None:
+            return
+        elapsed = max(0.0, self.time-op.graphic_started_at) * op.graphic_rate
+        if elapsed >= float(graphic.get("attack_duration") or op.attack_duration):
+            return
+        rate = 1.0 / self._operator_animation_duration_scale(op, graphic)
+        if math.isclose(rate, op.graphic_rate, rel_tol=1e-12):
+            return
+        op.graphic_started_at = self.time - elapsed/rate
+        op.graphic_rate = rate
+        runtime = op.skill_runtime
+        if runtime is not None and getattr(runtime, "glady_emitted", False):
+            runtime.glady_anim_end = op.graphic_started_at + float(
+                graphic.get("attack_duration", op.attack_duration))/rate
+        attack = op.pending_attack
+        if attack is None or not attack.animation_events:
+            return
+        deadlines = [self._operator_attack_deadline(op, delay=max(0.0, (event-elapsed)/rate,
+                                                                attack.minimum_execute_at-self.time))
+                     for event in attack.animation_events]
+        frame_delta = deadlines[0][0] - attack.execute_frame
+        attack.execute_frame, attack.execute_at = deadlines[0]
+        if len(deadlines) == len(attack.followup_frames)+1:
+            attack.followup_frames = tuple(frame for frame, _ in deadlines[1:])
+        else:
+            # Additional child emissions retain their fixed spacing.
+            attack.followup_frames = tuple(frame+frame_delta for frame in attack.followup_frames)
+
+    def _operator_animation_duration_scale(self, op: _Operator, timing: dict | None = None) -> float:
+        if timing is None:
+            timing = self.attack_timing.get(op.char_id, {})
+            if op.skill_active or op.skill_end_reason == "PERMANENT":
+                timing = op.skill_attack_timing.get(op.skill_prefab_id, timing)
+        if timing.get("timing_scale") == "FIXED":
+            return 1.0
+        duration = float(timing.get("attack_duration") or op.attack_duration)
+        if duration <= 0.0:
+            return 1.0
+        scale = max(self._effective_attack_interval(op) / duration, 1e-9)
+        # Native _maxAnimScale caps duration scaling, not playback speed.
+        # Missing metadata retains the existing unbounded timing candidate.
+        limit = float(timing.get("max_anim_duration_scale", -1.0))
+        return min(scale, max(limit, 1e-9)) if limit >= 0 else scale
+
+    def _operator_action_duration(self, op: _Operator) -> float:
+        timing = self.attack_timing.get(op.char_id, {})
+        if op.skill_active or op.skill_end_reason == "PERMANENT":
+            timing = op.skill_attack_timing.get(op.skill_prefab_id, timing)
+        if "max_anim_duration_scale" not in timing or timing.get("timing_scale") == "FIXED":
+            return self._effective_attack_interval(op)
+        self.mechanic_diagnostics["OPERATOR_ACTION_FINISH_PHASE_CANDIDATE"] = 1
+        return float(timing.get("attack_duration") or op.attack_duration) * self._operator_animation_duration_scale(op, timing)
+
+    def _operator_attack_hit_delay(self, op: _Operator, *, timing: dict | None = None) -> float:
+        if timing is None:
+            timing = {"max_anim_duration_scale": self.attack_timing.get(op.char_id, {}).get(
+                "max_anim_duration_scale", -1.0)}
+            if op.skill_active or op.skill_end_reason == "PERMANENT":
+                timing = op.skill_attack_timing.get(op.skill_prefab_id, timing)
         duration = float((timing or {}).get("attack_duration") or op.attack_duration)
         hit_time = float((timing or {}).get("attack_hit_time") or op.attack_hit_time)
+        if (timing or {}).get("timing_scale") == "FIXED":
+            # Some abilities have a fixed predelay independent of attack speed.
+            return max(0.0, hit_time, float(timing.get("min_hit_time", 0)))
         if duration <= 0.0 or hit_time <= 0.0:
             return 0.0
-        return hit_time * self._effective_attack_interval(op) / duration
+        return max(float(timing.get("min_hit_time", 0)),
+                   hit_time * self._operator_animation_duration_scale(op, timing))
 
-    def _operator_attack_deadline(self, op: _Operator) -> tuple[int, float]:
-        delay = self._operator_attack_hit_delay(op)
+    def _operator_attack_deadline(self, op: _Operator, *, delay: float | None = None) -> tuple[int, float]:
+        if delay is None:
+            delay = self._operator_attack_hit_delay(op)
         if delay <= 0.0:
             return self.frame_index, self.time
         # Candidate Spine event phase: resolve on the fixed frame after the
@@ -3144,13 +3474,41 @@ class Battle:
         op.pending_attack = None
         if attack is None:
             return
+        if attack.kind == "ALCHEMY":
+            op.skill_runtime.launch_alchemy(attack)
+            return
+        if attack.kind == "ROSTER_STATE":
+            op.skill_runtime.land_state_action(attack)
+            if op.skill_runtime.continue_attack_sequence(attack):
+                return
+            self._sp_on_attack(op, sp_recovery_locked=attack.sp_recovery_locked)
+            op.skill_runtime.attack_complete()
+            return
         if attack.kind == "HEAL":
             amount = self.operator_attack_power(op, attack.source_atk_scale) * attack.attack_scale
+            healing_flags = attack.profile.payload if attack.profile else {}
+            timing = (op.skill_attack_timing.get(op.skill_prefab_id, {}) if op.skill_active else
+                      self.attack_timing.get(op.char_id, {}))
+            key = timing.get("heal_projectile_key")
             for target in attack.targets:
                 if not target.dead:
-                    self._resolve_operator_heal(op, target, amount)
+                    if self._projectile_speed(key) is not None:
+                        payload = replace(attack, primary=target, targets=[target],
+                            profile=AttackProfile(payload={
+                                **healing_flags,
+                                "keep_projectile_after_departure": bool(timing.get("keep_projectile_after_departure",
+                                    self.attack_timing.get(op.char_id, {}).get("keep_projectile_after_departure", False))),
+                                "projectile_delay_after_reached": float(timing.get("projectile_delay_after_reached", 0))}))
+                        self._new_projectile(key=key, side="OPERATOR", source=op, target=target,
+                                             operator_attack=payload, cached_atk=amount)
+                        self.mechanic_diagnostics["HEAL_PROJECTILE_CURVE_AND_HIT_PHASE_CANDIDATE"] = 1
+                    else:
+                        self._resolve_operator_heal(op, target, amount,
+                            ignore_heal_free=bool(healing_flags.get("ignore_heal_free")))
                 elif op.healing_runtime is not None:
                     op.healing_runtime.refund_dead_target()
+                elif op.skill_runtime is not None:
+                    op.skill_runtime.refund_dead_heal_target(attack)
             self._sp_on_attack(op, sp_recovery_locked=attack.sp_recovery_locked)
             self.consume_skill_ammo(op)
             return
@@ -3158,6 +3516,26 @@ class Battle:
             op,
             hit_frame=int(self.frame_index),
         )
+        if attack.kind == "ROSTER":
+            attack = op.skill_runtime.refresh_attack_targets(attack)
+            if op.skill_runtime.refund_dead_attack_target(attack):
+                return
+            primary_valid = any(self._enemy_is_attackable(target) for target in attack.targets)
+            if primary_valid:
+                op.skill_runtime.attack_emitted(attack)
+            key = attack.profile.payload.get("projectile_key", op.projectile_key)
+            if primary_valid and self._projectile_speed(key) is not None:
+                self._emit_operator_projectiles(op, attack)
+            elif op.skill_runtime is not None:
+                op.skill_runtime.land(attack)
+            if primary_valid:
+                op.skill_runtime.skill_spent = 0.0
+            if op.skill_runtime.continue_attack_sequence(attack):
+                return
+            self._sp_on_attack(op, sp_recovery_locked=attack.sp_recovery_locked)
+            self.consume_skill_ammo(op)
+            op.skill_runtime.attack_complete()
+            return
         primary_valid = self._enemy_is_attackable(attack.primary)
         if attack.will_hit and primary_valid:
             if attack.kind == "HAMMER":
@@ -3215,6 +3593,8 @@ class Battle:
         operator_attack: _PendingOperatorAttack | None = None,
         will_hit: bool = True,
         cached_atk: float | None = None,
+        mount_point: str | None = None,
+        origin_override: tuple[float, float, float] | None = None,
     ) -> None:
         speed = self._projectile_speed(key)
         if speed is None:
@@ -3225,6 +3605,14 @@ class Battle:
             source_row, source_col = source.position()
         source_z = 0.0
         muzzle_position = None
+        if origin_override is not None:
+            source_row, source_col, source_z = origin_override
+            muzzle_position = origin_override
+        elif isinstance(source, _Operator):
+            origin, mount_point = self._operator_projectile_origin(source, key, target, mount_point)
+            source_row, source_col, source_z = origin
+            if mount_point is not None:
+                muzzle_position = origin
         if isinstance(source, _Enemy) and self.assumptions.enemy_projectile_muzzle:
             muzzle_position = self.enemy_muzzle_position_v3(source)
             if muzzle_position is not None:
@@ -3246,6 +3634,13 @@ class Battle:
         if profile is not None and profile.distance_dimensions == 3:
             initial_distance = math.sqrt(initial_distance ** 2 + (target_z - source_z) ** 2)
         self.projectile_counter += 1
+        lifecycle = (dict(self.attack_timing.get(source.char_id, {}).get(
+            "projectile_lifecycle", {}).get(key, {})) if isinstance(source, _Operator) else {})
+        birth_delay = 0.0
+        if lifecycle.get("random_birth_delay", 0) > 0:
+            birth_delay = self.random_uniform(0, lifecycle["random_birth_delay"],
+                mechanism="operator_projectile_birth_delay", source=source, target=target,
+                details={"projectile": key})
         if muzzle_position is None:
             self.used_assumptions.add("PROJECTILE_SOURCE_CENTER")
         self.projectiles.append(
@@ -3266,8 +3661,77 @@ class Battle:
                 cached_atk=cached_atk,
                 parabolic="mortar" in key.lower(),
                 initial_distance=initial_distance,
+                origin=(source_row, source_col, source_z),
+                mount_point=mount_point if muzzle_position is not None else None,
+                lifecycle=lifecycle,
+                last_destination=(target_row, target_col, target_z),
+                born_at=self.time + birth_delay,
+                fixed_destination=((target_row, target_col, target_z)
+                                   if lifecycle.get("fixed_endpoint") else None),
             )
         )
+
+    def _operator_projectile_origin(
+        self, op: _Operator, key: str, target=None, mount_point: str | None = None
+    ) -> tuple[tuple[float, float, float], str | None]:
+        """Select an emission point shared by tracking and special flight runtimes."""
+        graphic = self.operator_graphics.get(op.char_id)
+        rule = graphic.projectiles.get(key, {}) if graphic is not None else {}
+        if graphic is not None and key not in graphic.projectiles and mount_point is None:
+            self.mechanic_diagnostics[f"OPERATOR_PROJECTILE_BINDING_MISSING:{op.char_id}:{key}"] += 1
+        if rule.get("faceToTarget"):
+            self._face_operator_graphic(op, target)
+        if mount_point is None:
+            group = rule.get("group", [])
+            if group and graphic is not None:
+                # Missing geometry must not silently consume an extra random draw.
+                if all(self.operator_muzzle_position_v3(op, point) is not None for point in group):
+                    if rule.get("loopType") == "RANDOM":
+                        mount_point = self.choose_random_target(group, source=op,
+                            mechanism="operator_projectile_mount", details={"projectile": key})
+                    else:
+                        index = op.mount_group_indices.get(key, 0)
+                        mount_point = group[index % len(group)]
+                        op.mount_group_indices[key] = index + 1
+                    self.mechanic_diagnostics["OPERATOR_MOUNT_SELECTION_ORDER_CANDIDATE"] = 1
+                else:
+                    self.mechanic_diagnostics[f"OPERATOR_MOUNT_GROUP_MISSING:{op.char_id}:{key}"] += 1
+            else:
+                mount_point = rule.get("mount")
+        if mount_point is not None:
+            position = self.operator_muzzle_position_v3(op, mount_point)
+            if position is not None:
+                op.last_projectile_mount = mount_point
+                self.used_assumptions.add("OPERATOR_PROJECTILE_MOUNT")
+                self.mechanic_diagnostics["OPERATOR_GRAPHIC_POSE_CANDIDATE"] = 1
+                return position, mount_point
+            self.mechanic_diagnostics[f"OPERATOR_MOUNT_MISSING:{op.char_id}:{mount_point}"] += 1
+        self.used_assumptions.add("PROJECTILE_SOURCE_CENTER")
+        return (float(op.tile[0]), float(op.tile[1]), 0.0), None
+
+    def _face_operator_graphic(self, op: _Operator, target=None) -> None:
+        if isinstance(target, (_Enemy, _Operator)):
+            row, col = target.tile if isinstance(target, _Operator) else target.position()
+            dr, dc = row - op.tile[0], col - op.tile[1]
+        else:
+            from .operator_skills import FACING
+            dr, dc = FACING[op.facing % 4]
+        if abs(dc) > 1e-9:
+            op.graphic_sign = 1.0 if dc > 0 else -1.0
+        if abs(dr) > 1e-9:
+            op.graphic_face = "back" if dr > 0 else "front"
+
+    def operator_muzzle_position_v3(self, op: _Operator, mount_point: str | None = None):
+        """Read a pose without choosing a point or advancing the random stream."""
+        profile = self.operator_graphics.get(op.char_id)
+        if profile is None:
+            return None
+        mount = mount_point or op.last_projectile_mount
+        offset = profile.offset_at(op.graphic_face, mount, op.graphic_animation,
+                                   max(0.0, self.time - op.graphic_started_at) * op.graphic_rate)
+        if offset is None:
+            return None
+        return op.tile[0] + offset[0], op.tile[1] + offset[1] * op.graphic_sign, offset[2]
 
     def enemy_muzzle_position(self, enemy: _Enemy) -> tuple[float, float] | None:
         position = self.enemy_muzzle_position_v3(enemy)
@@ -3324,7 +3788,22 @@ class Battle:
     def _emit_operator_projectiles(
         self, op: _Operator, attack: _PendingOperatorAttack
     ) -> None:
-        if not op.projectile_key:
+        if op.char_id == SOUL_WARD and op.skill_runtime is not None:
+            op.skill_runtime.emit_soul_ward_projectile(attack)
+            return
+        if op.char_id == "char_1035_wisdel" and op.skill_runtime is not None:
+            op.skill_runtime.emit_wisdel_projectiles(attack)
+            return
+        if op.char_id == "char_4039_horn" and op.skill_runtime is not None:
+            op.skill_runtime.emit_horn_projectiles(attack)
+            return
+        if (op.char_id == "char_4213_skybx" and attack.profile is not None
+                and attack.profile.skill and op.skill_runtime is not None):
+            op.skill_runtime.emit_skybx_skill_projectile(attack)
+            return
+        key = (attack.profile.payload.get("projectile_key", op.projectile_key)
+               if attack.profile is not None else op.projectile_key)
+        if not key:
             return
         spec = self.operator_projectiles.get(op.char_id) or {}
         if spec.get("mapping") == "inferred_base_logic_key":
@@ -3347,9 +3826,10 @@ class Battle:
                 source_atk_scale=attack.source_atk_scale,
                 sp_recovery_locked=attack.sp_recovery_locked,
                 will_hit=attack.will_hit,
+                profile=attack.profile,
             )
             self._new_projectile(
-                key=op.projectile_key,
+                key=key,
                 side="OPERATOR",
                 source=op,
                 target=enemy,
@@ -3605,21 +4085,28 @@ class Battle:
         taken_scale: float = 1.0,
         damage_type: str | None = None,
         damage_source: Any = ...,
+        modifier_key: str = "",
+        ability_owner: Any = ...,
     ):
         kind = damage_type or getattr(op, "damage_type", "PHYSICAL")
         source = op if damage_source is ... else damage_source
-        self._reflect_shell_damage(enemy, source)
-        result = apply_damage(
+        life_loss = str(getattr(kind, "value", kind)).upper() == DamageType.LIFE_LOSS.value
+        if not life_loss:
+            self._reflect_shell_damage(enemy, source)
+        result = self._apply_damage(
             DamagePacket(
                 amount=amount,
                 damage_type="ARTS" if kind == "WEAKNESS" else kind,
                 weakness=kind == "WEAKNESS",
                 attack_type=attack_type,
                 apply_way=apply_way,
-                output_scale=self._outgoing_damage_scale(op) * output_scale,
+                output_scale=(1.0 if life_loss else self._outgoing_damage_scale(op)) * output_scale,
                 taken_scale=taken_scale,
                 source=source,
-                critical_chance=float(getattr(op, "critical_chance", 0.0)),
+                modifier_key=modifier_key,
+                ability_owner=(op if attack_type == AttackType.NORMAL else None)
+                    if ability_owner is ... else ability_owner,
+                critical_chance=0.0 if life_loss else float(getattr(op, "critical_chance", 0.0)),
                 critical_multiplier=float(
                     getattr(op, "critical_multiplier", 1.0)
                 ),
@@ -3627,12 +4114,13 @@ class Battle:
                 target_defense_override=self._effective_enemy_defense(enemy),
             ),
             enemy,
-            roll=self._roll_probability,
         )
         if result.killed:
             self.enemies_killed += 1
             if hasattr(op, "kills"):
                 op.kills += 1
+            if getattr(op, "skill_runtime", None) is not None:
+                op.skill_runtime.killed_enemy(enemy)
         if hasattr(op, "damage_dealt"):
             op.damage_dealt += result.final_amount
         return result
@@ -3644,10 +4132,10 @@ class Battle:
             return
         # The source template uses fixed magical damage with no damage source,
         # and does not require the incoming modifier to succeed.
-        apply_damage(DamagePacket(enemy.shell_reflect, DamageType.ARTS,
+        self._apply_damage(DamagePacket(enemy.shell_reflect, DamageType.ARTS,
                                   attack_type=AttackType.NORMAL, source=None,
                                   target_resistance_override=self._effective_resistance(source)),
-                     source, roll=self._roll_probability)
+                     source)
 
     def _deal_damage_to_operator(
         self,
@@ -3657,7 +4145,7 @@ class Battle:
         attack_override: float | None = None,
     ) -> None:
         defense = self.operator_defense(op)
-        result = apply_damage(
+        result = self._apply_damage(
             DamagePacket(
                 amount=(
                     self._effective_enemy_atk(enemy)
@@ -3681,7 +4169,6 @@ class Battle:
                 target_resistance_override=self._effective_resistance(op),
             ),
             op,
-            roll=self._roll_probability,
         )
         if (
             result.final_amount > 0
@@ -3736,12 +4223,37 @@ class Battle:
     def _process_projectiles(self) -> None:
         active: list[_Projectile] = []
         for projectile in self.projectiles:
-            if not self._projectile_target_valid(projectile):
+            attack = projectile.operator_attack
+            wisdel = (attack is not None and attack.profile is not None
+                      and "wisdel_component" in attack.profile.payload)
+            rules = projectile.lifecycle
+            if projectile.born_at is not None and self.time + 1e-9 < projectile.born_at:
+                active.append(projectile)
+                continue
+            valid = self._projectile_target_valid(projectile)
+            # Reviewed movements retain their cached endpoint when its mount
+            # becomes invalid. Unreviewed attacks keep the historical path.
+            if not rules and not (wisdel and projectile.impact_at is not None) and not valid:
+                continue
+            if valid and projectile.fixed_destination is None:
+                projectile.last_destination = self._projectile_target_position(
+                    projectile.target, projectile.motion_profile)
+            lifetime = rules.get("lifetime")
+            start = projectile.born_at if projectile.born_at is not None else projectile.launched_at
+            source_invalid = rules.get("stop_when_source_invalid") and projectile.source.dead
+            if source_invalid or (lifetime is not None and self.time - start + 1e-9 >= lifetime):
+                self._expire_operator_projectile(projectile, wisdel=wisdel)
+                continue
+            if projectile.impact_at is not None:
+                if self.time + 1e-9 >= projectile.impact_at:
+                    self._projectile_lands(projectile)
+                else:
+                    active.append(projectile)
                 continue
             profile = projectile.motion_profile
-            target_row, target_col, target_z = self._projectile_target_position(
-                projectile.target, profile,
-            )
+            target_row, target_col, target_z = (projectile.fixed_destination or
+                (projectile.last_destination if rules else None) or
+                self._projectile_target_position(projectile.target, profile))
             delta_row = target_row - projectile.position_row
             delta_col = target_col - projectile.position_col
             delta_z = target_z - projectile.position_z
@@ -3769,13 +4281,71 @@ class Battle:
                 projectile.travelled += step_distance
             radius = profile.reach_radius if profile is not None else 0.0
             if distance - step_distance <= radius + epsilon:
-                self._projectile_lands(projectile)
+                attack = projectile.operator_attack
+                if wisdel:
+                    projectile.source.skill_runtime.wisdel_projectile_reached(projectile)
+                delay = (float(attack.profile.payload.get("projectile_delay_after_reached",
+                              rules.get("delay_after_reached", 0)))
+                         if attack is not None and attack.profile is not None else 0)
+                if delay > 0:
+                    projectile.impact_at = self.time + delay
+                    active.append(projectile)
+                else:
+                    self._projectile_lands(projectile)
             else:
                 active.append(projectile)
         self.projectiles = active
 
+    def _expire_operator_projectile(self, projectile: _Projectile, *, wisdel: bool) -> None:
+        """Run the reviewed stop path, without restarting the arrival delay."""
+        rules = projectile.lifecycle
+        reached = projectile.impact_at is not None
+        if wisdel and not reached and rules.get("always_reach_in_end"):
+            # Projectile.OnStop delivers the reached notification before
+            # its movement's forced DealReached resets the position.
+            projectile.source.skill_runtime.wisdel_projectile_reached(projectile)
+        if not reached and rules.get("force_reached_when_timeup") and rules.get("reset_to_target"):
+            endpoint = projectile.fixed_destination or projectile.last_destination
+            if endpoint is not None:
+                projectile.position_row, projectile.position_col, projectile.position_z = endpoint
+        attack = projectile.operator_attack
+        if (attack is not None and attack.profile is not None
+                and "horn_component" in attack.profile.payload):
+            projectile.source.skill_runtime.land_horn_projectile(projectile, stopped=True)
+            self.mechanic_diagnostics["OPERATOR_PROJECTILE_STOP_ORDER_CANDIDATE"] = 1
+            return
+        if wisdel or reached or rules.get("force_reached_when_timeup") or rules.get("always_hit_in_end"):
+            self._projectile_lands(projectile)
+        self.mechanic_diagnostics["OPERATOR_PROJECTILE_STOP_ORDER_CANDIDATE"] = 1
+
     def _projectile_lands(self, projectile: _Projectile) -> None:
-        if not projectile.will_hit or not self._projectile_target_valid(projectile):
+        attack = projectile.operator_attack
+        if attack is not None and attack.profile is not None:
+            if attack.profile.skill and attack.profile.payload.get("sid") == "skchr_skybx_1":
+                if projectile.will_hit:
+                    projectile.source.skill_runtime.land_skybx_splash(attack,
+                        (projectile.position_row, projectile.position_col), float(projectile.cached_atk or 0))
+                return
+            if attack.kind == "HALO2_LINK":
+                projectile.source.skill_runtime.land_halo2_link(attack, projectile.target,
+                    source_key=projectile.projectile_id)
+                return
+            if attack.profile.skill and attack.profile.payload.get("sid") == "skchr_halo2_2":
+                # Reached actions precede the main hit and do not depend on
+                # its trace target or damage judgement remaining valid.
+                projectile.source.skill_runtime.emit_halo2_links(attack,
+                    (projectile.position_row, projectile.position_col, projectile.position_z))
+        if (attack is not None and attack.profile is not None
+                and "horn_component" in attack.profile.payload):
+            projectile.source.skill_runtime.land_horn_projectile(projectile)
+            return
+        if not projectile.will_hit:
+            return
+        if (attack is not None and attack.profile is not None
+                and "wisdel_component" in attack.profile.payload):
+            projectile.source.skill_runtime.wisdel_projectile_stopped(projectile)
+            return
+        if not self._projectile_target_valid(projectile):
             return
         if projectile.side == "ENEMY":
             self._enemy_attack_lands(
@@ -3786,6 +4356,26 @@ class Battle:
             return
         attack = projectile.operator_attack
         if attack is None:
+            return
+        if attack.kind == "HEAL":
+            self._resolve_operator_heal(projectile.source, projectile.target,
+                projectile.cached_atk if projectile.cached_atk is not None else
+                self.operator_attack_power(projectile.source, attack.source_atk_scale) * attack.attack_scale,
+                ignore_heal_free=bool(attack.profile and attack.profile.payload.get("ignore_heal_free")))
+            return
+        if attack.kind == "LOGOS_TALENT":
+            projectile.source.skill_runtime.land_talent_projectile(projectile)
+            return
+        if attack.kind == "LOGOS_TRANSFER":
+            self._apply_operator_damage(projectile.source, projectile.target,
+                float(projectile.cached_atk or 0), damage_type="ARTS",
+                attack_type=AttackType.NORMAL, apply_way=ApplyWay.NONE)
+            return
+        if attack.profile is not None and projectile.source.skill_runtime is not None:
+            pull_source = ({"projectile_id": projectile.projectile_id}
+                           if projectile.source.char_id == "char_474_glady" else {})
+            projectile.source.skill_runtime.land(attack, target=projectile.target, ranged=True,
+                **pull_source)
             return
         self._deal_damage_to_enemy(
             projectile.source,
@@ -3819,11 +4409,105 @@ class Battle:
                     enemy, op, attack_override=attack_override
                 )
 
-    def _roll_probability(self, probability: float) -> bool:
+    @staticmethod
+    def _random_subject(unit: Any) -> Any:
+        if unit is None or isinstance(unit, (str, int, bool)):
+            return unit
+        if isinstance(unit, tuple) and len(unit) == 2 and all(isinstance(v, (int, float)) for v in unit):
+            return {"side": "cell", "tile": list(unit)}
+        if hasattr(unit, "char_id"):
+            return {"side": "operator", "char": unit.char_id,
+                    "deployment": getattr(unit, "deployment_index", None)}
+        if hasattr(unit, "enemy_index"):
+            return {"side": "enemy", "key": getattr(unit, "key", None), "id": unit.enemy_index}
+        raise ValueError("random decision subjects require a stable entity ID")
+
+    def _random_context(self, mechanism: str, source: Any = None, target: Any = None,
+                        details: dict | None = None) -> dict:
+        return {"frame": getattr(self, "frame_index", 0), "mechanism": mechanism,
+                "source": self._random_subject(source), "target": self._random_subject(target),
+                "details": details or {}}
+
+    def _ensure_rng(self) -> None:
         if not hasattr(self, "rng"):
             self.seed = 0
             self.rng = DeterministicRng(0)
+
+    def _roll_probability(self, probability: float, *, mechanism: str = "probability",
+                          source: Any = None, target: Any = None, details: dict | None = None) -> bool:
+        self._ensure_rng()
+        if isinstance(self.rng, RandomDecisionRng):
+            return self.rng.roll(probability, context=self._random_context(mechanism, source, target, details))
         return self.rng.roll(probability)
+
+    def _apply_damage(self, packet: DamagePacket, target: Any):
+        labeled = None
+        if isinstance(getattr(self, "rng", None), RandomDecisionRng):
+            def labeled(probability: float, mechanism: str) -> bool:
+                return self._roll_probability(probability, mechanism=mechanism, source=packet.source,
+                                              target=target, details={"damage_type": packet.normalized_damage_type().value,
+                                              "attack_type": str(getattr(packet.attack_type, "value", packet.attack_type)),
+                                              "apply_way": str(getattr(packet.apply_way, "value", packet.apply_way))})
+        runtime = getattr(target, "skill_runtime", None)
+        source_runtime = getattr(packet.source, "skill_runtime", None)
+        if source_runtime is None:
+            summoner = getattr(packet.source, "summoner", None)
+            if summoner is not None and summoner.char_id == "char_450_necras":
+                source_runtime = summoner.skill_runtime
+        if source_runtime:
+            packet = source_runtime.modify_packet(packet, target)
+        if runtime:
+            packet = runtime.modify_taken_packet(packet)
+        kind = packet.normalized_damage_type()
+        if isinstance(target, _Enemy):
+            if kind is not DamageType.LIFE_LOSS:
+                packet = replace(packet, taken_scale=packet.taken_scale * max(
+                    [1.0] + [r.wanted_damage_scale(packet.source, target) for r in live_runtimes(self)]))
+            if kind is DamageType.ARTS:
+                packet = replace(packet, amount=packet.amount + float(getattr(target, "roster_arts_addition", 0)))
+            if kind in {DamageType.PHYSICAL, DamageType.ARTS, DamageType.TRUE}:
+                packet = replace(packet, taken_scale=packet.taken_scale * max(
+                    [1.0] + [r.weakness_scale(target) for r in live_runtimes(self)]))
+            if kind is DamageType.ELEMENTAL:
+                packet = replace(packet, taken_scale=packet.taken_scale * max(
+                    [1.0] + [r.element_vulnerability_scale(target) for r in live_runtimes(self)]))
+        elif isinstance(target, _Operator):
+            if kind in {DamageType.PHYSICAL, DamageType.ARTS, DamageType.TRUE, DamageType.ELEMENTAL}:
+                resistance = max([
+                    packet.damage_resistance,
+                    runtime.own_damage_resistance(kind) if runtime else 0.0,
+                    target.healing_runtime.own_damage_resistance(kind) if target.healing_runtime else 0.0,
+                ] + ([r.ally_damage_resistance(target, packet.source) for r in live_runtimes(self)]
+                     if kind in {DamageType.PHYSICAL, DamageType.ARTS} and packet.source in self.enemies else []))
+                packet = replace(packet, damage_resistance=resistance)
+        result = apply_damage(packet, target, roll=self._roll_probability, roll_labeled=labeled,
+            on_calculate=source_runtime.calculate_damage_modifier if source_runtime is not None else None,
+            on_output=source_runtime.output_modifier if source_runtime is not None else None,
+            on_taking_damage=runtime.taking_damage_modifier if runtime is not None else None,
+            before_apply=source_runtime.before_apply_damage
+                if source_runtime is not None else None)
+        if source_runtime is not None and isinstance(target, _Enemy):
+            source_runtime.damage_landed(packet, target, result)
+        if (source_runtime is not None and source_runtime.op.char_id == "char_4133_logos"
+                and source_runtime.op.module_id == "uniequip_002_logos" and kind is DamageType.ARTS
+                and isinstance(target, _Enemy) and not target.dead and result.final_amount > 0):
+            self.apply_element_damage(target, ElementType.DARK, result.final_amount *
+                float(source_runtime.talent(10).get("ep_damage_ratio", 0)), source=packet.source)
+        if runtime:
+            runtime.taken_damage(packet, result)
+        if result.killed and isinstance(target, _Enemy):
+            for receiver in live_runtimes(self):
+                receiver.enemy_died(target, killer=packet.source)
+        return result
+
+    def random_uniform(self, lower: float, upper: float, *, mechanism: str,
+                       source: Any = None, target: Any = None, details: dict | None = None) -> float:
+        """A named half-open sample for mechanics such as launch directions."""
+        self._ensure_rng()
+        lower, upper = uniform_bounds(lower, upper)
+        if isinstance(self.rng, RandomDecisionRng):
+            return self.rng.uniform(lower, upper, context=self._random_context(mechanism, source, target, details))
+        return uniform_value(self.rng, lower, upper)
 
     def _attack_hits(
         self,
@@ -3837,15 +4521,19 @@ class Battle:
             probability = float(getattr(source, "arts_hit_rate", 1.0))
         else:
             return True
-        return self._roll_probability(probability)
+        return self._roll_probability(probability, mechanism="hit_rate", source=source,
+                                      details={"damage_type": normalized.value})
 
-    def choose_random_target(self, candidates: list[Any]) -> Any:
+    def choose_random_target(self, candidates: list[Any], *, mechanism: str = "random_target",
+                             source: Any = None, details: dict | None = None) -> Any:
         """Choose once from an already-filtered candidate list."""
         if not candidates:
             return None
-        if not hasattr(self, "rng"):
-            self.seed = 0
-            self.rng = DeterministicRng(0)
+        self._ensure_rng()
+        if isinstance(self.rng, RandomDecisionRng):
+            context = self._random_context(mechanism, source, details={**(details or {}),
+                "candidates": [self._random_subject(item) for item in candidates]})
+            return candidates[self.rng.choose_index(len(candidates), context=context)]
         return candidates[self.rng.choose_index(len(candidates))]
 
     @staticmethod
@@ -3991,20 +4679,44 @@ class Battle:
             index_by_key[key] = index
         diagnostics[index].update(updates)
 
+    def _enemy_targetable(self, target: _Enemy) -> bool:
+        if target.statuses.targetable:
+            return True
+        if any(target.statuses.has(s) for s in (Status.INVINCIBLE, Status.UNTARGETABLE, Status.SLEEP)):
+            return False
+        return target.statuses.has(Status.INVISIBLE) and (any(
+            not op.dead and op.char_id == "char_172_svrash"
+            and "2" in op.talent_blackboards and self._enemy_intersects_range(target, op.range_cells)
+            for op in self.operators) or any(r.reveals(target) for r in effect_runtimes(self)))
+
     def _validate_operator_target(
         self, op: _Operator, target: _Enemy | None
     ) -> bool:
         if target is None or not self._enemy_is_attackable(target):
             return False
-        if not target.statuses.targetable:
+        if not self._enemy_targetable(target):
+            return False
+        if op.char_id == "char_4039_horn" and self._is_airborne(target):
+            return False
+        if op.char_id == "token_10043_necras_skeltn" and self._is_airborne(target):
+            return False
+        if op.skill_prefab_id == "skchr_skybx_1" and not op.skill_active and not self._is_airborne(target):
             return False
         blocked = any(enemy is target for enemy in op.blocked)
+        blocker = target.blocked_by
+        if (op.char_id == "char_450_necras" and blocker is not None and not blocker.dead
+                and getattr(blocker, "summoner", None) is op):
+            return True
         if (op.prioritize_blocked or op.subprofession == "hammer") and blocked:
             # Preserve the existing blocked-first rule: once an enemy is
             # blocked, the melee selector does not reapply ranged geometry.
             return True
         if target.statuses.has(Status.CAMOUFLAGE):
             return False
+        if op.skill_runtime is not None and op.skill_runtime.is_wanted(target):
+            return True
+        if op.char_id == "char_4039_horn" and self._enemy_intersects_range(target, {op.tile}):
+            return True
         return self._enemy_intersects_range(target, op.range_cells)
 
     def _search_operator_target_now(self, op: _Operator) -> _Enemy | None:
@@ -4022,6 +4734,13 @@ class Battle:
             candidates.append(enemy)
         if not candidates:
             return None
+        if op.char_id == "char_4039_horn":
+            # The grouped selector tries mortar range before its own-tile
+            # melee fallback. Priority within each selector remains unchanged.
+            ranged = [e for e in candidates if self._enemy_intersects_range(e, op.range_cells)]
+            candidates = ranged or candidates
+        if op.skill_prefab_id == "skchr_lemuen_1":
+            return min(candidates, key=lambda enemy: (self._effective_enemy_defense(enemy), enemy.creation_index))
         priority = cmp_to_key(compare_operator_target_keys)
         return min(candidates, key=lambda enemy: priority(operator_target_key(enemy)))
 
@@ -4259,6 +4978,8 @@ class Battle:
             if op.dead:
                 continue
             if not op.statuses.targetable or op.statuses.has(Status.CAMOUFLAGE):
+                continue
+            if op.air_blocking and not self._is_airborne(enemy):
                 continue
             dist = math.hypot(op.tile[0] - r, op.tile[1] - c)
             if dist <= enemy.range_radius + OPERATOR_HITBOX_RADIUS + 1e-9:
@@ -4573,6 +5294,10 @@ class Battle:
         self._start_enemy_attack_cooldown(enemy)
         if enemy.apply_way != ApplyWay.MELEE.value:
             enemy.target_search_after_attack = True
+        for runtime in live_runtimes(self):
+            runtime.before_enemy_normal_attack(enemy)
+        if enemy.dead or not enemy.statuses.can_attack:
+            return
         if enemy.palsy_stacks > 0:
             enemy.palsy_stacks -= 1
             enemy.statuses.apply(
@@ -4683,6 +5408,7 @@ class Battle:
             100.0
             + unit.statuses.attack_speed_delta
             + element_bonus
+            + (sum(r.enemy_speed_delta(unit) for r in live_runtimes(self)) if isinstance(self, Battle) and isinstance(unit, _Enemy) else 0)
         )
         container = getattr(unit, "buffs", None)
         if container is not None and hasattr(container, "attribute_value"):
@@ -4695,9 +5421,12 @@ class Battle:
             form = unit.form_runtime
             total = max(1.0, own_speed + unit.squad_bonus.attack_speed
                         + unit.statuses.attack_speed_delta + element_bonus
-                        + (form.attack_speed if form else 0))
+                        + (form.attack_speed if form else 0)
+                        + (unit.skill_runtime.attack_speed() if unit.skill_runtime else 0)
+                        + (sum(r.aura_speed(unit) for r in live_runtimes(self)) if isinstance(self, Battle) else 0))
             return (unit.attack_interval * own_speed
-                    + (form.attack_time_add * 100 if form else 0)) / total
+                    + (form.attack_time_add * 100 if form else 0)
+                    + (unit.skill_runtime.interval_delta * 100 if unit.skill_runtime else 0)) / total
         return unit.attack_interval * 100.0 / attack_speed
 
     def _effective_enemy_move_speed(self, enemy: _Enemy) -> float:
@@ -4707,6 +5436,9 @@ class Battle:
             speed = container.attribute_value("MOVE_SPEED", speed)
         if enemy.statuses.has(Status.SLUGGISH):
             speed *= 0.2
+        for runtime in effect_runtimes(self):
+            if not runtime.op.dead or runtime.op.char_id == "char_4087_ines":
+                speed *= runtime.move_factor(enemy)
         return speed
 
     def _move_enemy(self, enemy: _Enemy) -> None:
@@ -4853,7 +5585,16 @@ class Battle:
 
         enemy.remaining_path_distance = self._targeting_path_distance(enemy)
         if not enemy.dead and enemy.route_idx >= len(enemy.route) - 1:
-            enemy.leaked = True
+            gate = next((op for op in self.operators if not op.dead
+                and op.char_id == "token_10058_sbell2_icetgt"
+                and op.statuses.can_block and len(op.blocked) < op.block_count
+                and not enemy.unblockable and not self._is_airborne(enemy)
+                and not enemy.statuses.has(Status.FEAR)
+                and math.dist(enemy.position(), op.tile) <= op.block_radius), None)
+            if gate is None:
+                enemy.leaked = True
+            else:
+                self._start_blocking(gate, enemy)
 
     def _advance_hidden_route_events(self, enemy: _Enemy) -> None:
         """Resolve hidden-route control points without visible movement."""
@@ -5229,7 +5970,9 @@ class Battle:
             and not enemy.disappeared
             and enemy.blocked_by is None
             and not enemy.unblockable
-            and not self._is_airborne(enemy)
+            and not enemy.statuses.has(Status.FEAR)
+            and self._is_airborne(enemy) == op.air_blocking
+            and not (getattr(enemy, "lure_target", None) and self.time < enemy.lure_target[1])
             and math.hypot(
                 op.tile[0] - enemy.position_row,
                 op.tile[1] - enemy.position_col,
@@ -5432,6 +6175,9 @@ class Battle:
         origin_row: float,
         origin_col: float,
         force_level: int,
+        *, interrupt_source: _Operator | None = None, source_key: int | None = None,
+        stop_radius: float | None = None, stop_after_reached: bool = False,
+        stop_within_source_block_range: bool = False,
     ) -> bool:
         if enemy.dead or enemy.disappeared or self._is_airborne(enemy):
             return False
@@ -5444,19 +6190,35 @@ class Battle:
         )
         if distance <= 1e-9:
             return False
-        if enemy.pull_remaining > 0:
-            self.mechanic_diagnostics.setdefault("PULL_STACK:ONE_SOURCE_APPROX", 1)
-        enemy.pull_origin_row = float(origin_row)
-        enemy.pull_origin_col = float(origin_col)
-        enemy.pull_initial_distance = distance
-        enemy.pull_force = PULL_FORCE_BY_FORCE_LEVEL[effective_level]
-        enemy.pull_remaining = 0.5 if effective_level < -1 else 1.0
+        if source_key is None and None in enemy.pull_sources:
+            self.mechanic_diagnostics["PULL_STACK:SOURCE_ID_MISSING"] = 1
+        enemy.pull_sources[source_key] = _PullForce(float(origin_row), float(origin_col), distance,
+            PULL_FORCE_BY_FORCE_LEVEL[effective_level], 0.5 if effective_level < -1 else 1.0,
+            interrupt_source, stop_radius, stop_after_reached,
+            stop_within_source_block_range=stop_within_source_block_range)
+        if stop_radius is not None:
+            self.mechanic_diagnostics["HARPOON_STOP_CHECK_PHASE_CANDIDATE"] = 1
+        self._sync_pull_summary(enemy)
         enemy.unbalanced = True
         enemy.unbalance_lock_remaining = max(
             enemy.unbalance_lock_remaining, UNBALANCE_MIN_DURATION
         )
         self._release_enemy_block(enemy)
         return True
+
+    @staticmethod
+    def _sync_pull_summary(enemy: _Enemy) -> None:
+        """Keep the historical scalar fields as a summary, not a force owner."""
+        enemy.pull_remaining = max((p.remaining for p in enemy.pull_sources.values()), default=0.0)
+        if enemy.pull_sources:
+            latest = next(reversed(enemy.pull_sources.values()))
+            enemy.pull_origin_row, enemy.pull_origin_col = latest.origin_row, latest.origin_col
+            enemy.pull_initial_distance = latest.initial_distance
+            enemy.pull_force = latest.force
+            enemy.pull_interrupt_source = latest.interrupt_source
+        else:
+            enemy.pull_force = enemy.pull_initial_distance = 0.0
+            enemy.pull_interrupt_source = None
 
     @staticmethod
     def _release_enemy_block(enemy: _Enemy) -> None:
@@ -5477,18 +6239,47 @@ class Battle:
         if self._is_airborne(enemy):
             self._end_unbalance(enemy)
             return False
-        if enemy.pull_remaining > 0:
-            force_dt = min(self.dt, enemy.pull_remaining)
-            dr = enemy.pull_origin_row - enemy.position_row
-            dc = enemy.pull_origin_col - enemy.position_col
+        for key, pull in list(enemy.pull_sources.items()):
+            source = pull.interrupt_source
+            if source is not None and (source.dead or source.statuses.has(Status.SILENCE)
+                                       or source.statuses.has(Status.STUNNED)):
+                del enemy.pull_sources[key]
+                self.mechanic_diagnostics["HARPOON_INTERRUPT_UPDATE_PHASE_CANDIDATE"] = 1
+        for key, pull in list(enemy.pull_sources.items()):
+            force_dt = min(self.dt, pull.remaining)
+            dr = pull.origin_row - enemy.position_row
+            dc = pull.origin_col - enemy.position_col
             distance = math.hypot(dr, dc)
-            if distance > 1e-9 and enemy.pull_initial_distance > 1e-9:
-                force = enemy.pull_force * (
-                    distance / enemy.pull_initial_distance
+            at_destination = pull.stop_radius is not None and distance <= pull.stop_radius
+            source = pull.interrupt_source
+            if (not at_destination and pull.stop_within_source_block_range
+                    and source is not None):
+                # CheckInBlockRange subtracts the margin from radius squared,
+                # without checking free block slots or ordinary block status.
+                at_destination = (sum((enemy.position()[i] - source.tile[i]) ** 2 for i in (0, 1))
+                                  <= source.block_radius ** 2 - .05)
+            if at_destination:
+                # TryEarlyStopPull only clears the shared rigidbody velocity
+                # when this is the sole valid pull source. A retained chain
+                # attempts this until successful, then never clears it again.
+                if not pull.velocity_stopped and len(enemy.pull_sources) == 1:
+                    enemy.force_velocity_row = enemy.force_velocity_col = 0.0
+                    pull.velocity_stopped = True
+                if pull.stop_after_reached:
+                    del enemy.pull_sources[key]
+                    continue
+            elif distance > 1e-9 and pull.initial_distance > 1e-9:
+                force = pull.force * (
+                    min(1.0, distance / pull.initial_distance)
                 ) ** 4
                 enemy.force_velocity_row += dr / distance * force * force_dt
                 enemy.force_velocity_col += dc / distance * force * force_dt
-            enemy.pull_remaining = max(0.0, enemy.pull_remaining - self.dt)
+            pull.remaining = max(0.0, pull.remaining - self.dt)
+            if pull.remaining <= 0:
+                del enemy.pull_sources[key]
+        self._sync_pull_summary(enemy)
+        if len(enemy.pull_sources) > 1:
+            self.mechanic_diagnostics["PULL_MULTI_SOURCE_PHYSICS_PHASE_CANDIDATE"] = 1
         speed = math.hypot(enemy.force_velocity_row, enemy.force_velocity_col)
         if not enemy.unbalanced and speed <= 1e-9:
             return False
@@ -5530,6 +6321,8 @@ class Battle:
         enemy.pull_force = 0.0
         enemy.pull_remaining = 0.0
         enemy.pull_initial_distance = 0.0
+        enemy.pull_interrupt_source = None
+        enemy.pull_sources.clear()
 
     def _targeting_path_distance(self, enemy: _Enemy) -> float:
         """Estimate distToExit from checkpoint grids and their next nodes.
@@ -5630,6 +6423,25 @@ class Battle:
 
         return f32(total + projection)
 
+    def _queue_lemuen_survivor_sp(self, source: _Operator, target: _Enemy, amount: float) -> None:
+        if not amount or source.dead or target.dead or target.leaked:
+            return
+        _, markers = self._lemuen_survivor_sp.setdefault(id(target), (target, []))
+        markers.append((source, amount))
+        self.mechanic_diagnostics["LEMUEN_MODULE_TARGET_LATE_ENABLE_PHASE_CANDIDATE"] = 1
+
+    def _tick_lemuen_survivor_sp(self, target: _Enemy) -> None:
+        pending = self._lemuen_survivor_sp.pop(id(target), None)
+        if pending is None or target.dead or target.leaked:
+            return
+        # BuffContainer.Tick calls OnTick for its buffs, then OnLateTick.
+        # The marker's finite lifetime is not a delay before granting SP.
+        if self.dt >= 0.10000000149011612:
+            return
+        for source, amount in pending[1]:
+            if not source.dead:
+                self._gain_sp(source, amount)
+
     def _cleanup(self) -> None:
         for enemy in list(self.enemies):
             if enemy.dead or enemy.leaked:
@@ -5646,6 +6458,10 @@ class Battle:
                 for enemy in list(op.blocked):
                     self._release_enemy_block(enemy)
         self.enemies = [e for e in self.enemies if not e.dead]
+        for key, (target, markers) in list(self._lemuen_survivor_sp.items()):
+            markers[:] = [(source, amount) for source, amount in markers if not source.dead]
+            if target.dead or target.leaked or not markers:
+                self._lemuen_survivor_sp.pop(key)
 
     # ------------------------------------------------------- generic mechanics
     def apply_status(
@@ -5690,6 +6506,12 @@ class Battle:
         neutral: bool = False,
         source: _Enemy | _Operator | None = None,
     ) -> ElementResult:
+        normalized = element if isinstance(element, ElementType) else ElementType(str(element).upper())
+        source_runtime = getattr(source, "skill_runtime", None)
+        if source_runtime is not None and isinstance(target, _Enemy):
+            amount *= source_runtime.element_output_scale(target)
+        for runtime in live_runtimes(self):
+            amount *= runtime.element_incoming_scale(target, normalized)
         result = target.elements.apply(
             element,
             amount,
@@ -5751,6 +6573,9 @@ class Battle:
                 result.burst_duration,
                 resistible=False,
             )
+        if enemy_target:
+            for runtime in live_runtimes(self):
+                runtime.element_break_started(target)
 
     def _tick_element_burst(self, target: _Enemy | _Operator) -> None:
         runtime = target.element_burst
@@ -5783,7 +6608,7 @@ class Battle:
         damage_type: DamageType,
         source: _Enemy | _Operator | None,
     ) -> None:
-        result = apply_damage(
+        result = self._apply_damage(
             DamagePacket(
                 amount=amount,
                 damage_type=damage_type,
@@ -5793,7 +6618,6 @@ class Battle:
                 target_resistance_override=self._effective_resistance(target),
             ),
             target,
-            roll=self._roll_probability,
         )
         if result.killed and isinstance(target, _Enemy):
             self.enemies_killed += 1
@@ -5812,7 +6636,10 @@ class Battle:
             if runtime is not None and runtime.element is ElementType.FIRE
             else 0.0
         )
-        return float(getattr(target, "res", 0.0)) - reduction
+        own = getattr(target, "skill_runtime", None)
+        return (float(getattr(target, "res", 0.0)) - reduction
+                + float(getattr(target, "roster_res_delta", 0))
+                + (own.res_bonus() if own else 0))
 
     @staticmethod
     def _outgoing_damage_scale(source: _Enemy | _Operator) -> float:
@@ -5859,7 +6686,7 @@ class Battle:
             )
         ):
             return False
-        result = apply_damage(
+        result = self._apply_damage(
             DamagePacket(
                 amount=amount,
                 damage_type=damage_type,
@@ -5871,7 +6698,6 @@ class Battle:
                 target_resistance_override=self._effective_resistance(target),
             ),
             target,
-            roll=self._roll_probability,
         )
         if result.killed and isinstance(target, _Enemy):
             self.enemies_killed += 1
@@ -5913,11 +6739,11 @@ class Battle:
                 if op.facing == 0:  # right
                     dr, dc = side, forward
                 elif op.facing == 1:  # down
-                    dr, dc = forward, -side
+                    dr, dc = -forward, side
                 elif op.facing == 2:  # left
                     dr, dc = -side, -forward
                 else:  # up
-                    dr, dc = -forward, side
+                    dr, dc = forward, -side
                 cells.add((op.tile[0] + dr, op.tile[1] + dc))
         return cells
 
@@ -6109,6 +6935,8 @@ class Battle:
         op = self._active_operator(char_id)
         if op is None:
             return OperationAttempt("skip", "not_on_field")
+        if getattr(op, "manual_retreat_forbidden", False):
+            return OperationAttempt("skip", "retreat_forbidden")
         op.retreated = True
         op.dead = True
         self._process_operator_departure(op, retreated=True)
@@ -6123,6 +6951,8 @@ class Battle:
             return OperationAttempt("skip", "skill_unavailable" if op.skill_end_reason == "PERMANENT" else "no_skill")
         if op.skill_type != "MANUAL":
             return OperationAttempt("skip", "not_manual_skill")
+        if op.skill_prefab_id == WHITW2_S1:
+            return self._try_switch_mode(char_id)
         if op.form_runtime is not None and op.form_runtime.mode == "THANATOS":
             if op.form_runtime.manual_switch():
                 return OperationAttempt("ok", details={"deployment":op.deployment_index, "form":"ORPHEUS"})
@@ -6130,7 +6960,7 @@ class Battle:
         details = {"deployment": op.deployment_index, "sp": op.sp, "required_sp": self._skill_cost(op),
                    "startup_remaining": max(0.0, op.skill_startup_until - self.time),
                    "active_until": op.active_until,
-                   "statuses": [status.value for status in op.statuses.durations]}
+                   "statuses": sorted(status.value for status in op.statuses.active_statuses())}
         if self._skill_starting(op):
             return OperationAttempt("wait", "skill_starting", details)
         if op.skill_active:
@@ -6183,25 +7013,44 @@ class Battle:
                                               "cast": op.skill_cast_count})
 
     def _process_operator_departure(
-        self, op: _Operator, *, retreated: bool
+        self, op: _Operator, *, retreated: bool, refund_withdraw_cost: bool = True,
+        preserve_redeploy_state: bool = False,
     ) -> None:
         if op.departure_processed:
             return
         op.departure_processed = True
+        respawn_scale = min([1.0] + [r.departure_respawn_scale(op) for r in effect_runtimes(self)
+                                    if not r.op.dead or r.op is op])
         if op.form_runtime is not None:
             op.form_runtime.depart()
         if op.healing_runtime is not None:
             op.healing_runtime.depart()
-        if retreated:
+        if op.skill_runtime is not None:
+            op.skill_runtime.depart()
+        for runtime in effect_runtimes(self):
+            runtime.clear_angel_blessings(op)
+            runtime.remove_element_aura_member(op)
+        if retreated and refund_withdraw_cost and op.subprofession != "merchant":
             refund = math.floor(min(op.deployed_cost * 0.5, op.base_cost))
             self.dp = min(self.max_cost, self.dp + refund)
         if op.target_selector is not None:
             op.target_selector.dispose()
-        penalty = min(self.redeploy_penalty.get(op.char_id, 0) + 1, 2)
-        self.redeploy_penalty[op.char_id] = penalty
-        self.redeploy_ready_at[op.char_id] = self.time + op.respawn_time
+        if not preserve_redeploy_state:
+            penalty = min(self.redeploy_penalty.get(op.char_id, 0) + 1, 2)
+            self.redeploy_penalty[op.char_id] = penalty
+            self.redeploy_ready_at[op.char_id] = self.time + op.respawn_time * respawn_scale
 
     def _try_deploy(self, plan: OperatorPlan) -> OperationAttempt:
+        if plan.char_id == SOUL_WARD:
+            return OperationAttempt("skip", "token_automatic_spawn_only")
+        if plan.char_id == "token_10057_svash2_eagle1":
+            return OperationAttempt("skip", "token_skill_not_active")
+        if plan.char_id in TOKEN_SKILLS:
+            owner = next((r for r in live_runtimes(self) if r.sid == TOKEN_SKILLS[plan.char_id]), None)
+            return owner.deploy_token(plan) if owner else OperationAttempt("wait", "token_owner_not_on_field")
+        for receiver in live_runtimes(self):
+            if plan.char_id in receiver.relocation_reserve:
+                return receiver.redeploy_relocated(plan)
         if plan.char_id not in self.characters:
             return OperationAttempt("skip", "unknown_operator")
         if plan.tile is None:
@@ -6226,7 +7075,7 @@ class Battle:
         profession = str(self.characters[plan.char_id].get("position", "RANGED"))
         details = {"tile": list(plan.tile), "cost": cost, "available_cost": self.dp,
                    "cost_lower_bound": self.cost_lower_bound,
-                   "occupied_slots": sum(1 for op in self.operators if not op.dead),
+                   "occupied_slots": sum(1 for op in self.operators if not op.dead and getattr(op, "uses_deployment_slot", True)),
                    "slot_limit": self.character_limit,
                    "redeploy_ready_at": self.redeploy_ready_at.get(plan.char_id, 0.0)}
         if not (0 <= row < len(self.map_grid) and 0 <= col < len(self.map_grid[0])):
@@ -6247,6 +7096,22 @@ class Battle:
             return OperationAttempt("wait", blockers[0], details)
         self.dp -= cost
         self.operators.append(self._make_operator(plan, cost))
-        self.squad_effects.deployed(plan.char_id)
+        deployed = self.operators[-1]
+        if deployed.skill_runtime is not None:
+            deployed.skill_runtime.cost_spent(cost)
+        self._operator_deployed(deployed)
+        return OperationAttempt("ok", details={**details, "deployment": deployed.deployment_index})
+
+    def _operator_deployed(self, deployed: _Operator) -> None:
+        """Shared field-entry notifications, including cost-free relocation."""
+        if deployed.skill_runtime is not None:
+            deployed.skill_runtime.born()
+        for runtime in live_runtimes(self):
+            runtime.deployed(deployed)
+            shield = runtime.deck_shields.pop(deployed.char_id, None)
+            if shield:
+                deployed.damage_rules.append(DamageRule("BARRIER", value=shield))
+                runtime.deck_discounts.pop(deployed.char_id, None)
+                runtime.deck_discount = None
+        self.squad_effects.deployed(deployed.char_id)
         self._sync_squad_effects()
-        return OperationAttempt("ok", details={**details, "deployment": self.operators[-1].deployment_index})

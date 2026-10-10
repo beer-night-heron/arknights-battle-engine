@@ -18,6 +18,10 @@ from arksim.battle import Battle, CLIENT_FP_SCALE, CLIENT_LOGIC_RATE
 from arksim import data as D
 from arksim.mechanics import Status
 from arksim.cli import DEFAULT_DATA_DIR, build_config
+from arksim.cli import parse_plan, resolve_level_file
+from arksim.replay_edit import frame_number, replace_future_plan, verify_prefix, runtime_signature
+from arksim.squad import BUILD_FIELDS
+from arksim.random_trace import RandomDecisionRng
 
 def compact_enemy(enemy: Any, battle: Battle) -> dict[str, Any]:
     route_index = next(
@@ -56,6 +60,8 @@ def compact_enemy(enemy: Any, battle: Battle) -> dict[str, Any]:
     }
     if enemy.facing is not None:
         state["facing"] = round(enemy.facing.value_at(battle.time), 4)
+    if enemy.wisdel_remnant_source is not None and not enemy.wisdel_remnant_source.dead:
+        state["remnantSource"] = enemy.wisdel_remnant_source.deployment_index
     muzzle = battle.enemy_muzzle_position_v3(enemy)
     if muzzle is not None:
         state["muzzle"] = {"r": round(muzzle[0], 4), "c": round(muzzle[1], 4), "z": round(muzzle[2], 4)}
@@ -75,10 +81,13 @@ def compact_operator(operator: Any, battle: Battle) -> dict[str, Any]:
         if periodic else operator.sp % 1.0
         if operator.sp_type == "INCREASE_WITH_TIME" else None
     )
+    muzzle = battle.operator_muzzle_position_v3(operator)
     return {
         "id": operator.deployment_index,
         "char": operator.char_id,
         "profile": operator.plan_profile,
+        "muzzle": {"r": round(muzzle[0], 4), "c": round(muzzle[1], 4), "z": round(muzzle[2], 4)} if muzzle else None,
+        "muzzleMount": operator.last_projectile_mount,
         "name": operator.name,
         "r": operator.tile[0],
         "c": operator.tile[1],
@@ -108,6 +117,9 @@ def compact_operator(operator: Any, battle: Battle) -> dict[str, Any]:
         "canEndSkill": operator.skill_controls.can_end,
         "canSwitchMode": operator.skill_controls.can_switch,
         "skillEndReason": operator.skill_end_reason,
+        "skillState": operator.skill_runtime.snapshot() if operator.skill_runtime else None,
+        "summoner": getattr(getattr(operator, "summoner", None), "deployment_index", None),
+        "camouflaged": operator.statuses.has(Status.CAMOUFLAGE),
         "form": operator.form_runtime.mode if operator.form_runtime is not None else None,
         "atkScale": round(operator.atk_scale, 4),
         "defScale": round(operator.def_scale, 4),
@@ -126,6 +138,8 @@ def compact_projectile(projectile: Any) -> dict[str, Any]:
         "id": projectile.projectile_id,
         "key": projectile.key,
         "side": projectile.side,
+        "origin": list(projectile.origin) if getattr(projectile, "origin", None) is not None else None,
+        "mount": getattr(projectile, "mount_point", None),
         "r": round(projectile.position_row, 4),
         "c": round(projectile.position_col, 4),
         "z": round(projectile.position_z, 4),
@@ -170,12 +184,24 @@ def export_roster(battle: Battle) -> list[dict[str, Any]]:
                 "blockCapacity": int(attrs.get("blockCnt", 1)),
             },
         })
+    for operator in battle.operators:
+        if not hasattr(operator, "summoner"):
+            continue
+        roster.append({"profile": -operator.deployment_index, "char": operator.char_id,
+                       "planned": False, "reserveEligible": False, "name": operator.name,
+                       "baseCost": operator.base_cost, "loadout": {},
+                       "attributes": {"maxHp": operator.max_hp, "atk": operator.atk,
+                                      "def": operator.defense, "res": operator.res,
+                                      "attackInterval": operator.attack_interval,
+                                      "blockCapacity": operator.block_count}})
     return roster
 
 
 def reserve_state(battle: Battle, roster: list[dict[str, Any]]) -> list[dict[str, Any]]:
     profiles = {}
     for profile in roster:
+        if profile.get("reserveEligible") is False:
+            continue
         previous = profiles.get(profile["char"])
         if previous is None or previous["profile"] < battle.plan_index:
             profiles[profile["char"]] = profile
@@ -218,7 +244,10 @@ def capture_state(battle: Battle, roster: list[dict[str, Any]] | None = None) ->
         },
         "projectiles": {
             projectile.projectile_id: compact_projectile(projectile)
-            for projectile in battle.projectiles
+            for projectile in [*battle.projectiles, *[visual for operator in battle.operators
+                               if operator.skill_runtime for visual in operator.skill_runtime.visuals()]]
+            if getattr(projectile, "born_at", None) is None
+               or projectile.born_at <= battle.time + 1e-9
         },
         "effects": {
             id(effect): {
@@ -363,6 +392,7 @@ def run_case(
     plan_path: Path,
     shared: dict[str, Any],
     sample_interval: float,
+    plan_edits: list[tuple[int, list]] | None = None,
 ) -> dict[str, Any]:
     battle = Battle(
         shared["level"],
@@ -386,15 +416,34 @@ def run_case(
         favor_table=shared.get("favor_table"),
         squad=shared.get("squad"),
         operator_forms=shared.get("operator_forms"),
+        operator_graphics=shared.get("operator_graphics"),
+        random_trace=shared.get("random_trace", False),
+        random_tape=shared.get("random_tape"),
+        module_context=shared.get("module_context"),
     )
     frames: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
     roster = export_roster(battle)
+    roster_history = {(item["profile"], item["char"]): item for item in roster}
+    edits = iter(plan_edits or [])
+    edit = next(edits, None)
     before = capture_state(battle, roster)
     frames.append(snapshot(before))
     next_sample = sample_interval
     while battle.time < 600:
+        if edit is not None and battle.frame_index == edit[0]:
+            replace_future_plan(battle, edit[1], edit[0])
+            roster = export_roster(battle)
+            roster_history.update({(item["profile"], item["char"]): item for item in roster})
+            # Future-only reserve profiles may change; don't report them as
+            # battle events or rewrite the already captured boundary frame.
+            before = capture_state(battle, roster)
+            edit = next(edits, None)
         battle.step()
+        if any(hasattr(operator, "summoner") and (-operator.deployment_index, operator.char_id) not in roster_history
+               for operator in battle.operators):
+            roster = export_roster(battle)
+            roster_history.update({(item["profile"], item["char"]): item for item in roster})
         after = capture_state(battle, roster)
         events.extend(derive_events(before, after))
         if battle.time + 1e-9 >= next_sample:
@@ -411,6 +460,10 @@ def run_case(
             break
     if not battle.end_reason:
         battle.end_reason = "timeout"
+    if edit is not None:
+        raise ValueError("战斗在切入点之前结束，不能继续编排")
+    if isinstance(battle.rng, RandomDecisionRng):
+        battle.rng.assert_consumed()
     events.extend(battle.operation_log.events)
     events.extend(battle.wave_scheduler.events)
     for op in battle.operators:
@@ -430,7 +483,7 @@ def run_case(
     final_state = snapshot(capture_state(battle, roster))
     if not frames or frames[-1]["t"] != final_state["t"]:
         frames.append(final_state)
-    return {
+    case = {
         "label": label,
         "plan": plan_path.name,
         "sampleInterval": sample_interval,
@@ -438,7 +491,7 @@ def run_case(
         "enemyMuzzle": battle.assumptions.enemy_projectile_muzzle,
         "enemyTurning": battle.assumptions.enemy_facing_transition,
         "routes": export_routes(battle),
-        "roster": roster,
+        "roster": list(roster_history.values()),
         "squad": [item.char_id for item in battle.squad],
         "difficulty": battle.level.get("selectedDifficulty", "NORMAL"),
         "optionalRunes": battle.level.get("selectedOptionalRunes", []),
@@ -446,6 +499,9 @@ def run_case(
         "events": events,
         "result": asdict(battle.result()),
     }
+    if isinstance(battle.rng, RandomDecisionRng):
+        case["randomDecisions"] = battle.rng.export()
+    return case
 
 
 def promote(staged: Path, output_root: Path) -> Path:
@@ -498,7 +554,44 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--enemy-muzzle", action="store_true", help="use optional enemy muzzle profiles")
     parser.add_argument("--enemy-turning", action="store_true", help="simulate optional enemy facing transitions")
     parser.add_argument("--output-dir", default=str(ROOT / "local"), help="parent of 最新模拟 and 模拟历史")
+    parser.add_argument("--editor-project", help="editor project to retain in the replay")
+    parser.add_argument("--continuation", help="validated editor continuation context")
+    parser.add_argument("--source-replay", help="source replay whose prefix must match before publishing")
+    parser.add_argument("--random-trace", help="new local JSON file for semantic random decisions")
+    parser.add_argument("--random-tape", help="local decision JSON to replay outcomes strictly")
+    parser.add_argument("--module-context", help="local JSON containing game_tags, map_tags and ingots")
     args = parser.parse_args(argv)
+    if bool(args.continuation) != bool(args.source_replay):
+        parser.error("--continuation and --source-replay must be used together")
+    if args.continuation and args.editor_project:
+        parser.error("--editor-project cannot be combined with --continuation")
+    if args.module_context and (args.continuation or args.editor_project):
+        parser.error("条件模组的额外场景暂不支持编辑器方案与回放续编")
+    if args.random_tape and (args.continuation or args.editor_project):
+        parser.error("指定随机结果复演暂不支持编辑器方案或回放续编")
+    if args.random_tape:
+        analysis_root = Path(args.output_dir).resolve()
+        local_root = (ROOT / "local").resolve()
+        if analysis_root == local_root or not analysis_root.is_relative_to(local_root):
+            parser.error("指定随机结果复演请用 --output-dir 选择 local/ 下的独立子目录")
+    trace_path = None
+    tape = None
+    for name in ("random_trace", "random_tape"):
+        if not getattr(args, name):
+            continue
+        path = Path(getattr(args, name)).resolve()
+        if not path.is_relative_to((ROOT / "local").resolve()):
+            parser.error("随机记录与指定结果文件必须保存在 local/ 内")
+        if name == "random_trace":
+            if path.exists():
+                parser.error("随机记录文件已经存在，请使用新文件名")
+            trace_path = path
+        else:
+            try:
+                tape = json.loads(path.read_text(encoding="utf-8"))
+                RandomDecisionRng(args.seed, tape=tape)
+            except (OSError, ValueError) as error:
+                parser.error(f"无法读取指定随机结果：{error}")
     if not math.isfinite(args.sample_interval) or args.sample_interval < 1 / 30:
         parser.error("--sample-interval must be finite and at least 1/30 second")
     try:
@@ -516,11 +609,70 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, KeyError) as error:
         parser.error(f"cannot load simulation inputs: {error}")
     shared["seed"] = args.seed
-    case = run_case(args.label, Path(args.plan), shared, args.sample_interval)
+    if args.module_context:
+        context_path = Path(args.module_context).resolve()
+        if not context_path.is_relative_to((ROOT / "local").resolve()):
+            parser.error("模组场景文件必须位于 local/ 内")
+        try:
+            shared["module_context"] = json.loads(context_path.read_text(encoding="utf-8"))
+            if not isinstance(shared["module_context"], dict):
+                raise ValueError("模组场景必须是对象")
+        except (OSError, ValueError) as error:
+            parser.error(f"无法读取模组场景：{error}")
+    shared["random_trace"] = trace_path is not None
+    shared["random_tape"] = tape
+    signature = runtime_signature(Path(args.data_dir), resolve_level_file(D.load_stages(), args.stage))
+    context, edits = None, []
+    source = None
+    if args.source_replay:
+        source = json.loads(Path(args.source_replay).read_text(encoding="utf-8"))
+        if source["cases"][0].get("randomDecisions", {}).get("outcome_replay"):
+            raise ValueError("指定随机结果的分析回放暂不支持续编，请先正常运行原方案")
+        if source.get("runtimeSignature") and source["runtimeSignature"] != signature:
+            raise ValueError("本地运行数据或假设参数已改变，请先重新运行原方案")
+        if source.get("map") != export_map(shared["level"]):
+            raise ValueError("原回放地图与当前输入不一致")
+    if args.continuation:
+        from arksim.editor import EditorData
+        from arksim.replay_edit import validate_edit
+        context = json.loads(Path(args.continuation).read_text(encoding="utf-8"))
+        data = EditorData(Path(args.data_dir))
+        root_compiled = data.compile(context["project"])
+        original = root_compiled["project"]
+        root_plan = parse_plan(root_compiled["plan"])
+        if root_plan != shared["plan"] or original["stage"] != args.stage:
+            raise ValueError("续编原方案与运行输入不一致")
+        squad = [{k: v for k, v in asdict(item).items() if k in BUILD_FIELDS} for item in shared["squad"] or []]
+        if squad != original["squad"]:
+            raise ValueError("续编原编队与运行输入不一致")
+        actual_options = {"seed": args.seed, "spawn_timing": args.spawn_timing,
+                          "enemy_attack_timing": args.enemy_attack_timing, "enemy_muzzle": args.enemy_muzzle,
+                          "enemy_turning": args.enemy_turning, "optional_runes": args.rune}
+        if actual_options != original["options"] or not context["edits"]:
+            raise ValueError("续编选项或记录与运行输入不一致")
+        previous_frame = -1
+        for change in context["edits"]:
+            compiled = data.compile(change["project"])
+            frame = change["frame"]
+            if type(frame) is not int or frame <= previous_frame:
+                raise ValueError("续编切入帧必须递增")
+            validate_edit(original, compiled["project"], frame)
+            edits.append((frame, parse_plan(compiled["plan"])))
+            original, previous_frame = compiled["project"], frame
+    elif args.editor_project:
+        context = {"project": json.loads(Path(args.editor_project).read_text(encoding="utf-8")), "edits": []}
+    case = run_case(args.label, Path(args.plan), shared, args.sample_interval, edits)
+    if args.source_replay:
+        verify_prefix(source["cases"][0], case, edits[-1][0])
+        # Keep the source's sampled prefix byte-for-byte at JSON value level.
+        boundary = edits[-1][0]
+        case["frames"] = [f for f in source["cases"][0]["frames"] if frame_number(f) <= boundary] + [
+            f for f in case["frames"] if frame_number(f) > boundary]
     created = datetime.now(timezone.utc).isoformat()
     payload = {
         "format": "arksim-replay", "schemaVersion": 1,
         "engineVersion": __version__, "createdAt": created,
+        "runtimeSignature": signature,
         "stage": args.stage, "spawnTiming": args.spawn_timing,
         "difficulty": shared["level"].get("selectedDifficulty", "NORMAL"),
         "optionalRunes": shared["level"].get("selectedOptionalRunes", []),
@@ -528,6 +680,14 @@ def main(argv: list[str] | None = None) -> int:
         "enemyMuzzle": args.enemy_muzzle, "enemyTurning": args.enemy_turning,
         "map": export_map(shared["level"]), "cases": [case],
     }
+    if context is not None:
+        payload["editorContext"] = context
+    if shared.get("module_context") is not None:
+        payload["moduleContext"] = shared["module_context"]
+    if trace_path is not None:
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        with trace_path.open("x", encoding="utf-8") as stream:
+            json.dump(case["randomDecisions"], stream, ensure_ascii=False, indent=2, allow_nan=False)
     output_root = Path(args.output_dir).resolve()
     # All moving happens within this resolved root, with no symlink escapes.
     history = output_root / "模拟历史"
@@ -550,6 +710,8 @@ def main(argv: list[str] | None = None) -> int:
         "enemyMuzzle": args.enemy_muzzle, "enemyTurning": args.enemy_turning,
         "frames": len(case["frames"]), "result": case["result"],
     }
+    if shared.get("module_context") is not None:
+        manifest["moduleContext"] = shared["module_context"]
     (staged / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     latest = promote(staged, output_root)
     print(f"Replay: {latest / 'replay.json'}")

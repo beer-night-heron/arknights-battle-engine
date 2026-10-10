@@ -1,4 +1,4 @@
-"""Optional enemy facing and map-space projectile attachment profiles.
+"""Facing and map-space projectile attachment profiles.
 
 Profiles contain converted simulation coordinates, not raw model pixels.
 The linear facing transition is a replaceable approximation, not a claim
@@ -16,7 +16,7 @@ from typing import Any
 def _finite(value: Any) -> float:
     number = float(value)
     if not math.isfinite(number):
-        raise ValueError("enemy graphic values must be finite")
+        raise ValueError("graphic values must be finite")
     return number
 
 
@@ -129,3 +129,65 @@ class FacingRuntime:
         self.target = target
         self.started_at = time
         self.duration = duration
+
+
+@dataclass(frozen=True)
+class OperatorGraphicProfile:
+    faces: dict[str, dict[str, Any]]
+    projectiles: dict[str, dict[str, Any]]
+
+    @classmethod
+    def from_dict(cls, spec: dict[str, Any]) -> "OperatorGraphicProfile":
+        if not isinstance(spec, dict) or spec.get("coordinateSpace") != "map":
+            raise ValueError("operator graphics require coordinateSpace='map'")
+        faces = {}
+        for face, value in spec.get("faces", {}).items():
+            if face not in ("front", "back"):
+                raise ValueError("operator graphic faces must be front/back")
+            animations = {}
+            for name, animation in value.get("animations", {}).items():
+                times = tuple(_finite(t) for t in animation["times"])
+                duration = _finite(animation["duration"])
+                if (duration < 0 or not times or times[0] != 0 or times[-1] > duration + 1e-7
+                        or any(a >= b for a, b in zip(times, times[1:]))):
+                    raise ValueError("operator animation samples must increase from zero within duration")
+                offsets = {mount: tuple(map_offset(v) for v in samples)
+                           for mount, samples in animation["offsets"].items()}
+                if any(len(samples) != len(times) for samples in offsets.values()):
+                    raise ValueError("operator mount samples must match animation times")
+                animations[name] = (duration, bool(animation.get("loop", False)), times, offsets)
+            faces[face] = animations
+        projectiles = spec.get("projectiles", {})
+        if not isinstance(projectiles, dict):
+            raise ValueError("operator graphic projectile rules must be objects")
+        for rule in projectiles.values():
+            if not isinstance(rule, dict) or rule.get("loopType", "LOOP") not in ("LOOP", "RANDOM"):
+                raise ValueError("operator mount group must use LOOP/RANDOM")
+            if "group" in rule and (not isinstance(rule["group"], list) or not rule["group"]
+                                    or any(not isinstance(v, str) for v in rule["group"])):
+                raise ValueError("operator mount group must contain named points")
+        return cls(faces, projectiles)
+
+    def offset_at(self, face: str, mount: str, animation: str, time: float):
+        if mount == "FOOT":
+            return (0.0, 0.0, 0.0)
+        animations = self.faces.get(face, {})
+        track = animations.get(animation)
+        if track is None or (not track[1] and time > track[0] + 1e-7):
+            track = animations.get("Idle")
+        if track is None:
+            return None
+        duration, loop, times, offsets = track
+        values = offsets.get(mount)
+        if not values:
+            return None
+        time = max(0.0, time)
+        if loop and duration > 0:
+            time %= duration
+        index = bisect_right(times, time)
+        if index == 0:
+            return values[0]
+        if index == len(times):
+            return values[-1]
+        weight = (time - times[index - 1]) / (times[index] - times[index - 1])
+        return tuple(a + (b - a) * weight for a, b in zip(values[index - 1], values[index]))

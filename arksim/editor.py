@@ -11,10 +11,23 @@ from .loadout import resolve_plan
 from .skill_controls import skill_controls
 from .squad import BUILD_FIELDS
 from .runes import select_stage_runes, forbidden_locations
+from .operator_skills import TOKEN_SKILLS, token_builds
 
 OP_FIELDS = {"char_id", "time", "action", "tile", "facing", "on_failure", "mode"}
 DEFAULT_OPTIONS = {"spawn_timing": "fast", "enemy_attack_timing": "float", "seed": 0,
                    "enemy_muzzle": False, "enemy_turning": False, "optional_runes": []}
+
+# Prefer carried squad bonuses for new members; saved builds remain explicit.
+CARRIED_MODULE_DEFAULTS = {
+    "char_180_amgoat": "uniequip_002_amgoat",  # CCR-X: carried caster ATK
+    "char_340_shwaz": "uniequip_002_shwaz",  # ARC-X: carried sniper ATK
+    "char_4228_closur": "uniequip_002_closur",  # TAC-X: carried Rhodes ATK
+    "char_1023_ghost2": "uniequip_003_ghost2",  # PUM-Y: hunter HP and SP
+    "char_263_skadi": "uniequip_002_skadi",  # DRE-Y: hunter ATK and HP
+    "char_218_cuttle": "uniequip_002_cuttle",  # DEA-X: hunter attack speed
+    "char_2025_shu": "uniequip_003_shu",  # GUA-Y: upgraded team conditions
+    "char_2014_nian": "uniequip_003_nian",  # PRO-Y: carried defender HP
+}
 
 
 class EditorData:
@@ -92,7 +105,12 @@ class EditorData:
                                        "level": meta.get("unlockLevel", 1)}, "trust": trust})
         return {"id": key, "name": char.get("name", key), "position": char.get("position"),
                 "maxLevels": [p.get("maxLevel", 1) for p in char.get("phases", [])],
-                "maxPotential": char.get("maxPotentialLevel", 0), "skills": skills, "modules": modules}
+                "maxPotential": char.get("maxPotentialLevel", 0), "skills": skills, "modules": modules,
+                "defaultModuleId": CARRIED_MODULE_DEFAULTS.get(key),
+                "tokens": [{"id": token, "name": self.characters[token].get("name", token),
+                            "position": self.characters[token].get("position"), "skill": sid}
+                           for token, sid in TOKEN_SKILLS.items() if token in self.characters
+                           and any(s["id"] == sid for s in skills)]}
 
     def build(self, raw: dict) -> tuple[dict, dict]:
         if not isinstance(raw, dict) or set(raw) - BUILD_FIELDS:
@@ -130,6 +148,7 @@ class EditorData:
             builds[key] = config
             squad.append(config)
             summaries.append(summary)
+        builds.update(token_builds(squad, self.characters))
         options = project.get("options", {})
         if not isinstance(options, dict) or set(options) - DEFAULT_OPTIONS.keys():
             raise ValueError("模拟选项格式错误或含有未知字段")
@@ -153,7 +172,7 @@ class EditorData:
                     raise ValueError("操作格式错误或含有未知字段")
                 key = raw.get("char_id")
                 if key not in builds:
-                    raise ValueError("操作引用的干员未携带")
+                    raise ValueError("操作引用的干员未携带，或召唤物不属于当前技能")
                 item = parse_plan([{**builds[key], **raw} if raw.get("action", "DEPLOY").upper() == "DEPLOY" else raw])[0]
                 if item.action == "DEPLOY":
                     r, c = item.tile
@@ -194,7 +213,7 @@ class EditorData:
         builds, operations = {}, []
         for item in plans:
             fields = asdict(item)
-            if item.action == "DEPLOY":
+            if item.action == "DEPLOY" and item.char_id not in TOKEN_SKILLS:
                 config, _ = self.build({k: v for k, v in fields.items() if k in BUILD_FIELDS})
                 previous = builds.get(item.char_id)
                 if previous is not None and previous != config:

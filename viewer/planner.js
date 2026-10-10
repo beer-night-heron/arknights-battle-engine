@@ -5,7 +5,12 @@ const labels = {DEPLOY:'部署',RETREAT:'撤退',SKILL:'开技能',SKILL_END:'�
 const professionNames = {PIONEER:'先锋',WARRIOR:'近卫',TANK:'重装',SNIPER:'狙击',CASTER:'术师',MEDIC:'医疗',SUPPORT:'辅助',SPECIAL:'特种'};
 const buildFields = ['char_id','elite','level','trust','potential_rank','skill_id','skill_level','module_id','module_level','auto_skill'];
 const freshProject = () => ({format:'arksim-plan-editor',version:1,stage:'',squad:[],operations:[],options:{spawn_timing:'fast',enemy_attack_timing:'float',seed:0,enemy_muzzle:false,enemy_turning:false}});
-const state = {project:freshProject(),catalog:null,stage:null,details:new Map(),selectedBuild:null,editIndex:null,tile:null,facing:0,preview:0,dirty:false,draftDirty:false,operationDirty:false,savedLabel:'未保存方案',running:false,revision:0};
+const state = {project:freshProject(),catalog:null,stage:null,details:new Map(),selectedBuild:null,editIndex:null,tile:null,facing:0,preview:0,dirty:false,draftDirty:false,operationDirty:false,savedLabel:'未保存方案',running:false,revision:0,branch:null};
+const embedded=window.parent!==window;
+const branchEmbed=new URLSearchParams(location.search).get('embed')==='branch';
+document.body.classList.toggle('embedded',embedded);document.body.classList.toggle('branch-editor',branchEmbed);
+function sendWorkspace(type,value={}){if(embedded)window.parent.postMessage({arksimWorkspace:true,type,...value},location.origin);}
+function lockedOperation(index){return state.branch&&state.project.operations[index]?.time<=state.branch.time+1e-9;}
 let noticeTimer, statTimer, buildRequest=0, stageRequest=0;
 const buildInputs=['elite','level','trust','potential','skill','skillLevel','module','moduleLevel','autoSkill'];
 const operationInputs=['opChar','opAction','opTime','opFrame','opMode','failure'];
@@ -118,9 +123,15 @@ function markDirty() {
   state.dirty=true; state.revision++; showSaveState();scheduleDraft();
   $('openReplay').hidden=true;
 }
-function operatorName(id) {return state.catalog?.operators.find(o=>o.id===id)?.name || id;}
+function operatorName(id) {return state.catalog?.operators.find(o=>o.id===id)?.name || detailFor(id)?.name || id;}
 function frameText(time) {const frame=Math.round(time*30);return `${Math.abs(time*30-frame)>1e-6?'约 ':''}f${frame}`;}
-function selectedMember() {return state.project.squad.find(b=>b.char_id===$('opChar').value);}
+function operationMembers() {
+  return state.project.squad.flatMap(b=>[b,...(detailFor(b.char_id)?.tokens||[]).filter(t=>t.skill===b.skill_id).map(t=>{
+    state.details.set(t.id,{id:t.id,name:t.name,position:t.position,skills:[],modules:[],tokens:[]});
+    return {char_id:t.id,owner:b.char_id,token:true};
+  })]);
+}
+function selectedMember() {return operationMembers().find(b=>b.char_id===$('opChar').value);}
 function detailFor(id) {return state.details.get(id);}
 async function loadDetail(id) {
   if (!state.details.has(id)) state.details.set(id,await api(`/api/operator?id=${encodeURIComponent(id)}`));
@@ -179,7 +190,7 @@ function renderSquad() {
     return `<article class="squad-card ${state.selectedBuild===b.char_id?'selected':''}" data-id="${escapeText(b.char_id)}" tabindex="0" role="button" aria-label="编辑${escapeText(operatorName(b.char_id))}练度"><button class="card-delete" data-remove="${escapeText(b.char_id)}" aria-label="移除${escapeText(operatorName(b.char_id))}">×</button><strong class="name">${escapeText(operatorName(b.char_id))}</strong><span class="meta">E${b.elite} / Lv.${b.level} · ${b.potential_rank+1} 潜</span><div class="skill-line">信赖 ${b.trust}%<br>${escapeText(skill?.name||'不携带技能')}${b.skill_id?` · ${rankName(b.skill_level)}`:''}<br>${escapeText(b.module_id?detail?.modules.find(m=>m.id===b.module_id)?.name||b.module_id:'不装备模组')}${b.module_id?` · ${b.module_level}级`:''}</div></article>`;
   }).join('');
   const before=$('opChar').value;
-  setOptions($('opChar'),state.project.squad.map(b=>({value:b.char_id,label:operatorName(b.char_id)})),before);
+  setOptions($('opChar'),operationMembers().map(b=>({value:b.char_id,label:b.token?`${operatorName(b.char_id)} · ${operatorName(b.owner)}`:operatorName(b.char_id)})),before);
   $('carriedList').innerHTML=state.project.squad.map(b=>`<button data-char="${escapeText(b.char_id)}" class="${$('opChar').value===b.char_id?'active':''}"><span>${escapeText(operatorName(b.char_id))}</span><small>E${b.elite} / ${b.level}</small></button>`).join('');
   renderOperationForm();
 }
@@ -188,7 +199,8 @@ function defaultBuild(detail) {
   const elite=detail.maxLevels.length-1,level=detail.maxLevels[elite],trust=200;
   const skill=detail.skills.find(s=>unlocked(s.unlock,elite,level));
   const ranks=skill?.ranks.filter(r=>r.conditions.every(c=>unlocked(c,elite,level)))||[];
-  const module=detail.modules.find(m=>unlocked(m.unlock,elite,level)&&m.levels.length);
+  const modules=detail.modules.filter(m=>unlocked(m.unlock,elite,level)&&m.levels.length);
+  const module=modules.find(m=>m.id===detail.defaultModuleId)??modules[0];
   return {char_id:detail.id,elite,level,trust,potential_rank:detail.maxPotential,
     skill_id:skill?.id??null,skill_level:ranks.length?Math.max(...ranks.map(r=>r.rank)):null,
     module_id:module?.id??null,module_level:module?Math.max(...module.levels):0,auto_skill:false};
@@ -252,14 +264,16 @@ async function saveMember(showNotice=true) {
   if(showNotice) notify('队伍练度已保存到当前方案');
 }
 function removeMember(id) {
-  const refs=state.project.operations.filter(o=>o.char_id===id).length;
+  const ids=new Set([id,...operationMembers().filter(b=>b.owner===id).map(b=>b.char_id)]);
+  const refs=state.project.operations.filter(o=>ids.has(o.char_id)).length;
   if(refs&&!confirm(`移除${operatorName(id)}会同时移除其 ${refs} 条操作，是否继续？`)) return;
   state.project.squad=state.project.squad.filter(b=>b.char_id!==id);
-  state.project.operations=state.project.operations.filter(o=>o.char_id!==id);
+  state.project.operations=state.project.operations.filter(o=>!ids.has(o.char_id));
   if(state.selectedBuild===id){state.selectedBuild=null;state.draftDirty=false;$('buildForm').hidden=true;$('buildName').textContent='选择一名干员';}
   cancelEdit(); markDirty(); renderSquad(); renderOperations(); renderMaps();
 }
 function switchStep(step) {
+  if(state.branch&&step==='setup'){notify('续编保留原关卡、队伍和练度；请在普通写操作模式建立新方案',true);return;}
   if(step==='operations'&&(!state.stage||!state.project.squad.length)) {notify('先选择关卡，并将干员加入队伍',true);return;}
   $('setupView').hidden=step!=='setup'; $('operationsView').hidden=step!=='operations';
   document.querySelectorAll('[data-step]').forEach(b=>b.classList.toggle('active',b.dataset.step===step));
@@ -280,6 +294,11 @@ function tileClass(tile,allowed=false) {
   return ['tile',tile.height==='HIGHLAND'?'highland':'',tile.build==='NONE'?'none':'',tile.key==='tile_start'?'start':'',tile.key==='tile_end'?'end':'',tile.key==='tile_telin'||tile.key==='tile_telout'?'portal':'',allowed?'allowed':''].join(' ');
 }
 function renderMaps() {
+  if(state.branch){
+    const position=detailFor($('opChar').value)?.position,allowed=[];
+    state.stage?.map.cells.forEach((row,r)=>row.forEach((cell,c)=>{if(cell.build===position)allowed.push([r,c]);}));
+    sendWorkspace('selection',{selection:{tile:state.tile,facing:state.facing,char:$('opChar').value,action:$('opAction').value,allowed}});return;
+  }
   const map=state.stage?.map;
   for(const [id,mini] of [['miniMap',true],['mapBoard',false]]) {
     const board=$(id); if(!map){board.innerHTML='';continue;}
@@ -320,6 +339,7 @@ function updatePreviewRange() {
 function operationDraft() {
   const action=$('opAction').value,time=Number($('opTime').value);
   if($('opTime').value===''||!Number.isFinite(time)||time<0) throw new Error('时刻须为非负数');
+  if(state.branch&&time<=state.branch.time+1e-9)throw new Error(`历史已锁定；新操作须在f${state.branch.frame+1}或之后`);
   const op={char_id:$('opChar').value,time,action,on_failure:$('failure').value};
   if(!op.char_id) throw new Error('请选择携带干员');
   if(action==='DEPLOY') {
@@ -342,6 +362,7 @@ function cancelEdit() {
   state.editIndex=null;$('operationTitle').textContent='添加操作';$('addOperationBtn').textContent='＋ 加入操作';$('cancelEditBtn').hidden=true;
 }
 function editOperation(index) {
+  if(lockedOperation(index)){notify('此操作属于切入帧及之前的历史，已锁定',true);return;}
   const op=state.project.operations[index];state.editIndex=index;state.operationDirty=false;
   $('opChar').value=op.char_id;$('opAction').value=op.action;$('failure').value=op.on_failure||'WAIT';$('opMode').value=op.mode??'';
   state.tile=op.tile?[...op.tile]:null;state.facing=op.facing??0;setTime(op.time);
@@ -352,6 +373,7 @@ function editOperation(index) {
 function moveOperation(index,direction) {
   const rows=orderedOperations(),at=rows.findIndex(x=>x.index===index),other=rows[at+direction];
   if(!other||other.op.time!==rows[at].op.time) return;
+  if(lockedOperation(index)||lockedOperation(other.index))return;
   const a=state.project.operations[index];state.project.operations[index]=other.op;state.project.operations[other.index]=a;
   if(state.editIndex===index)state.editIndex=other.index;else if(state.editIndex===other.index)state.editIndex=index;
   markDirty();renderOperations();renderMaps();
@@ -360,7 +382,8 @@ function renderOperations() {
   const rows=orderedOperations();$('operationCount').textContent=`${rows.length} 条`;updatePreviewRange();
   $('operationList').innerHTML=rows.length?rows.map(({op,index},at)=>{
     const detail=op.action==='DEPLOY'?`(${op.tile?.join(', ')}) · ${['右','下','左','上'][op.facing??0]}`:op.action==='SWITCH_MODE'?`模式 ${op.mode===undefined||op.mode===null?'切到另一状态':op.mode===0?'初始':'技能'}`:'';
-    return `<article class="operation-row ${state.editIndex===index?'selected':''}" data-index="${index}" tabindex="0" role="button" aria-label="编辑第${at+1}条操作"><div class="time">${op.time.toFixed(3)}<small>${frameText(op.time)}</small></div><div class="description">${escapeText(operatorName(op.char_id))} · ${escapeText(labels[op.action]||op.action)}<small>${escapeText(detail)} / ${{WAIT:'等待',SKIP:'跳过',STOP:'停止'}[op.on_failure||'WAIT']}</small></div><div class="row-actions"><button data-move="-1" aria-label="同刻上移" ${at===0||rows[at-1].op.time!==op.time?'disabled':''}>↑</button><button data-move="1" aria-label="同刻下移" ${at===rows.length-1||rows[at+1].op.time!==op.time?'disabled':''}>↓</button><button data-delete="1" aria-label="删除此操作">×</button></div></article>`;
+    const locked=lockedOperation(index);
+    return `<article class="operation-row ${locked?'locked':''} ${state.editIndex===index?'selected':''}" data-index="${index}" tabindex="${locked?-1:0}" role="button" aria-disabled="${!!locked}" aria-label="${locked?'已锁定':'编辑'}第${at+1}条操作"><div class="time">${op.time.toFixed(3)}<small>${frameText(op.time)}</small></div><div class="description">${escapeText(operatorName(op.char_id))} · ${escapeText(labels[op.action]||op.action)}<small>${locked?'历史已锁定 · ':''}${escapeText(detail)} / ${{WAIT:'等待',SKIP:'跳过',STOP:'停止'}[op.on_failure||'WAIT']}</small></div><div class="row-actions"><button data-move="-1" aria-label="同刻上移" ${locked||at===0||rows[at-1].op.time!==op.time?'disabled':''}>↑</button><button data-move="1" aria-label="同刻下移" ${locked||at===rows.length-1||rows[at+1].op.time!==op.time?'disabled':''}>↓</button><button data-delete="1" aria-label="删除此操作" ${locked?'disabled':''}>×</button></div></article>`;
   }).join(''):'<div class="empty-state"><h2>还没有操作</h2><p>选干员、定时刻，在地图上部署第一位。</p></div>';
 }
 function readOptions() {
@@ -384,6 +407,7 @@ async function saveProject() {
   notify(`方案已保存：${saved.projectFile}。可用“导入”继续编辑。`);
 }
 async function importFile(file) {
+  if(state.branch)throw new Error('续编不能替换原方案；请返回普通写操作模式导入');
   if((state.dirty||state.draftDirty||state.operationDirty)&&!confirm('导入将替换当前编辑内容。未保存的修改会丢失，是否继续？')) return;
   const raw=JSON.parse((await file.text()).replace(/^\uFEFF/,''));
   let compiled;
@@ -402,7 +426,7 @@ async function simulate() {
   const compiled=await validated();
   if(!compiled.plan.length)throw new Error('请先添加至少一条操作');
   const revision=state.revision;
-  const job=await api('/api/simulate',state.project);
+  const job=await api(state.branch?'/api/branch/simulate':'/api/simulate',state.branch?{branch:state.branch.id,project:compiled.project}:compiled.project);
   state.running=true;$('simulateBtn').disabled=true;$('runStatus').textContent='正在运行主战斗引擎…';$('openReplay').hidden=true;
   const poll=async()=>{
     try {
@@ -411,8 +435,10 @@ async function simulate() {
       state.running=false;$('simulateBtn').disabled=false;
       if(status.status==='failed'){$('runStatus').textContent='模拟失败，请检查运行日志';notify(status.message,true);return;}
       const r=status.result;
+      if(state.revision===revision){state.dirty=false;state.savedLabel='运行方案已保存到本地';showSaveState();scheduleDraft();}
       $('runStatus').textContent=`${r.win?'通关':'未通关'} · ${r.enemies_killed} 击杀 / ${r.enemies_leaked} 漏怪 · ${r.time.toFixed(2)} 秒${state.revision!==revision?'（编辑内容已有修改，此回放对应运行时方案）':''}`;
       $('openReplay').href=status.viewerUrl;$('openReplay').hidden=false;
+      $('openReplay').onclick=embedded?event=>{event.preventDefault();sendWorkspace('replay',{job:job.id,modified:state.revision!==revision});}:null;
       notify(`模拟完成${r.mechanic_warnings||r.behavior_warnings?'，结果中有未覆盖机制，请检查摘要':''}`);
     }catch(error){state.running=false;$('simulateBtn').disabled=false;$('runStatus').textContent='运行查询失败，请检查本地服务';notify(error.message,true);}
   };
@@ -460,6 +486,7 @@ $('operationForm').addEventListener('submit',guard(event=>{event.preventDefault(
 $('cancelEditBtn').addEventListener('click',()=>{cancelEdit();showSaveState();renderOperations();scheduleDraft();});
 $('operationList').addEventListener('click',event=>{
   const row=event.target.closest('[data-index]');if(!row)return;const index=Number(row.dataset.index);
+  if(lockedOperation(index)){notify('历史操作已锁定',true);return;}
   if(event.target.closest('[data-delete]')){state.project.operations.splice(index,1);cancelEdit();markDirty();renderOperations();renderMaps();}
   else if(event.target.closest('[data-move]'))moveOperation(index,Number(event.target.closest('[data-move]').dataset.move));
   else editOperation(index);
@@ -494,7 +521,34 @@ window.addEventListener('beforeunload',event=>{flushDraft(true);if(state.dirty||
     state.catalog=await api('/api/catalog');
     $('connection').textContent=`本地数据已连接 · ${state.catalog.stages.length} 个关卡 / ${state.catalog.operators.length} 名干员 · v${state.catalog.engineVersion}`;
     updateStageOptions();renderSquad();renderOperations();
-    await checkDraft();
+    if(!branchEmbed)await checkDraft();else $('draftState').textContent='续编方案可另存；原回放保持不变';
+    sendWorkspace('ready');
     if(!state.catalog.stages.length)notify('没有可用地图，请先向本地数据目录导入关卡文件',true);
   }catch(error){$('offline').hidden=false;$('offlineReason').textContent=error.message;$('connection').textContent='未连接本地服务';}
 })();
+
+window.editorBridge={isDirty:()=>state.dirty||state.draftDirty||state.operationDirty,isRunning:()=>state.running};
+$('returnReplay').onclick=embedded?event=>{event.preventDefault();sendWorkspace('mode',{mode:'replay'});}:null;
+window.addEventListener('message',guard(async event=>{
+  if(event.source!==window.parent||event.origin!==location.origin||!event.data?.arksimWorkspace||!state.catalog)return;
+  const message=event.data;
+  if(message.type==='branch'){
+    if(state.running)throw new Error('请等待当前续编运行完成');
+    await loadProject(message.branch.project);state.branch=message.branch;state.dirty=false;state.revision++;
+    $('openReplay').hidden=true;$('openReplay').onclick=null;
+    $('importBtn').hidden=true;$('returnReplay').hidden=true;$('backToSquadBtn').hidden=true;
+    document.querySelectorAll('[data-step]').forEach(button=>button.hidden=true);
+    $('opTime').min=(state.branch.frame+1)/30;$('opFrame').min=state.branch.frame+1;
+    setTime((state.branch.frame+1)/30);switchStep('operations');
+    $('simulateBtn').textContent='重算后续';$('runStatus').textContent='已保留历史；后续操作可增删、改时刻和同刻顺序。';
+    state.savedLabel=`续编 f${state.branch.frame} · 尚未保存`;showSaveState();
+  }
+  if(message.type==='unit'&&state.branch&&state.project.squad.some(b=>b.char_id===message.char)){
+    $('opChar').value=message.char;state.tile=null;renderSquad();renderMaps();
+  }
+  if(message.type==='tile'&&state.branch&&$('opAction').value==='DEPLOY'){
+    const [r,c]=message.tile,cell=state.stage?.map.cells[r]?.[c];
+    if(cell?.build!==detailFor($('opChar').value)?.position)return;
+    state.tile=[r,c];renderOperationForm();renderMaps();markOperationDraft();
+  }
+}));

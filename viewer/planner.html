@@ -3,12 +3,13 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>ARKSIM / 战术编排</title><link rel="stylesheet" href="planner.css">
+  <script>if(window.parent===window&&!new URLSearchParams(location.search).has('embed'))location.replace('index.html?mode=write');</script>
 </head>
 <body>
   <header class="topbar">
     <a class="brand" href="planner.html">ARKSIM<span>主战斗引擎 / 战术编排</span></a>
     <nav aria-label="编辑步骤"><button data-step="setup" class="active"><i>01</i>关卡与队伍</button><button data-step="operations"><i>02</i>操作编排</button></nav>
-    <div class="file-actions"><button id="importBtn">导入</button><button id="saveBtn">保存方案</button><button id="exportBtn">导出操作 JSON</button><a href="index.html" class="button">回放页 ↗</a></div>
+    <div class="file-actions"><button id="importBtn">导入</button><button id="saveBtn">保存方案</button><button id="exportBtn">导出操作 JSON</button><a id="returnReplay" href="index.html?mode=replay" class="button">看回放</a></div>
     <input id="importFile" type="file" accept=".json,application/json" hidden>
   </header>
   <div class="status-strip"><span id="connection">正在连接本地数据…</span><span id="saveState">未保存方案</span><span id="draftState" role="status" aria-live="polite">正在检查本地草稿…</span></div>

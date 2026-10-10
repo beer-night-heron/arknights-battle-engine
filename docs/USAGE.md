@@ -32,7 +32,7 @@ python tools/simulate.py --stage "关卡ID" --plan "local/plans/my-plan.json"
 
 直接双击 `viewer/index.html`，不需要启动服务。沿用原来的深色战术回放页面，样式和脚本都包含在这一个 HTML 文件中。JSON 文件可以单独存放。
 
-- 在“打开回放数据”中选择 `replay.json`。读取在浏览器本地完成。
+- 在工作台选择“看回放”，再在“打开回放数据”中选择 `replay.json`。读取在浏览器本地完成。
 - 点击底部的播放按钮或按空格播放/暂停；方向键与箭头按钮前进、后退一个保存的采样帧。
 - 拖动底部时间轴，或点击右侧事件跳到对应时间。
 - 点击地图上的单位或待部署卡片，左侧显示其状态。干员展示当前攻击力、防御力、法术抗性、攻击间隔、生命和阻挡上限等具体属性。
@@ -47,6 +47,8 @@ python tools/simulate.py --stage "关卡ID" --plan "local/plans/my-plan.json"
 - “退出当前文件”重新打开读取界面，随后可以读取下一份模拟。
 
 回放是已计算状态的展示，不会在页面内重新计算战斗。默认每个逻辑帧保存一次；若导出时指定较大的采样间隔，箭头只能跳到保存帧。显示位置和 HP 已做小数压缩，不能用页面坐标精度代替引擎内部精度。事件记录由相邻逻辑帧状态变化生成，不是完整的攻击起手或内部调用日志。
+
+本地服务运行时，可以在暂停帧点击“从当前帧续编”，锁定历史并修改未来操作，然后调用主战斗引擎重算。续编会暂时收起事件流与播放控件；地图维持切入帧状态。具体流程与输入要求见 [图形化操作编辑](EDITOR.md)。新回放记录本地运行数据与默认假设的签名，数据改变时须先重新运行原方案。
 
 ## 导出参数
 
@@ -92,6 +94,24 @@ python -m arksim.cli --stage "关卡ID" --plan "local/plans/my-plan.json" --runs
 摘要输出包含 `results`、`summary`、`execution`。批量种子从 `--seed` 开始依次递增；没有进行随机抽取的确定性运行会复用首个结果，实际执行次数会明确记录。随机运行分别计算；`--confidence` 控制 Wilson 胜率区间，默认 0.95。确定性场景重复运行不构成独立随机试验。
 
 `--json-out` 直接向终端输出摘要 JSON；`--output` 以 UTF-8 写文件，避免依赖终端重定向编码。这两种摘要均不能导入回放页面。
+
+## 可选随机判定记录
+
+回放生成命令可额外保存随机判定，记录本次实际经过的判定入口及其原始抽样值。记录模式保持原战斗结果；记录文件必须使用 `local/` 内的新路径，已有文件不会覆盖。回放方案中也保留 `randomDecisions`。
+
+```powershell
+python tools/simulate.py --stage "关卡ID" --plan "local/plans/my-plan.json" --random-trace "local/analysis/run-a/decisions.json"
+```
+
+如需隔离某个随机分支，另存记录并仅修改有关项的 `result`，再通过 `--random-tape` 运行。必须选择 `local/` 下的独立输出子目录，避免把分析运行写入正式最新模拟。
+
+```powershell
+python tools/simulate.py --stage "关卡ID" --plan "local/plans/my-plan.json" --random-tape "local/analysis/run-a/selected-decisions.json" --output-dir "local/analysis/run-b"
+```
+
+复演严格核对每次判定的机制、实体、帧、参数、同语义次数和目标顺序；数量或内容不同会停止，不会自动跳过不同项。指定结果也必须符合类型和范围，不能把概率为零的判定改成成功。日志保留自然抽样结果与指定结果，随机数仍按原流程消耗。
+
+指定结果的回放可查看，但暂不支持编辑器方案和回放续编；它不能用于估计自然触发率或通关概率。角色的概率规律与具体效果仍需独立验证，记录能力不表示所有角色已经实现。
 
 ## 常见问题
 
