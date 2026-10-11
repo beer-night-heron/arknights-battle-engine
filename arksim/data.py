@@ -71,6 +71,35 @@ def load_behavior_templates() -> dict[str, Any]:
         return {}
 
 
+def load_behavior_components() -> dict[str, Any]:
+    """Optional local directory compiled from serialized ability components."""
+    from .behavior_components import ComponentCatalog, FORMAT
+    assert DATA_DIR is not None, "call set_data_dir() first"
+    result = {}
+    operator_file = "operator_behavior_components_v2.json" if (DATA_DIR / "operator_behavior_components_v2.json").exists() else "operator_behavior_components.json"
+    for name in ("behavior_components.json", "skill_behavior_components.json", operator_file):
+        try:
+            directory = _load(name)
+        except FileNotFoundError:
+            continue
+        catalog = ComponentCatalog(directory)
+        if not catalog.enabled:
+            continue
+        result.setdefault("format", FORMAT)
+        result.setdefault("version", 1)
+        result["resource_kinds"] = sorted(set(result.get("resource_kinds", [])) | catalog.resource_kinds)
+        resources = result.setdefault("resources", {})
+        duplicates = resources.keys() & catalog.resources.keys()
+        if duplicates:
+            raise ValueError(f"duplicate behavior component resources: {sorted(duplicates)}")
+        resources.update(catalog.resources)
+        actors = result.setdefault("actors", {})
+        if actors.keys() & catalog.actors.keys():
+            raise ValueError("duplicate behavior component actor graphs")
+        actors.update(catalog.actors)
+    return result
+
+
 def load_enemy_graphics() -> dict[str, Any]:
     """Load optional, preconverted map-space enemy attachment profiles."""
     try:

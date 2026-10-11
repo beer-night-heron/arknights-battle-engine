@@ -420,6 +420,7 @@ def run_case(
         random_trace=shared.get("random_trace", False),
         random_tape=shared.get("random_tape"),
         module_context=shared.get("module_context"),
+        behavior_components=shared.get("behavior_components"),
     )
     frames: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []

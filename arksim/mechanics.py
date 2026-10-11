@@ -93,6 +93,7 @@ class DamagePacket:
     modifier_key: str = ""
     ability_owner: Any = None
     damage_resistance: float = 0.0
+    notify_calculate: bool = True
 
     def normalized_damage_type(self) -> DamageType:
         value = str(getattr(self.damage_type, "value", self.damage_type)).upper()
@@ -572,7 +573,7 @@ def apply_damage(
                 damage_type = DamageType.PHYSICAL if physical > arts else DamageType.ARTS
         resolved_packet = replace(resolved_packet, damage_type=damage_type)
         packet = replace(packet, damage_type=damage_type)
-    if on_calculate is not None and damage_type is not DamageType.LIFE_LOSS:
+    if on_calculate is not None and packet.notify_calculate and damage_type is not DamageType.LIFE_LOSS:
         on_calculate(packet, target)
     basic = calculate_basic_damage(
         resolved_packet,

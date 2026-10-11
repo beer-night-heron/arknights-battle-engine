@@ -11,6 +11,7 @@ executed by the existing behaviour interpreter supplied by Battle.
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
@@ -47,6 +48,9 @@ class BuffDefinition:
     modifiers: tuple[BuffModifier, ...] = ()
     events: tuple[tuple[str, tuple[dict[str, Any], ...]], ...] = ()
     unique_by_key: bool = True
+    status_flags: tuple[str, ...] = ()
+    template_key: str = ""
+    registered_behavior: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "key", str(self.key))
@@ -136,6 +140,9 @@ class BuffDefinition:
                     payload.get("uniqueByKey", True),
                 )
             ),
+            status_flags=tuple(str(flag).upper() for flag in payload.get("status_flags", ())),
+            template_key=str(payload.get("templateKey") or ""),
+            registered_behavior=bool(payload.get("registered_behavior", False)),
         )
 
     @classmethod
@@ -177,6 +184,15 @@ class BuffDefinition:
                         break
             modifiers.append(item)
         normalized["modifiers"] = modifiers
+        if normalized.get("registered_behavior"):
+            normalized["status_flags"] = attributes.get("abnormalFlags") or []
+            if normalized.get("durationKey"):
+                normalized["lifeTime"] = board.get(normalized["durationKey"], normalized.get("lifeTime", 0))
+            if any(not math.isfinite(float(item.get("value", 0))) for item in modifiers):
+                raise ValueError("non-finite Buff modifier")
+            lifetime = float(normalized.get("lifeTime", 0))
+            if not math.isfinite(lifetime) or lifetime < 0:
+                raise ValueError("invalid Buff lifetime")
         normalized.pop("attributes", None)
         return cls.from_dict(normalized)
 
@@ -189,6 +205,7 @@ class BuffInstance:
     owner: Any
     source: Any = None
     parent: "BuffInstance | None" = None
+    finish_with_parent: bool = False
     blackboard: dict[str, Any] = field(default_factory=dict)
     attached_step: int | None = None
     remaining_lifetime: float | None = field(init=False)
@@ -252,6 +269,8 @@ class BuffContainer:
         self,
         definition: BuffDefinition,
         source: Any,
+        parent: BuffInstance | None = None,
+        finish_with_parent: bool = False,
     ) -> BuffInstance | None:
         for instance in (*self.active, *self.pending_add):
             if instance.finished or not instance.enabled:
@@ -259,6 +278,10 @@ class BuffContainer:
             if self._is_pending_finish(instance):
                 continue
             if instance.definition.key != definition.key:
+                continue
+            if instance.finish_with_parent != finish_with_parent:
+                continue
+            if finish_with_parent and instance.parent is not parent:
                 continue
             if definition.unique_by_key or self._source_equal(instance.source, source):
                 return instance
@@ -272,9 +295,14 @@ class BuffContainer:
         parent: BuffInstance | None = None,
         blackboard: dict[str, Any] | None = None,
         attached_step: int | None = None,
+        finish_with_parent: bool = False,
     ) -> BuffInstance:
         """Queue a Buff for the next commit, preserving stable creation order."""
-        existing = self._find_existing(definition, source)
+        if finish_with_parent and (parent is None or parent.finished or not parent.enabled
+                or self._is_pending_finish(parent)
+                or not any(item is parent for item in (*self.active, *self.pending_add))):
+            raise ValueError("derived Buff requires a live parent in the same container")
+        existing = self._find_existing(definition, source, parent, finish_with_parent)
         if existing is not None:
             return existing
         self.created_counter += 1
@@ -283,6 +311,7 @@ class BuffContainer:
             owner=self.owner,
             source=source,
             parent=parent,
+            finish_with_parent=finish_with_parent,
             blackboard=dict(blackboard or {}),
             attached_step=(
                 self.current_step if attached_step is None else attached_step
@@ -321,7 +350,17 @@ class BuffContainer:
             return False
         if not self._find_identity(self.pending_finish, instance):
             self.pending_finish.append(instance)
+            # Only explicitly bound same-container children follow this parent.
+            for child in (*self.active, *self.pending_add):
+                if child.finish_with_parent and child.parent is instance:
+                    self.finish(child)
         return True
+
+    def contains_derived(self, parent: BuffInstance, key: str | None = None) -> bool:
+        return any(item.parent is parent and item.finish_with_parent
+            and item.enabled and not item.finished and not self._is_pending_finish(item)
+            and (key is None or item.definition.key == key)
+            for item in (*self.active, *self.pending_add))
 
     def finish_by_key(self, key: str, *, source: Any = None) -> int:
         wanted = str(key)
@@ -388,7 +427,14 @@ class BuffContainer:
         for instance in batch:
             if instance.finished or not instance.enabled:
                 continue
-            existing = self._find_existing(instance.definition, instance.source)
+            if instance.finish_with_parent and (instance.parent is None
+                    or instance.parent.finished or not instance.parent.enabled
+                    or self._is_pending_finish(instance.parent)):
+                instance.finished = True
+                instance.enabled = False
+                continue
+            existing = self._find_existing(instance.definition, instance.source,
+                instance.parent, instance.finish_with_parent)
             if existing is not None:
                 instance.finished = True
                 instance.enabled = False
@@ -448,7 +494,7 @@ class BuffContainer:
             ):
                 self.finish(instance)
 
-    def modifiers(self, attribute: str) -> tuple[BuffModifier, ...]:
+    def modifiers(self, attribute: str, *, registered_only: bool = False) -> tuple[BuffModifier, ...]:
         wanted = str(attribute).upper()
         return tuple(
             modifier
@@ -456,6 +502,7 @@ class BuffContainer:
             if instance.enabled
             and not instance.finished
             and not self._is_pending_finish(instance)
+            and (not registered_only or instance.definition.registered_behavior)
             for modifier in instance.definition.modifiers
             if modifier.attribute == wanted
         )

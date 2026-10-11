@@ -9,6 +9,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
+from .affiliations import AFFILIATION_FIELDS, has_affiliation
 from .loadout import module_phase, resolve_plan, select_abilities
 
 BUILD_FIELDS = frozenset(("char_id", "elite", "level", "trust", "potential_rank",
@@ -121,6 +122,8 @@ class SquadEffects:
         self.sp_amount = shu.get("sp", 0.0) if self.sui_active else 0.0
 
     def count(self, key: str, value: str) -> int:
+        if key in AFFILIATION_FIELDS:
+            return sum(has_affiliation(self.characters[cid], value, key) for cid in self.builds)
         return sum(self.characters[cid].get(key) == value for cid in self.builds)
 
     def upgraded(self, cid: str, mid: str) -> bool:
@@ -143,16 +146,16 @@ class SquadEffects:
 
     def cost_modifier(self, cid: str) -> float:
         data = self.boards.get("char_249_mlyss", {})
-        if self.characters[cid].get("groupId") != "rhine":
+        if not has_affiliation(self.characters[cid], "rhine", "groupId"):
             return 0.0
         return data.get("cost", 0.0) + (0.0 if self.first_rhine_used else data.get("runtime_cost", 0.0))
 
     def deployed(self, cid: str) -> None:
-        if "char_249_mlyss" in self.boards and self.characters[cid].get("groupId") == "rhine":
+        if "char_249_mlyss" in self.boards and has_affiliation(self.characters[cid], "rhine", "groupId"):
             self.first_rhine_used = True
 
     def initial_sp_bonus(self, cid: str) -> float:
-        if self.characters[cid].get("nationId") == "siracusa":
+        if has_affiliation(self.characters[cid], "siracusa", "nationId"):
             return self.boards.get("char_1038_whitw2", {}).get("sp", 0)
         return 0.0
 
@@ -180,12 +183,12 @@ class SquadEffects:
                     source in field_ids and professions["SNIPER"] >= 2)
                 if enabled:
                     atk += data.get("atk", 0.0)
-            elif source == "char_4228_closur" and char.get("nationId") == "rhodes":
+            elif source == "char_4228_closur" and has_affiliation(char, "rhodes", "nationId"):
                 atk += data.get("atk", 0.0)
-            elif source == "char_197_poca" and char.get("teamId") == "student":
+            elif source == "char_197_poca" and has_affiliation(char, "student", "teamId"):
                 atk += data.get("atk", 0.0)
                 extra = self.extra[source]
-                active = sum(skill_in_effect(op) and self.characters[op.char_id].get("teamId") == "student"
+                active = sum(skill_in_effect(op) and has_affiliation(self.characters[op.char_id], "student", "teamId")
                              for op in field)
                 atk += min(extra.get("max_atk", 0.0), extra.get("init_atk", 0.0) * active)
             elif source == "char_1051_headb2":
@@ -195,7 +198,7 @@ class SquadEffects:
                 self_in_cast = cid == source and owner is not None and owner.skill_prefab_id == "skchr_headb2_2"
                 if (owner is not None and skill_in_effect(owner) and not self_in_cast
                         and receiver is not None and receiver.statuses.targetable):
-                    scale = data.get("scale_bonus", 1.0) if char.get("teamId") == "student" else 1.0
+                    scale = data.get("scale_bonus", 1.0) if has_affiliation(char, "student", "teamId") else 1.0
                     atk += data.get("atk", 0.0) * scale
                     defense += data.get("def", 0.0) * scale
             elif source == "char_2014_nian":
@@ -218,17 +221,17 @@ class SquadEffects:
                 if sum((diverse, same, self.sui_active)) >= 2:
                     atk += self.extra[source].get("atk", 0.0)
             elif source in ("char_263_skadi", "char_1023_ghost2", "char_218_cuttle"):
-                if char.get("groupId") == "abyssal":
+                if has_affiliation(char, "abyssal", "groupId"):
                     atk += data.get("atk", 0.0)
                     hp += data.get("max_hp", 0.0)
                     speed += data.get("attack_speed", 0.0)
                     recovery = max(recovery, data.get("sp_recovery_per_sec", 0.0))
             elif source == "char_298_susuro" and initial_cost <= data.get("cost", -1.0):
                 heal += data.get("heal_scale", 1.0) - 1.0
-            elif source == "char_4141_marcil" and char.get("teamId") == "laios":
+            elif source == "char_4141_marcil" and has_affiliation(char, "laios", "teamId"):
                 if self.count("teamId", "laios") >= 4:
                     defense += data.get("def", 0.0)
                     speed += data.get("attack_speed", 0.0)
-            elif source == "char_1038_whitw2" and char.get("nationId") == "siracusa" and cid in self.skill_started:
+            elif source == "char_1038_whitw2" and has_affiliation(char, "siracusa", "nationId") and cid in self.skill_started:
                 speed += data.get("attack_speed", 0.0)
         return SquadBonus(atk, defense, hp, speed, heal, recovery)

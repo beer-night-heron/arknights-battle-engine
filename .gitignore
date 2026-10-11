@@ -13,6 +13,7 @@
 !/tools/list_data.py
 !/tools/simulate.py
 !/tools/editor.py
+!/tools/behavior_components.py
 # local/ includes data, plans, generated output and all historical material.
 /local/
 # Block accidental reintroduction of the discontinued engine.

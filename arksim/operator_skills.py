@@ -10,6 +10,8 @@ from dataclasses import dataclass, field, replace
 from functools import cmp_to_key
 from typing import Any
 
+from .affiliations import has_affiliation
+from .behavior import BehaviorContext, node_name
 from .mechanics import (ApplyWay, AttackType, DamagePacket, DamageRule,
                         DamageRuleKind, DamageType, ElementType, Status,
                         compare_operator_target_keys, operator_target_key)
@@ -110,6 +112,9 @@ class OperatorSkillRuntime:
             if pre_reborn.get("module_id") == owner.module_id else 0.0)
         self.next_pre_reborn_check = battle.time + float(pre_reborn.get("first_interval", 0))
         self.pre_reborn_bonus = False
+        self.pre_reborn_buff = None
+        self.pre_reborn_template_active = False
+        self.horn_reborn_marker_board = None
         high_hp_check = battle.attack_timing.get(owner.char_id, {}).get("module_high_hp", {})
         self.high_hp_interval = (float(high_hp_check.get("interval", 0))
             if high_hp_check.get("module_id") == owner.module_id else 0.0)
@@ -153,6 +158,8 @@ class OperatorSkillRuntime:
         self.remnants = {}
         self.ward_spawn_at = None
         self.ward_camouflage_sources = {}
+        self.ward_camouflage_buffs = {}
+        self.ward_range_buffs = {}
         self.entered = {}
         self.medical_regen = {}
         self.medical_shields = []
@@ -327,21 +334,37 @@ class OperatorSkillRuntime:
 
     def calculate_damage_modifier(self, packet, target):
         if (self.op.char_id == "char_4133_logos" and packet.source is self.op and not self.op.dead
-                and target in self.b.enemies and target.level_type in {"ELITE", "BOSS"}
+                and not self.b.behavior_component_claimed(self.op, "v035_common_addsp")
+                and target in self.b.enemies
                 and packet.normalized_damage_type() not in {DamageType.HEAL, DamageType.LIFE_LOSS}):
-            amount = float(self.op.trait_blackboard.get("sp", 0))
-            if amount:
-                self.b._gain_sp(self.op, amount)
+            board = self.op.trait_blackboard
+            if "sp" in board:
+                key = "v035_common_addsp"
+                if key in self.b.behavior.templates:
+                    self.b.execute_behavior_event(key, "ON_CALCULATE_DAMAGE", source=self.op,
+                        target=target, buff_owner=self.op, blackboard=board, modifier=packet)
+                else:
+                    self.b.behavior.validate_event(key, "ON_CALCULATE_DAMAGE")
+                    if target.level_type in {"ELITE", "BOSS"}:
+                        self.b._gain_sp(self.op, float(board["sp"]))
                 self.b.mechanic_diagnostics["LOGOS_MODULE_CALCULATE_SP_PHASE_CANDIDATE"] = 1
 
     def output_modifier(self, packet, target):
         op, b = self.op, self.b
         if packet.normalized_damage_type() is DamageType.HEAL:
             if (op.char_id == "char_202_demkni" and not op.dead and packet.source is op
+                    and not b.behavior_component_claimed(op, "demkni_t_2")
                     and target in b.operators and not target.dead and self.talent(2)):
                 t = self.talent(2)
                 key = "demkni_e_sp[rhine].sp" if self.has_group_tag(target, "rhine") else "demkni_e_sp.sp"
-                b._gain_sp(target, float(t.get(key, t.get("sp", 0))))
+                amount = float(t.get(key, t.get("sp", 0)))
+                if "demkni_t_2" in b.behavior.templates:
+                    b.execute_behavior_event("demkni_t_2", "ON_OUTPUT_MODIFIER",
+                        source=op, target=target, buff_owner=op,
+                        blackboard={**t, "sp": amount}, modifier=packet)
+                else:
+                    b.behavior.validate_event("demkni_t_2", "ON_OUTPUT_MODIFIER")
+                    b._gain_sp(target, amount)
                 b.mechanic_diagnostics["DEMKNI_HEAL_OUTPUT_PHASE_CANDIDATE"] = 1
             return
         self.output_damage(packet, target)
@@ -418,7 +441,7 @@ class OperatorSkillRuntime:
         return scale
 
     def ally_damage_resistance(self, target, source=None):
-        if self.op.char_id == "char_474_glady" and self.b.characters.get(target.char_id, {}).get("groupId") == "abyssal":
+        if self.op.char_id == "char_474_glady" and self.has_group_tag(target, "abyssal"):
             upgraded = self.op.module_id == "uniequip_002_glady" and self.op.module_level >= 2
             if source in self.b.enemies and (upgraded or "seamonster" in source.enemy_tags):
                 return float(self.talent(1).get("damage_resistance", 0))
@@ -459,7 +482,7 @@ class OperatorSkillRuntime:
 
     def has_group_tag(self, unit, tag):
         char = self.b.characters.get(getattr(unit, "char_id", ""), {})
-        return any(char.get(key) == tag for key in ("nationId", "groupId", "teamId"))
+        return has_affiliation(char, tag)
 
     def wanted_damage_scale(self, source, enemy):
         if not self.is_wanted(enemy):
@@ -1120,11 +1143,12 @@ class OperatorSkillRuntime:
         self.wisdel_stop_packet((projectile.position_row, projectile.position_col),
             projectile.operator_attack.profile.payload["wisdel_component"])
 
-    def wisdel_targets(self, position, radius, *, ground=True):
+    def wisdel_targets(self, position, radius, *, ground=True, midpoint=False):
         return [enemy for enemy in self.b.enemies if self.b._enemy_is_attackable(enemy)
                 and self.b._enemy_targetable(enemy)
                 and (not ground or not self.b._is_airborne(enemy))
-                and self.b._enemy_intersects_circle(enemy, position, radius)]
+                and (self.b._enemy_within_radius(enemy, position, radius) if midpoint
+                     else self.b._enemy_intersects_circle(enemy, position, radius))]
 
     def clear_invalid_remnants(self, *, force=False):
         for key, enemy in list(self.remnants.items()):
@@ -1143,6 +1167,24 @@ class OperatorSkillRuntime:
         self.remnants[enemy.enemy_index] = enemy
 
     def trigger_wisdel_remnant(self, enemy):
+        key, event = "wisdel_t_1[projectile_shock]", "ON_BUFF_START"
+        node = context = None
+        if key in self.b.behavior.templates:
+            # Only the reviewed damage component is migrated. Dice, marker
+            # ownership/consumption and presentation remain explicit adapters.
+            node = self.b.behavior.event_action(key, event, "AOEDamage")
+            if node is None:
+                return
+            board = {name.split("attack@", 1)[1]: value for name, value in self.talent(1).items()
+                     if name.startswith("attack@")}
+            context = BehaviorContext(source=self.op, buff_source=self.op, buff_owner=enemy,
+                target=enemy, blackboard=board, battle=self.b, template_key=key, event=event,
+                diagnostics=self.b.behavior_diagnostics)
+            if not self.b._validate_aoe_binding(context, node):
+                return
+            self.b.mechanic_diagnostics["WISDEL_REMNANT_PARTIAL_TEMPLATE_ADAPTER"] = 1
+        else:
+            self.b.behavior.validate_event(key, event)
         # The saved template rolls first, then checks the bomb buff. The
         # only-once flag gates regular buffs, not the stop-hit extra template.
         success = self.b._roll_probability(float(self.talent(1).get("attack@prob", 0)),
@@ -1150,13 +1192,16 @@ class OperatorSkillRuntime:
         owner = enemy.wisdel_remnant_source
         if not success or owner is None or owner.dead:
             return
-        position = enemy.position()
-        radius = float(self.talent(1).get("attack@range_radius",
-            self.b.attack_timing.get(self.op.char_id, {}).get("wisdel_remnant_radius", 1.1)))
-        amount = self.b.operator_attack_power(self.op) * float(self.talent(1).get("attack@bomb_atk_scale", 0))
-        for target in self.wisdel_targets(position, radius, ground=False):
-            self.damage(target, amount, "PHYSICAL", attack_type=AttackType.NORMAL)
-            target.statuses.apply(Status.STUNNED, float(self.talent(1).get("attack@stun", 0)))
+        if node is not None:
+            self.b.behavior.execute_node(node, context)
+        else:
+            position = enemy.position()
+            radius = float(self.talent(1).get("attack@range_radius",
+                self.b.attack_timing.get(self.op.char_id, {}).get("wisdel_remnant_radius", 1.1)))
+            amount = self.b.operator_attack_power(self.op) * float(self.talent(1).get("attack@bomb_atk_scale", 0))
+            for target in self.wisdel_targets(position, radius, ground=False, midpoint=True):
+                self.damage(target, amount, "PHYSICAL", attack_type=AttackType.NORMAL)
+                target.statuses.apply(Status.STUNNED, float(self.talent(1).get("attack@stun", 0)))
         if owner.skill_runtime is not None:
             owner.skill_runtime.remnants.pop(enemy.enemy_index, None)
         enemy.wisdel_remnant_source = None
@@ -1266,7 +1311,7 @@ class OperatorSkillRuntime:
                         elite_scale = float(self.talent(10).get("atk_scale", 1)) if enemy.level_type in {"ELITE", "BOSS"} else 1.0
                         extra_scale = self.value("atk_scale", default=1) if p.skill else 1.0
                         self.damage(enemy, b.operator_attack_power(op) * extra_scale * elite_scale * float(op.trait_blackboard["atk_scale_m"]),
-                                    "ARTS", attack_type=AttackType.ADDITION, modifier_key="svrash_e_002_tr")
+                                    "ARTS", attack_type=AttackType.ADDITION, modifier_key="svrash_e_002_tr", notify_calculate=False)
                         b.mechanic_diagnostics["SVRASH_MODULE_CALCULATE_ORDER_CANDIDATE"] = 1
                         if enemy.dead:
                             continue
@@ -1288,10 +1333,10 @@ class OperatorSkillRuntime:
             self.regen(op, float(op.trait_blackboard.get("value", 50)) * count)
 
     def damage(self, target, amount, kind="ARTS", *, attack_type=AttackType.BUFF, apply_way=ApplyWay.NONE,
-               modifier_key="", ability_owner=...):
+               modifier_key="", ability_owner=..., notify_calculate=True):
         return self.b._apply_operator_damage(self.op, target, amount,
             attack_type=attack_type, apply_way=apply_way, damage_type=kind,
-            modifier_key=modifier_key, ability_owner=ability_owner)
+            modifier_key=modifier_key, ability_owner=ability_owner, notify_calculate=notify_calculate)
 
     def near(self, pos, radius):
         return [e for e in self.b.enemies if self.b._enemy_is_attackable(e)
@@ -1354,10 +1399,27 @@ class OperatorSkillRuntime:
                 continue
             self.try_logos_talent(primary)
 
-    def try_logos_talent(self, primary):
+    def try_logos_talent(self, primary, *, triggered=False):
         from .battle import _PendingOperatorAttack
         b, op, talent = self.b, self.op, self.talent(1)
-        if not talent or not b._roll_probability(float(talent.get("prob", 0)),
+        if not talent:
+            return
+        key = ("logos_e_002_t_1" if op.module_id == "uniequip_002_logos" and op.module_level >= 2
+               else "logos_t_1")
+        event = "ON_BUFF_TRIGGER" if triggered else "ON_ABILITY_CAST_ON_TARGET"
+        if key in b.behavior.templates:
+            before = len(b.projectiles)
+            b.execute_behavior_event(key, event, source=op, target=primary, buff_owner=op,
+                blackboard=talent, random_mechanism="logos_extra_hit", ability_family="ATTACK",
+                projectile_key="projectile_chr_logos_t",
+                projectile_selector=lambda: b.choose_random_target(self.candidates(), source=op,
+                    mechanism="logos_extra_target"))
+            if len(b.projectiles) > before:
+                b.mechanic_diagnostics["LOGOS_TALENT_EMISSION_PHASE_CANDIDATE"] = 1
+                b.mechanic_diagnostics["LOGOS_TALENT_ARC_AND_BORN_DELAY_CANDIDATE"] = 1
+            return
+        b.behavior.validate_event(key, event)
+        if not b._roll_probability(float(talent.get("prob", 0)),
                 mechanism="logos_extra_hit", source=op, target=primary):
             return
         base_atk = b.operator_attack_power(op)
@@ -1378,6 +1440,9 @@ class OperatorSkillRuntime:
         b.mechanic_diagnostics["LOGOS_TALENT_ARC_AND_BORN_DELAY_CANDIDATE"] = 1
 
     def land_talent_projectile(self, projectile):
+        if projectile.behavior_payload is not None:
+            self.b.land_behavior_projectile(projectile)
+            return
         op, target = self.op, projectile.target
         amount = projectile.cached_atk
         if amount is None or not self.b._enemy_is_attackable(target):
@@ -1445,10 +1510,17 @@ class OperatorSkillRuntime:
                 target.statuses.apply(Status.STUNNED, self.value("stun_duration"))
 
     def attack_complete(self):
-        if self.sid == "skchr_oblvns_1" and self.free_cast():
+        if (self.sid == "skchr_oblvns_1" and self.free_cast()
+                and not self.b.behavior_component_claimed(self.op, "oblvns_s_1[fever]")):
             # The Fever buff restores max SP at ON_AFTER_ATTACK with forceFlag,
             # independently of the still-running post-delay/SP block.
-            self.b._store_sp_gain(self.op, self.op.sp_max)
+            key = "oblvns_s_1[fever]"
+            if key in self.b.behavior.templates:
+                self.b.execute_behavior_event(key, "ON_AFTER_ATTACK", source=self.op,
+                    target=self.op, buff_owner=self.op, blackboard=self.bb)
+            else:
+                self.b.behavior.validate_event(key, "ON_AFTER_ATTACK")
+                self.b._store_sp_gain(self.op, self.op.sp_max)
             self.b.mechanic_diagnostics["SAKIKO_FEVER_AFTER_ATTACK_SP_PHASE_CANDIDATE"] = 1
         if self.armed and self.sid in POST_DELAY_ATTACKS:
             self.armed = False
@@ -1718,6 +1790,28 @@ class OperatorSkillRuntime:
             return
         if self.b.time + 1e-9 < self.next_pre_reborn_check:
             return
+        key = "horn_e_003_t[check]"
+        if key in self.b.behavior.templates or self.pre_reborn_buff is not None:
+            self.pre_reborn_template_active = True
+            if self.pre_reborn_buff is None:
+                # The existing actor clock supplies ON_BUFF_TRIGGER. Do not
+                # also enable a container timer and dispatch the event twice.
+                self.pre_reborn_buff = self.b.register_behavior_buff(
+                    {"buffKey": key, "templateKey": key, "lifeTimeType": "INFINITY"},
+                    owner=self.op, source=self.op, blackboard=self.talent(11))
+            parent = self.pre_reborn_buff
+            if parent is not None and not parent.finished:
+                self.b._dispatch_buff_event(parent, "ON_BUFF_TRIGGER")
+                self.op.buffs.commit()
+            self.pre_reborn_bonus = parent is not None and self.op.buffs.contains_derived(parent)
+            if parent is not None and parent.finished:
+                self.next_pre_reborn_check = math.inf
+            else:
+                while self.b.time + 1e-9 >= self.next_pre_reborn_check:
+                    self.next_pre_reborn_check += max(self.b.dt, self.pre_reborn_interval)
+            self.b.mechanic_diagnostics["HORN_PRE_REBORN_CHECK_PHASE_CANDIDATE"] = 1
+            return
+        self.b.behavior.validate_event(key, "ON_BUFF_TRIGGER")
         if self.revive_count:
             # Finishing the checker also finishes its derived attribute buff.
             self.pre_reborn_bonus = False
@@ -1729,7 +1823,7 @@ class OperatorSkillRuntime:
         self.b.mechanic_diagnostics["HORN_PRE_REBORN_CHECK_PHASE_CANDIDATE"] = 1
 
     def has_pre_reborn_bonus(self):
-        if self.op.dead:
+        if self.op.dead or self.pre_reborn_template_active:
             return False
         if self.pre_reborn_interval > 0:
             return self.pre_reborn_bonus
@@ -1779,7 +1873,7 @@ class OperatorSkillRuntime:
                 attack_type=AttackType.NORMAL, ignore_evasion=True), enemy)
             if not result.killed:
                 continue
-            self.try_logos_talent(enemy)  # ForceTrigger still executes the talent's Dice node.
+            self.try_logos_talent(enemy, triggered=True)  # ForceTrigger still executes the talent's Dice node.
             options = [e for e in b.enemies if e is not enemy and b._enemy_is_attackable(e)
                        and b._enemy_targetable(e) and not e.statuses.has(Status.CAMOUFLAGE)]
             target = b.choose_random_target(options, source=op, mechanism="logos_execute_transfer")
@@ -2125,6 +2219,10 @@ class OperatorSkillRuntime:
             if not t:
                 return False
             self.revive_count = 1
+            # Bridge the existing revival into the checker's presence test;
+            # do not run reborn_effect again and duplicate its heal/visuals.
+            self.horn_reborn_marker_board = dict(t)
+            op.buff_blackboards["horn_t_1[reborn_effect]"] = self.horn_reborn_marker_board
             # FINAL_SCALER applies after additive/multiplier HP attributes,
             # including attributes added after this one-shot revival.
             op.max_hp_final_scale *= float(t.get("max_hp", 1))
@@ -2261,6 +2359,12 @@ class OperatorSkillRuntime:
         self.enemy_count_bonus = False
         self.low_hp_bonus = False
         self.pre_reborn_bonus = False
+        if self.pre_reborn_buff is not None:
+            self.op.buffs.finish(self.pre_reborn_buff)
+            self.op.buffs.commit()
+        if (self.horn_reborn_marker_board is not None
+                and self.op.buff_blackboards.get("horn_t_1[reborn_effect]") is self.horn_reborn_marker_board):
+            self.op.buff_blackboards.pop("horn_t_1[reborn_effect]", None)
         self.high_hp_bonus = False
         self.ep_aura_members.clear()
         self.weakness_members.clear()
@@ -2522,6 +2626,19 @@ class OperatorSkillRuntime:
             value *= 1 + self.value("attack@move_speed")
         return value
 
+    def template_damage_multiplier(self, packet, target, key, blackboard):
+        """Adapt a reviewed calculate event without repeating the old multiplier."""
+        if key not in self.b.behavior.templates:
+            self.b.behavior.validate_event(key, "ON_CALCULATE_DAMAGE")
+            return None
+        context = self.b.execute_behavior_event(key, "ON_CALCULATE_DAMAGE",
+            source=self.op, target=target, buff_owner=self.op,
+            modifier=packet, blackboard=blackboard)
+        if context is None:
+            return packet
+        return replace(packet, amount=packet.amount * context.attack_scale,
+                       output_scale=packet.output_scale * context.damage_scale)
+
     def modify_packet(self, packet, target):
         if packet.normalized_damage_type() in {DamageType.HEAL, DamageType.LIFE_LOSS}:
             return packet
@@ -2554,16 +2671,28 @@ class OperatorSkillRuntime:
             packet = replace(packet, physical_penetration=packet.physical_penetration +
                              self.penetration_stacks * float(self.talent(1).get("def_penetrate_fixed", 0)))
         if (self.op.char_id == "char_172_svrash" and target in self.b.enemies and not target.dead
-                and target.level_type in {"ELITE", "BOSS"}
+                and packet.notify_calculate
+                and not self.b.behavior_component_claimed(self.op, "svrash_e_002_t[atk]")
                 and packet.normalized_damage_type() is not DamageType.LIFE_LOSS
-                and packet.modifier_key != "svrash_e_002_tr"):
+                and packet.modifier_key != "svrash_e_002_tr" and self.talent(10)):
             # The trait's direct NoOnCalDmg packet already includes this scale.
-            packet = replace(packet, amount=packet.amount * float(self.talent(10).get("atk_scale", 1)))
+            migrated = self.template_damage_multiplier(packet, target, "svrash_e_002_t[atk]", self.talent(10))
+            if migrated is not None:
+                packet = migrated
+            elif target.level_type in {"ELITE", "BOSS"}:
+                packet = replace(packet, amount=packet.amount * float(self.talent(10).get("atk_scale", 1)))
             if self.talent(10).get("atk_scale"):
                 self.b.mechanic_diagnostics["SVRASH_ELITE_CALCULATE_FILTER_PHASE_CANDIDATE"] = 1
-        if (self.op.char_id == "char_4039_horn" and target in self.b.enemies and target.blocked_by is not None
-                and packet.normalized_damage_type() is not DamageType.LIFE_LOSS):
-            packet = replace(packet, amount=packet.amount * float(self.op.trait_blackboard.get("atk_scale", 1)))
+        if (self.op.char_id == "char_4039_horn" and target in self.b.enemies
+                and packet.notify_calculate
+                and not self.b.behavior_component_claimed(self.op, "horn_e_002[passive]")
+                and packet.normalized_damage_type() is not DamageType.LIFE_LOSS
+                and self.op.trait_blackboard.get("atk_scale")):
+            migrated = self.template_damage_multiplier(packet, target, "horn_e_002[passive]", self.op.trait_blackboard)
+            if migrated is not None:
+                packet = migrated
+            elif target.blocked_by is not None:
+                packet = replace(packet, amount=packet.amount * float(self.op.trait_blackboard.get("atk_scale", 1)))
             if self.op.trait_blackboard.get("atk_scale"):
                 self.b.mechanic_diagnostics["HORN_BLOCKED_CALCULATE_FILTER_PHASE_CANDIDATE"] = 1
         if self.op.char_id == "char_450_necras" and packet.source is self.op and any(target.blocked_by is token for token in self.tokens):
@@ -2581,10 +2710,27 @@ class OperatorSkillRuntime:
         if (not packet.ignore_invincible
                 and any(self.op.statuses.has(s) for s in (Status.INVINCIBLE, Status.SLEEP))):
             return packet
-        if self.op.char_id == "char_136_hsguma" and self.b._roll_probability(float(self.talent(1).get("prob", 0)),
-                mechanism="hsguma_damage_resist", source=self.op, target=packet.source):
-            self.grant_attack_bonus("HSGUMA_RESIST", self.talent(1).get("atk", 0), self.talent(1).get("duration", 0))
-            return replace(packet, amount=0)
+        if self.op.char_id == "char_136_hsguma":
+            upgraded = self.op.module_id == "uniequip_002_hsguma" and self.op.module_level >= 2
+            context = None
+            key = "hsguma_e_002_t"
+            if upgraded:
+                if key in self.b.behavior.templates:
+                    context = self.b.execute_behavior_event(key, "ON_BLOCK_DAMAGE", source=self.op,
+                        target=packet.source, buff_owner=self.op, blackboard=self.talent(1),
+                        register_buffs=True, refresh_attribute_buffs=True, validate_only=True)
+                    if context is None:
+                        return packet
+                else:
+                    self.b.behavior.validate_event(key, "ON_BLOCK_DAMAGE")
+            if self.b._roll_probability(float(self.talent(1).get("prob", 0)),
+                    mechanism="hsguma_damage_resist", source=self.op, target=packet.source):
+                if context is not None:
+                    self.b.behavior.dispatch(key, "ON_BLOCK_DAMAGE", context)
+                    self.b.used_assumptions.add("HSGUMA_ATTRIBUTE_REFRESH_PHASE_CANDIDATE")
+                elif upgraded:
+                    self.grant_attack_bonus("HSGUMA_RESIST", self.talent(1).get("atk", 0), self.talent(1).get("duration", 0))
+                return replace(packet, amount=0)
         return packet
 
     def check_low_hp_recovery(self):
@@ -2738,7 +2884,7 @@ class OperatorSkillRuntime:
         return 1.0
 
     def sjerag_ally(self, target):
-        return self.b.characters.get(target.char_id, {}).get("nationId") == "kjerag"
+        return self.has_group_tag(target, "kjerag")
 
     def enemy_died(self, enemy, killer=None):
         if (self.op.char_id == "char_4145_ulpia" and self.op.module_id == "uniequip_003_ulpia"
@@ -3144,7 +3290,17 @@ class OperatorSkillRuntime:
     def clear_ward_camouflage(self, *, force=False):
         for key, unit in list(self.ward_camouflage_sources.items()):
             if force or unit.dead or self.op.dead:
-                self.op.statuses.revoke(Status.CAMOUFLAGE, ("SOUL_WARD", key))
+                references = self.ward_range_buffs.pop(key, [])
+                instance = self.ward_camouflage_buffs.pop(key, None)
+                if references:
+                    for owner, reference in references:
+                        owner.buffs.finish(reference)
+                        owner.buffs.commit()
+                elif instance is not None:
+                    self.op.buffs.finish(instance)
+                    self.op.buffs.commit()
+                else:
+                    self.op.statuses.revoke(Status.CAMOUFLAGE, ("SOUL_WARD", key))
                 self.ward_camouflage_sources.pop(key)
 
     def spawn_soul_wards(self, count, *, first_sp=0.0):
@@ -3166,9 +3322,9 @@ class OperatorSkillRuntime:
                    if 0 <= cell[0] < len(b.map_grid) and 0 <= cell[1] < len(b.map_grid[0])
                    and any(b.is_buildable(*cell, position) for position in ("MELEE", "RANGED"))
                    and not b.tile_occupied(*cell)]
-        # NO_CHARACTER_AND_NEAREST. Stable map order is still a candidate.
+        # Row zero is the map bottom. Native equal-distance order remains a candidate.
         choices.sort(key=lambda cell: (sum((cell[i]-op.tile[i])**2 for i in (0, 1)),
-                                       -cell[0], cell[1]))
+                                       cell[0], cell[1]))
         output = []
         cfg = b.attack_timing.get(op.char_id, {}).get("soul_ward", {})
         for index, cell in enumerate(choices[:max(0, min(int(count), cap-living))]):
@@ -3184,11 +3340,22 @@ class OperatorSkillRuntime:
             b.operators.append(unit)
             self.tokens.append(unit)
             output.append(unit)
-            # CreateBuffInRange is an entry action, not a continuous aura.
-            cells = b.range_cells_from_id(cfg.get("camouflage_range", "x-5"), cell, 0)
-            if op.tile in cells and op.statuses.targetable:
-                if op.statuses.grant(Status.CAMOUFLAGE, ("SOUL_WARD", unit.deployment_index)):
+            # Range registration is an entry action, not a continuous aura.
+            key = "token_wisdel_passive[to_host]"
+            if key in b.behavior.templates:
+                def remember(owner, instance):
                     self.ward_camouflage_sources[unit.deployment_index] = unit
+                    self.ward_range_buffs.setdefault(unit.deployment_index, []).append((owner, instance))
+                    if owner is op:
+                        self.ward_camouflage_buffs[unit.deployment_index] = instance
+                b.execute_behavior_event(key, "ON_BUFF_START", source=unit, target=unit,
+                    buff_owner=unit, blackboard=unit.skill_blackboard, range_buff_sink=remember)
+            else:
+                b.behavior.validate_event(key, "ON_BUFF_START")
+                cells = b.range_cells_from_id(cfg.get("camouflage_range", "x-5"), cell, 0)
+                if op.tile in cells and op.statuses.targetable:
+                    if op.statuses.grant(Status.CAMOUFLAGE, ("SOUL_WARD", unit.deployment_index)):
+                        self.ward_camouflage_sources[unit.deployment_index] = unit
         return output
 
     def soul_ward_skill_started(self):
@@ -4263,10 +4430,15 @@ class SoulWardRuntime(OperatorSkillRuntime):
             if self.no_target_at_emission:
                 self.b._store_sp_gain(self.op, self.b._skill_cost(self.op))
             else:
-                amount = math.floor(self.b.random_uniform(self.value("sp_min"), self.value("sp_max"),
-                    mechanism="wisdel_ward_finish_sp", source=self.op))
-                # The template explicitly uses forceFlag, including SP_BLOCKED.
-                self.b._store_sp_gain(self.op, amount)
+                if "token_wisdel_skill_end" in self.b.behavior.templates:
+                    self.b.execute_behavior_event("token_wisdel_skill_end", "ON_BUFF_START",
+                        source=self.op, target=self.op, buff_owner=self.op,
+                        blackboard=self.bb, random_mechanism="wisdel_ward_finish_sp")
+                else:
+                    self.b.behavior.validate_event("token_wisdel_skill_end", "ON_BUFF_START")
+                    amount = math.floor(self.b.random_uniform(self.value("sp_min"), self.value("sp_max"),
+                        mechanism="wisdel_ward_finish_sp", source=self.op))
+                    self.b._store_sp_gain(self.op, amount)
 
     def depart(self):
         super().depart()

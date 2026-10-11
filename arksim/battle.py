@@ -17,6 +17,7 @@ result instead of being silently treated as exact simulation.
 
 from __future__ import annotations
 
+import copy
 import math
 import struct
 from collections import Counter, deque
@@ -36,9 +37,13 @@ from .behavior import (
     BehaviorDiagnostics,
     BehaviorError,
     BehaviorInterpreter,
+    rounded_sp_ratio,
+    registered_buff_spec_issue,
+    node_name,
     resolve_behavior_template,
 )
 from .buffs import BuffCatalog, BuffContainer, BuffDefinition, BuffInstance
+from .behavior_components import ComponentCatalog, ComponentListener, module_resources, CALCULATE, OUTPUT
 from .mechanics import (
     ApplyWay,
     AttackType,
@@ -66,7 +71,7 @@ from .targeting import FramePeriodicTicker, TargetSelectorRuntime
 from .loadout import deployment_position, deployment_tile_matches, module_phase, resolve_plan, select_abilities
 from .forms import MAKOTO, MakotoS3
 from .healing import SHU, SHU_S1, ShuHealing
-from .operator_skills import (SUPPORTED as ROSTER_SKILLS, TOKEN_SKILLS,
+from .operator_skills import (SUPPORTED as ROSTER_SKILLS, TOKEN_SKILLS, NEXT,
                              AttackProfile, OperatorSkillRuntime, SoulWardRuntime, SOUL_WARD,
                              live_runtimes, effect_runtimes)
 from .induced_movement import temporary_move
@@ -248,6 +253,7 @@ class Result:
     operation_results: list[dict[str, Any]] = field(default_factory=list)
     spawn_timing: str = SPAWN_TIMING_FAST
     enemy_attack_timing: str = ENEMY_ATTACK_TIMING_FLOAT
+    behavior_components: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -276,6 +282,9 @@ class _PullForce:
 
 @dataclass
 class _Enemy:
+    component_listeners: list[ComponentListener] = field(default_factory=list, init=False)
+    component_claims: set[str] = field(default_factory=set, init=False)
+    component_rejected_buffs: set[str] = field(default_factory=set, init=False)
     key: str
     name: str
     hp: float
@@ -450,6 +459,7 @@ class _Projectile:
     lifecycle: dict[str, Any] = field(default_factory=dict)
     last_destination: tuple[float, float, float] | None = None
     born_at: float | None = None
+    behavior_payload: dict[str, Any] | None = None
 
     def position(self) -> tuple[float, float]:
         return self.position_row, self.position_col
@@ -457,6 +467,13 @@ class _Projectile:
 
 @dataclass
 class _Operator:
+    component_listeners: list[ComponentListener] = field(default_factory=list, init=False)
+    component_claims: set[str] = field(default_factory=set, init=False)
+    component_rejected_buffs: set[str] = field(default_factory=set, init=False)
+    component_mode_index: int | None = field(default=None, init=False)
+    component_mode_claims: set[str] = field(default_factory=set, init=False)
+    component_mode_rejections: set[str] = field(default_factory=set, init=False)
+    component_talent_selection: tuple | None = field(default=None, init=False)
     char_id: str
     name: str
     tile: tuple[int, int]
@@ -566,6 +583,7 @@ class _Operator:
     behavior_next_trigger_at: float = -1.0
     behavior_finish_dispatched: bool = False
     buff_blackboards: dict[str, dict[str, Any]] = field(default_factory=dict)
+    buffs: BuffContainer = field(default_factory=BuffContainer)
     target_selector: TargetSelectorRuntime | None = None
     selector_first_search_frame: int | None = None
     # Character combat is a stateful chain.  The selector cache must survive
@@ -645,6 +663,7 @@ class Battle:
         random_trace: bool = False,
         random_tape: dict | None = None,
         module_context: dict[str, Any] | None = None,
+        behavior_components: dict[str, Any] | None = None,
     ) -> None:
         if "selectedDifficulty" not in level:
             level = select_runes(level)
@@ -680,6 +699,8 @@ class Battle:
             diagnostics=self.behavior_diagnostics,
         )
         self.battle_equips = battle_equips or {}
+        self.component_catalog = ComponentCatalog(behavior_components)
+        self.component_status: list[dict[str, Any]] = []
         self.projectile_data = projectile_data or {}
         if buff_abilities is None and D.DATA_DIR is not None:
             buff_abilities = D.load_enemy_buff_abilities()
@@ -865,12 +886,16 @@ class Battle:
             + (op.form_runtime.atk_bonus if op.form_runtime else 0)
             + (runtime.attack_bonus() if runtime else 0)
             + float(getattr(op, "roster_atk_bonus", 0))
+            + sum(m.value for m in op.buffs.modifiers("ATK", registered_only=True)
+                  if m.formula == "MULTIPLIER")
             + sum(r.aura_atk(op) for r in live_runtimes(self)))
 
     def operator_defense(self, op: _Operator) -> float:
         self._sync_squad_effects()
         return op.defense * (op.def_scale + op.squad_bonus.defense
             + (op.skill_runtime.defense_bonus() if op.skill_runtime else 0)
+            + sum(m.value for m in op.buffs.modifiers("DEF", registered_only=True)
+                  if m.formula == "MULTIPLIER")
             + sum(r.aura_def(op) for r in live_runtimes(self))) + sum(
                 runtime.flat_defense_for(op) for runtime in effect_runtimes(self))
 
@@ -2070,6 +2095,8 @@ class Battle:
             respawn_time=float(attrs.get("respawnTime", 70.0)) * max(0, 1 + self.squad_effects.respawn_modifier),
         )
         op.plan_profile = next((index for index, item in enumerate(self.plan) if item is plan), None)
+        op.buffs.owner = op
+        op.buffs.event_handler = self._dispatch_buff_event
         op.build_plan = plan
         equipped_phase = module_phase(module, plan.module_level) if module is not None else None
         trait, talents, deferred = select_abilities(
@@ -2139,6 +2166,14 @@ class Battle:
         )
         self._face_operator_graphic(op)
         op.graphic_started_at = self.time
+        module_bindings = list(module_resources(equipped_phase, plan, op.talent_blackboards,
+                               **self._module_ability_tags(plan.module_id)))
+        self.component_catalog.bind_operator(self, op, module_bindings=module_bindings, selected_talents=talents)
+        if self.component_catalog.enabled and "module" in self.component_catalog.resource_kinds:
+            for resource, board_key, reason in module_bindings:
+                board = op.trait_blackboard if board_key == "trait" else op.talent_blackboards.get(board_key, {})
+                self.component_catalog.bind(self, op, resource, board, reason=reason)
+        self._sync_component_skill_mode(op, active=op.skill_active)
         return op
 
     def _attach_skill(self, op: _Operator, skill_id: str, skill_level: int | None = None) -> None:
@@ -2177,7 +2212,9 @@ class Battle:
         )
         if prefab_id in ROSTER_SKILLS:
             op.behavior_template_key = None
-        if op.behavior_template_key:
+        if prefab_id and self.component_catalog.enabled and "skill" in self.component_catalog.resource_kinds:
+            self.component_catalog.bind(self, op, prefab_id, op.skill_blackboard)
+        if op.behavior_template_key and not self.behavior_component_claimed(op, op.behavior_template_key):
             supported_events = {
                 "ON_BUFF_START",
                 "ON_BUFF_FINISH",
@@ -2531,6 +2568,14 @@ class Battle:
         if op.attack_cd > 0 or op.pending_attack is not None:
             return
 
+        # NEXT skills may have been ready before this frame's cooldown update
+        # but unable to cast then. Retry at the new attack opportunity, before
+        # a normal attack renews that cooldown; do not tick SP/runtime twice.
+        if op.skill_runtime is not None and op.skill_runtime.sid in NEXT:
+            self._try_auto_skill(op)
+            if self._skill_starting(op):
+                return
+
         if op.skill_runtime is not None and op.skill_runtime.override_action():
             return
 
@@ -2616,6 +2661,7 @@ class Battle:
             ),
             mechanic_warnings=sum(self.mechanic_diagnostics.values()),
             unsupported_mechanics=dict(self.mechanic_diagnostics),
+            behavior_components=copy.deepcopy(self.component_status),
             seed=self.seed,
             random_draws=self.rng.draw_count,
             assumptions=[
@@ -2734,14 +2780,21 @@ class Battle:
                 op, recovery_was_stopped=recovery_was_stopped
             )
         self._recover_squad_sp(op)
+        self._try_auto_skill(op)
+
+    def _try_auto_skill(self, op: _Operator) -> bool:
+        """Check automatic permission without advancing any timer again."""
         if (
-            self._skill_ready(op)
+            not op.dead and self._skill_ready(op)
             and not op.skill_active
             and not self._skill_starting(op)
             and (op.skill_runtime.auto_ready() if op.skill_runtime else op.auto)
             and op.statuses.can_use_skill
+            and not (op.skill_runtime is not None and op.skill_runtime.sid in NEXT
+                     and op.statuses.has(Status.SP_BLOCKED))
         ):
-            self._cast_skill(op, automatic=True)
+            return self._cast_skill(op, automatic=True)
+        return False
 
     def _recover_time_sp(
         self, op: _Operator, *, recovery_was_stopped: bool
@@ -2841,7 +2894,10 @@ class Battle:
         self.squad_effects.skill_started_by(op.char_id)
         self._squad_field_signature = None
         if op.skill_runtime is not None and op.skill_runtime.sid in ROSTER_SKILLS:
-            return op.skill_runtime.activate()
+            activated = op.skill_runtime.activate()
+            if activated:
+                self._sync_component_skill_mode(op, active=True)
+            return activated
         if op.form_runtime is not None:
             op.form_runtime.begin("THANATOS", "SKILL")
             op.skill_end_reason = "FORM_SWITCH"
@@ -2875,6 +2931,7 @@ class Battle:
         if op.skill_controls.can_switch:
             op.skill_mode = 1
             op.skill_mode_target = None
+        self._sync_component_skill_mode(op, active=True)
         if op.skill_controls.can_end or op.skill_controls.can_switch:
             # Control phases and ability-specific finish effects need their
             # own validation; the description only establishes permission.
@@ -3042,6 +3099,7 @@ class Battle:
         op.behavior_active = False
         op.skill_active = False
         op.skill_mode = 0
+        self._sync_component_skill_mode(op, active=False)
         self._sync_squad_effects()
         op.skill_mode_target = None
         op.skill_end_reason = reason
@@ -3063,6 +3121,410 @@ class Battle:
             if item.get("key") is not None
         }
 
+    def execute_behavior_event(
+        self, template_key: str, event: str, *, source: Any,
+        target: Any = None, blackboard: dict[str, Any] | None = None,
+        buff_owner: Any = None, modifier: DamagePacket | None = None,
+        random_mechanism: str | None = None,
+        ability_family: str | None = None, projectile_selector: Any = None,
+        projectile_key: str | None = None,
+        range_buff_sink: Any = None,
+        register_buffs: bool = False, refresh_attribute_buffs: bool = False,
+        validate_only: bool = False,
+        buff_instance: BuffInstance | None = None,
+    ) -> BehaviorContext | None:
+        """Shared event adapter for explicitly migrated actor effects."""
+        if not self.behavior.validate_event(template_key, event):
+            return None
+        context = BehaviorContext(source=source, target=target,
+            buff_owner=buff_owner, buff_source=source,
+            modifier_source=modifier.source if modifier is not None else None,
+            modifier_target=target if modifier is not None else None,
+            blackboard=dict(blackboard or {}), battle=self,
+            modifier=modifier, random_mechanism=random_mechanism,
+            ability_family=ability_family, projectile_selector=projectile_selector,
+            projectile_key=projectile_key, range_buff_sink=range_buff_sink,
+            register_buffs=register_buffs, refresh_attribute_buffs=refresh_attribute_buffs)
+        if buff_instance is not None:
+            context.buff_instance = buff_instance
+            context.buff_container = getattr(buff_instance.owner, "buffs", None)
+            context.current_buff_key = buff_instance.definition.key
+        context.template_key, context.event = template_key, event
+        # Selector bindings are actor adapters; reject a missing binding before
+        # the event's Dice consumes a decision or any action changes state.
+        def bound(value):
+            if isinstance(value, dict):
+                if node_name(value) == "ModifySp":
+                    owner = context.entity(value.get("_targetType"))
+                    if owner is not None and not isinstance(owner, _Operator):
+                        return self.behavior._unsupported(f"{template_key}:{event}:sp_controller_binding")
+                if node_name(value) == "EmitProjectileUseAbilitySelector":
+                    key = value.get("_projectileKey") or projectile_key
+                    if projectile_selector is None or not key or self._projectile_speed(key) is None:
+                        return self.behavior._unsupported(f"{template_key}:{event}:projectile_binding")
+                    emitter = context.entity(value.get("_sourceType"))
+                    if not isinstance(emitter, (_Enemy, _Operator)):
+                        return self.behavior._unsupported(f"{template_key}:{event}:projectile_emitter")
+                    if isinstance(emitter, _Enemy) and value.get("_useMountPointGroup"):
+                        return self.behavior._unsupported(f"{template_key}:{event}:enemy_mount_group")
+                if node_name(value) == "CreateBuffInRange":
+                    if not self._validate_range_buff_binding(context, value):
+                        return False
+                if node_name(value) == "AOEDamage" and not self._validate_aoe_binding(context, value):
+                    return False
+                if node_name(value) == "CreateBuff":
+                    spec = value.get("_buff") or {}
+                    attributes = (spec.get("attributes") or {}).get("attributeModifiers")
+                    if value.get("_isDerivedBuff") and not self._validate_derived_buff_binding(context, value):
+                        return False
+                    if attributes and not register_buffs:
+                        return self.behavior._unsupported(f"{template_key}:{event}:attribute_registration_binding")
+                    if register_buffs:
+                        owner = context.entity(value.get("_buffOwner"))
+                        emitter = (context.entity(value.get("_specialBuffSource"))
+                                   if value.get("_useSpecialBuffSource") else context.source)
+                        if not isinstance(owner, (_Enemy, _Operator)) or not isinstance(emitter, (_Enemy, _Operator)):
+                            return self.behavior._unsupported(f"{template_key}:{event}:buff_entity_binding")
+                        if self._validated_buff_events(spec, blackboard=context.blackboard) is None:
+                            return False
+                if node_name(value) in {"CheckContainsDerviedBuff", "FinishBuff"}:
+                    if not self._validate_derived_buff_binding(context, {"_buffOwner": "BUFF_OWNER"}):
+                        return False
+                return all(bound(child) for child in value.values())
+            if isinstance(value, list):
+                return all(bound(child) for child in value)
+            return True
+        if not bound(self.behavior.templates[template_key]["eventToActions"][event]):
+            return None
+        if not validate_only:
+            self.behavior.dispatch(template_key, event, context)
+        return context
+
+    @staticmethod
+    def behavior_component_claimed(actor: Any, template: str) -> bool:
+        return template in getattr(actor, "component_claims", ())
+
+    def _dispatch_component_calculate(self, packet: DamagePacket, target: Any, phase: str):
+        """Shared outgoing event hook; no character or template-key selection."""
+        source = packet.source
+        if (not packet.notify_calculate or packet.normalized_damage_type() in {DamageType.HEAL, DamageType.LIFE_LOSS}
+                or not isinstance(source, (_Enemy, _Operator))
+                or not isinstance(target, (_Enemy, _Operator))
+                or isinstance(source, _Enemy) == isinstance(target, _Enemy) or target.dead):
+            return packet
+        for listener in source.component_listeners:
+            if listener.phase != phase or (listener.ignore_dead and source.dead):
+                continue
+            if not self.component_catalog.validate(self, listener):
+                listener.record.update(state="rejected", reason="preflight")
+                continue
+            context = self.execute_behavior_event(listener.template, CALCULATE,
+                source=source, target=target, buff_owner=source,
+                blackboard=listener.board, modifier=packet)
+            if context is not None and phase == "scale":
+                packet = replace(packet, amount=packet.amount * context.attack_scale * context.damage_scale)
+        return packet
+
+    def _dispatch_component_lifecycle(self, actor: Any, event: str, *, listeners=None) -> None:
+        """Owner-only passive notifications shared by any attached actor."""
+        for listener in tuple(actor.component_listeners if listeners is None else listeners):
+            if listener.phase not in {"lifecycle", "owner-events"}:
+                continue
+            if event == "ON_BUFF_START":
+                if listener.started:
+                    continue
+                # Field re-entry/relocation is not a new buff instance.
+                listener.started = True
+            elif not listener.started:
+                continue
+            if event not in listener.events or (listener.ignore_dead and actor.dead):
+                continue
+            if not self.component_catalog.validate(self, listener):
+                listener.record.update(state="rejected", reason="preflight")
+                continue
+            context = self.execute_behavior_event(listener.template, event, source=actor,
+                buff_owner=actor, blackboard=listener.board)
+            if context is None:
+                listener.record.update(state="rejected", reason="event_binding")
+
+    def _sync_component_skill_mode(self, op: _Operator, *, active: bool) -> None:
+        if op.component_talent_selection is None:
+            return  # The selected talent/module blackboards are not ready yet.
+        mode = self.component_catalog.explicit_skill_mode(op, active=active)
+        if mode is not None:
+            self.component_catalog.switch_operator_mode(self, op, mode)
+
+    def _notify_operator_attack_complete(self, op: _Operator, *, legacy_runtime=False) -> None:
+        # Reuse the existing final attack callback, never projectile impact or
+        # AttackState cleanup (which also runs on interruption/mode detach).
+        # Exact native post-delay/OnCastEnd placement remains a candidate.
+        self._dispatch_component_lifecycle(op, "ON_AFTER_ATTACK")
+        if legacy_runtime and op.skill_runtime is not None:
+            op.skill_runtime.attack_complete()
+
+    def _dispatch_component_output(self, packet: DamagePacket, target: Any) -> None:
+        source = packet.source
+        if (packet.normalized_damage_type() is not DamageType.HEAL
+                or not isinstance(source, (_Enemy, _Operator)) or source.dead
+                or not isinstance(target, (_Enemy, _Operator)) or target.dead):
+            return
+        for listener in tuple(source.component_listeners):
+            if listener.phase != "heal-output":
+                continue
+            if not self.component_catalog.validate(self, listener):
+                listener.record.update(state="rejected", reason="preflight")
+                continue
+            context = self.execute_behavior_event(listener.template, OUTPUT, source=source,
+                target=target, buff_owner=source, blackboard=listener.board, modifier=packet)
+            if context is None:
+                listener.record.update(state="rejected", reason="event_binding")
+
+    def _validate_derived_buff_binding(self, context: BehaviorContext, node: dict[str, Any]) -> bool:
+        parent = context.buff_instance
+        owner = context.entity(node.get("_buffOwner"))
+        container = getattr(owner, "buffs", None)
+        if (parent is None or container is None or context.buff_container is not container
+                or parent.owner is not owner or not parent.definition.registered_behavior
+                or parent.finished or not parent.enabled or container._is_pending_finish(parent)
+                or not any(item is parent for item in (*container.active, *container.pending_add))):
+            return self.behavior._unsupported("CreateBuff:derived_parent_binding")
+        return True
+
+    def _validate_range_buff_binding(self, context: BehaviorContext, node: dict[str, Any]) -> bool:
+        """Resolve the range and every child tree before any event side effects."""
+        label = f"{context.template_key or '<range>'}:{context.event or '<direct>'}:CreateBuffInRange"
+        if not self._validate_behavior_range(context, node, label):
+            return False
+        if node.get("_isDerivedBuff") and not callable(context.range_buff_sink):
+            return self.behavior._unsupported(label + ":derived_lifecycle_binding")
+        return all(self._validated_buff_events(spec, blackboard=context.blackboard) is not None
+                   for spec in node.get("_buffs") or [])
+
+    def _validate_behavior_range(self, context: BehaviorContext, node: dict[str, Any], label: str) -> bool:
+        source = context.entity(node.get("_sourceType"))
+        center = context.entity(node.get("_targetType"))
+        if not isinstance(source, (_Enemy, _Operator)) or not isinstance(center, (_Enemy, _Operator)):
+            return self.behavior._unsupported(label + ":entity_binding")
+        if node.get("_useRadius"):
+            try:
+                radius = float(node.get("_radius", 0))
+            except (TypeError, ValueError):
+                return self.behavior._unsupported(label + ":radius")
+            if not math.isfinite(radius) or radius < 0:
+                return self.behavior._unsupported(label + ":radius")
+        elif not node.get("_useGlobalRange"):
+            range_id = node.get("_rangeId")
+            if not range_id or range_id not in self.ranges:
+                return self.behavior._unsupported(label + ":range_binding")
+            if isinstance(center, _Enemy):
+                # Enemy facing is continuous, not an exported cardinal range
+                # orientation. Only rotation-invariant named ranges bind here.
+                cells = self.range_cells_from_id(range_id, (0, 0), 0)
+                if any(self.range_cells_from_id(range_id, (0, 0), facing) != cells for facing in (1, 2, 3)):
+                    return self.behavior._unsupported(label + ":enemy_range_facing")
+        return True
+
+    def _validate_aoe_binding(self, context: BehaviorContext, node: dict[str, Any]) -> bool:
+        if context.template_key == "huang_s_3" and not node.get("_useRadius") and not node.get("_rangeId"):
+            return isinstance(context.entity(node.get("_sourceType")), _Operator)
+        return self._validate_behavior_range(context, node,
+            f"{context.template_key or '<aoe>'}:{context.event or '<direct>'}:AOEDamage")
+
+    def behavior_range_targets(self, context: BehaviorContext, node: dict[str, Any]) -> list[Any]:
+        """Reviewed entry selection: side, availability, motion and midpoint range."""
+        source = context.entity(node.get("_sourceType"))
+        center = context.entity(node.get("_targetType"))
+        options = node.get("_targetOptions") or {"targetSide": "ENEMY"}
+        allied = options.get("targetSide") == "ALLY"
+        operator_side = isinstance(source, _Operator) == allied
+        candidates = self.operators if operator_side else self.enemies
+        advanced = options.get("enableAdvancedOptions", False)
+        check_free = advanced and options.get("purposeMask", "NONE") != "NONE"
+        ignore_free = advanced and (options.get("ignoreTargetFree") or
+                                     (allied and options.get("ignoreAllyTargetFree")))
+        position = center.tile if isinstance(center, _Operator) else center.position()
+        cells = None
+        if not node.get("_useRadius") and not node.get("_useGlobalRange"):
+            cell = center.tile if isinstance(center, _Operator) else center.tile()
+            cells = self.range_cells_from_id(node["_rangeId"], cell,
+                center.facing if isinstance(center, _Operator) else 0)
+        result = []
+        for unit in candidates:
+            if unit.dead or (isinstance(unit, _Enemy) and not self._enemy_is_attackable(unit)):
+                continue
+            if node.get("_excludeTarget") and unit is center:
+                continue
+            if check_free and not ignore_free:
+                available = self._enemy_targetable(unit) if isinstance(unit, _Enemy) else unit.statuses.targetable
+                if not available:
+                    continue
+            # No supported purpose is healing. ignoreHealFree does not make
+            # an attribute/status effect a healing selector.
+            airborne = self._is_airborne(unit) if isinstance(unit, _Enemy) else unit.statuses.has(Status.LEVITATE)
+            motion = options.get("targetMotion", "ALL")
+            if (motion == "WALK" and airborne) or (motion == "FLY" and not airborne):
+                continue
+            point = unit.tile if isinstance(unit, _Operator) else unit.position()
+            if node.get("_useRadius"):
+                if math.dist(point, position) > float(node.get("_radius", 0)) + 1e-9:
+                    continue
+            elif cells is not None:
+                cell = unit.tile if isinstance(unit, _Operator) else unit.tile()
+                if cell not in cells:
+                    continue
+            result.append(unit)
+        return result
+
+    def behavior_create_buff_in_range(self, context: BehaviorContext, node: dict[str, Any]) -> bool:
+        if not self._validate_range_buff_binding(context, node):
+            return False
+        source = context.entity(node.get("_sourceType"))
+        if source.dead:
+            return False
+        targets = self.behavior_range_targets(context, node)
+        for owner in targets:
+            for spec in node.get("_buffs") or []:
+                instance = self.register_behavior_buff(spec, owner=owner, source=source,
+                    blackboard=context.blackboard)
+                if (instance is not None and not instance.finished and node.get("_isDerivedBuff")
+                        and context.range_buff_sink is not None):
+                    context.range_buff_sink(owner, instance)
+        return bool(targets)
+
+    def behavior_advanced_damage(self, context: BehaviorContext, node: dict[str, Any]) -> bool:
+        """One reviewed hit packet; keep actor-specific damage notifications."""
+        source = context.entity(node.get("_sourceType"))
+        target = context.entity(node.get("_targetType"))
+        if source is None or target is None or target.dead:
+            return False
+        if isinstance(target, _Enemy) and not self._enemy_is_attackable(target):
+            return False
+        base = context.cached_attack
+        if base is None:
+            base = self.operator_attack_power(source) if isinstance(source, _Operator) else self._effective_enemy_atk(source)
+        scale = float(context.blackboard.get(node.get("_atkScaleVar", "atk_scale"), node.get("_defaultAtkScale", 1)))
+        return self._behavior_hit_damage(source, target, base * scale,
+            node.get("_damageType", "PHYSICAL"), node.get("_attackType", "NORMAL"),
+            node.get("_applyWay", "NONE"), node.get("_modifierKey", ""))
+
+    def _behavior_hit_damage(self, source: Any, target: Any, amount: float,
+                             damage_type: str, attack_type: str, apply_way: str,
+                             modifier_key: str) -> bool:
+        kind = {"MAGICAL": "ARTS", "PURE": "TRUE", "ELEMENT": "ELEMENTAL"}.get(
+            damage_type, damage_type)
+        attack_type = AttackType(attack_type)
+        apply_way = ApplyWay(apply_way)
+        if isinstance(source, _Operator) and isinstance(target, _Enemy):
+            # This is the same output adapter used before template migration.
+            runtime = source.skill_runtime
+            if runtime is not None:
+                runtime.damage(target, amount, kind, attack_type=attack_type,
+                    apply_way=apply_way, modifier_key=modifier_key)
+            else:
+                self._apply_operator_damage(source, target, amount, damage_type=kind,
+                    attack_type=attack_type, apply_way=apply_way, modifier_key=modifier_key)
+        else:
+            result = self._apply_damage(DamagePacket(amount, kind, source=source,
+                attack_type=attack_type, apply_way=apply_way, modifier_key=modifier_key,
+                output_scale=self._outgoing_damage_scale(source),
+                target_resistance_override=self._effective_resistance(target)), target)
+            if result.killed and isinstance(target, _Enemy):
+                self.enemies_killed += 1
+        # A cancelled or zero packet still permits the next hit action.
+        return True
+
+    def behavior_apply_hit_buffs(self, target: Any, specs: list[dict[str, Any]],
+                                 context: BehaviorContext) -> None:
+        """Apply the caller-validated built-ins after its damage actions."""
+        statuses = {"stun": Status.STUNNED, "sluggish": Status.SLUGGISH}
+        for spec in specs:
+            board = {**context.blackboard, **self._blackboard(spec)}
+            duration = float(board.get(spec.get("durationKey") or spec["buffKey"], spec.get("lifeTime", 0)))
+            target.statuses.apply(statuses[spec["buffKey"]], duration)
+
+    def behavior_emit_projectile(self, context: BehaviorContext, node: dict[str, Any]) -> bool:
+        source = context.entity(node.get("_sourceType"))
+        key = node.get("_projectileKey") or context.projectile_key
+        if source is None or context.projectile_selector is None or not key:
+            return self.behavior._unsupported("EmitProjectileUseAbilitySelector:projectile_binding")
+        if isinstance(source, _Enemy) and node.get("_useMountPointGroup"):
+            return self.behavior._unsupported("EmitProjectileUseAbilitySelector:enemy_mount_group")
+        group = node.get("_mountPointGroup") or {}
+        mount_rule = {"group": list(group.get("mountPoints") or []) if node.get("_useMountPointGroup") else [],
+            "loopType": group.get("loopType", "SEQUENTIAL"), "mount": node.get("_mountPoint")}
+        count = max(0, int(context.blackboard.get("emit_count", node.get("_emitCount", 1))))
+        base = (self.operator_attack_power(source) if isinstance(source, _Operator)
+                else self._effective_enemy_atk(source)) if node.get("_cacheAtkToActions") else None
+        emitted = False
+        for _ in range(count):
+            target = context.projectile_selector()
+            if target is None:
+                break
+            payload = {"template_key": context.template_key, "event": node["_ev"],
+                "actions": copy.deepcopy(node.get("_actions") or []),
+                "buffs": copy.deepcopy(node.get("_buffDataList") or []),
+                "blackboard": dict(context.blackboard), "cached_attack": base}
+            attack = _PendingOperatorAttack(self.time, self.frame_index, "BEHAVIOR", target, [target],
+                1, 1, True, True, profile=AttackProfile(payload={"keep_projectile_after_departure": True}))
+            self._new_projectile(key=key, side="OPERATOR" if isinstance(source, _Operator) else "ENEMY",
+                source=source, target=target, operator_attack=attack, cached_atk=base,
+                mount_rule=mount_rule, behavior_payload=payload)
+            emitted = True
+        return emitted
+
+    def land_behavior_projectile(self, projectile: _Projectile) -> None:
+        payload = projectile.behavior_payload
+        target = projectile.target
+        if payload is None or not self._projectile_target_valid(projectile) or not projectile.will_hit:
+            return
+        context = BehaviorContext(source=projectile.source, target=target,
+            buff_owner=projectile.source, buff_source=projectile.source,
+            blackboard=dict(payload["blackboard"]), battle=self,
+            template_key=payload["template_key"], event=payload["event"],
+            cached_attack=payload["cached_attack"])
+        self.behavior.execute_actions(payload["actions"], context)
+        if target.dead:
+            return
+        self.behavior_apply_hit_buffs(target, payload["buffs"], context)
+
+    def behavior_modify_sp(self, context: BehaviorContext, node: dict[str, Any]) -> bool:
+        """Use the existing SP controller for reviewed additive/ratio variants."""
+        owner = context.entity(node.get("_targetType"))
+        if owner is None or getattr(owner, "dead", False):
+            return False
+        if not isinstance(owner, _Operator):
+            return self.behavior._unsupported("ModifySp:missing_sp_controller")
+        if owner.skill is None:
+            return False
+        masks = {"NONE": 0, "INCREASE_WITH_TIME": 1, "INCREASE_WHEN_ATTACK": 2,
+                 "INCREASE_WHEN_TAKEN_DAMAGE": 4, "ATTACK_OR_DAMAGE": 6, "ALL": 7}
+        if not node.get("_dontCheckSpType"):
+            mask = node.get("_spMask", "ALL")
+            if mask not in masks and (type(mask) is not int or not 0 <= mask <= 7):
+                return self.behavior._unsupported(f"ModifySp:spMask:{mask}")
+            mask = masks.get(mask, mask)
+            if not (int(mask) & masks.get(owner.sp_type, 0)):
+                return False
+        key = str(node.get("_spString", ""))
+        if node.get("_modifyByRatio"):
+            amount = rounded_sp_ratio(int(owner.sp_max),
+                context.blackboard.get(key, node.get("_modifyRatio", 0)))
+        elif node.get("_modifyByRatioBasedOnCurSP"):
+            # The current-SP getter returns FP directly; retain its fraction.
+            amount = rounded_sp_ratio(owner.sp, context.blackboard.get(key, 0))
+        elif node.get("_modifyBySpCost"):
+            amount = self._skill_cost(owner)
+        else:
+            amount = math.floor(float(context.blackboard.get(key, node.get("_modifyValue", 0))))
+        if amount < 0:
+            return self.behavior._unsupported("ModifySp:negative_value")
+        # Keep caps, fractional remainders and the existing notification phase.
+        if node.get("_forceFlag"):
+            self._store_sp_gain(owner, amount)
+        else:
+            self._gain_sp(owner, amount)
+        return True
+
     def _dispatch_skill_event(
         self,
         op: _Operator,
@@ -3074,7 +3536,8 @@ class Battle:
         trigger_ratio: float = 0.0,
     ) -> BehaviorContext | None:
         template_key = getattr(op, "behavior_template_key", None)
-        if not template_key or not getattr(op, "behavior_active", False):
+        if (not template_key or not getattr(op, "behavior_active", False)
+                or self.behavior_component_claimed(op, template_key)):
             return None
         context = BehaviorContext(
             source=op,
@@ -3493,7 +3956,7 @@ class Battle:
             if op.skill_runtime.continue_attack_sequence(attack):
                 return
             self._sp_on_attack(op, sp_recovery_locked=attack.sp_recovery_locked)
-            op.skill_runtime.attack_complete()
+            self._notify_operator_attack_complete(op, legacy_runtime=True)
             return
         if attack.kind == "HEAL":
             amount = self.operator_attack_power(op, attack.source_atk_scale) * attack.attack_scale
@@ -3550,7 +4013,7 @@ class Battle:
                 return
             self._sp_on_attack(op, sp_recovery_locked=attack.sp_recovery_locked)
             self.consume_skill_ammo(op)
-            op.skill_runtime.attack_complete()
+            self._notify_operator_attack_complete(op, legacy_runtime=True)
             return
         primary_valid = self._enemy_is_attackable(attack.primary)
         if attack.will_hit and primary_valid:
@@ -3589,6 +4052,7 @@ class Battle:
             op, sp_recovery_locked=attack.sp_recovery_locked
         )
         self.consume_skill_ammo(op)
+        self._notify_operator_attack_complete(op)
 
     def _projectile_speed(self, key: str | None) -> float | None:
         if not key:
@@ -3613,6 +4077,8 @@ class Battle:
         origin_override: tuple[float, float, float] | None = None,
         immediate: bool = False,
         hit_on_expiry: float | None = None,
+        mount_rule: dict[str, Any] | None = None,
+        behavior_payload: dict[str, Any] | None = None,
     ) -> None:
         speed = 0.0 if immediate or hit_on_expiry is not None else self._projectile_speed(key)
         if speed is None:
@@ -3627,7 +4093,7 @@ class Battle:
             source_row, source_col, source_z = origin_override
             muzzle_position = origin_override
         elif isinstance(source, _Operator):
-            origin, mount_point = self._operator_projectile_origin(source, key, target, mount_point)
+            origin, mount_point = self._operator_projectile_origin(source, key, target, mount_point, mount_rule)
             source_row, source_col, source_z = origin
             if mount_point is not None:
                 muzzle_position = origin
@@ -3688,6 +4154,7 @@ class Battle:
                 lifecycle=lifecycle,
                 last_destination=(target_row, target_col, target_z),
                 born_at=self.time + birth_delay,
+                behavior_payload=behavior_payload,
                 impact_at=self.time if immediate else None,
                 fixed_destination=((target_row, target_col, target_z)
                                    if lifecycle.get("fixed_endpoint") else None),
@@ -3695,11 +4162,14 @@ class Battle:
         )
 
     def _operator_projectile_origin(
-        self, op: _Operator, key: str, target=None, mount_point: str | None = None
+        self, op: _Operator, key: str, target=None, mount_point: str | None = None,
+        mount_rule: dict[str, Any] | None = None,
     ) -> tuple[tuple[float, float, float], str | None]:
         """Select an emission point shared by tracking and special flight runtimes."""
         graphic = self.operator_graphics.get(op.char_id)
         rule = graphic.projectiles.get(key, {}) if graphic is not None else {}
+        if mount_rule is not None:
+            rule = {**rule, **mount_rule}
         if graphic is not None and key not in graphic.projectiles and mount_point is None:
             self.mechanic_diagnostics[f"OPERATOR_PROJECTILE_BINDING_MISSING:{op.char_id}:{key}"] += 1
         if rule.get("faceToTarget"):
@@ -4117,6 +4587,7 @@ class Battle:
         damage_source: Any = ...,
         modifier_key: str = "",
         ability_owner: Any = ...,
+        notify_calculate: bool = True,
     ):
         kind = damage_type or getattr(op, "damage_type", "PHYSICAL")
         source = op if damage_source is ... else damage_source
@@ -4134,6 +4605,7 @@ class Battle:
                 taken_scale=taken_scale,
                 source=source,
                 modifier_key=modifier_key,
+                notify_calculate=notify_calculate,
                 ability_owner=(op if attack_type == AttackType.NORMAL else None)
                     if ability_owner is ... else ability_owner,
                 critical_chance=0.0 if life_loss else float(getattr(op, "critical_chance", 0.0)),
@@ -4380,6 +4852,9 @@ class Battle:
             return
         if not self._projectile_target_valid(projectile):
             return
+        if projectile.behavior_payload is not None:
+            self.land_behavior_projectile(projectile)
+            return
         if projectile.side == "ENEMY":
             self._enemy_attack_lands(
                 projectile.source,
@@ -4491,6 +4966,7 @@ class Battle:
                 source_runtime = summoner.skill_runtime
         if source_runtime:
             packet = source_runtime.modify_packet(packet, target)
+        packet = self._dispatch_component_calculate(packet, target, "scale")
         if runtime:
             packet = runtime.modify_taken_packet(packet)
         kind = packet.normalized_damage_type()
@@ -4515,10 +4991,19 @@ class Battle:
                 ] + ([r.ally_damage_resistance(target, packet.source) for r in live_runtimes(self)]
                      if kind in {DamageType.PHYSICAL, DamageType.ARTS} and packet.source in self.enemies else []))
                 packet = replace(packet, damage_resistance=resistance)
+        def calculate(current_packet, current_target):
+            self._dispatch_component_calculate(current_packet, current_target, "notify")
+            if source_runtime is not None:
+                source_runtime.calculate_damage_modifier(current_packet, current_target)
+        def output(current_packet, current_target):
+            self._dispatch_component_output(current_packet, current_target)
+            if source_healing is not None:
+                source_healing.output_modifier(current_packet, current_target)
+            elif source_runtime is not None:
+                source_runtime.output_modifier(current_packet, current_target)
         result = apply_damage(packet, target, roll=self._roll_probability, roll_labeled=labeled,
-            on_calculate=source_runtime.calculate_damage_modifier if source_runtime is not None else None,
-            on_output=(source_healing.output_modifier if source_healing is not None else
-                       source_runtime.output_modifier if source_runtime is not None else None),
+            on_calculate=calculate if packet.notify_calculate else None,
+            on_output=output,
             on_taking_damage=runtime.taking_damage_modifier if runtime is not None else None,
             before_apply=source_runtime.before_apply_damage
                 if source_runtime is not None else None)
@@ -4968,6 +5453,11 @@ class Battle:
 
         return self._search_operator_target_now(op)
 
+    @staticmethod
+    def _enemy_within_radius(enemy: _Enemy, center: tuple[float, float], radius: float) -> bool:
+        """Midpoint range; distinct from a projectile's collider overlap."""
+        return math.dist(enemy.position(), center) <= radius + 1e-9
+
     def _enemy_intersects_circle(
         self,
         enemy: _Enemy,
@@ -5114,7 +5604,8 @@ class Battle:
             container.commit()
 
     def _tick_enemy_buffs(self) -> None:
-        for enemy in list(getattr(self, "enemies", ())):
+        # Registered operator Buffs share the existing frame-end timer phase.
+        for enemy in (*getattr(self, "enemies", ()), *getattr(self, "operators", ())):
             if enemy.dead:
                 continue
             container = getattr(enemy, "buffs", None)
@@ -5125,6 +5616,12 @@ class Battle:
 
     def _dispatch_buff_event(self, instance: BuffInstance, event: str) -> bool:
         """Run normalized Buff actions through the existing interpreter."""
+        if event == "ON_BUFF_START":
+            for flag in instance.definition.status_flags:
+                instance.owner.statuses.grant(flag, instance)
+        elif event == "ON_BUFF_FINISH":
+            for flag in instance.definition.status_flags:
+                instance.owner.statuses.revoke(flag, instance)
         actions = instance.definition.actions_for(event)
         if not actions:
             return True
@@ -5138,13 +5635,125 @@ class Battle:
             ability_blackboard={},
             battle=self,
             diagnostics=self.behavior_diagnostics,
-            template_key=instance.definition.key,
+            template_key=(instance.definition.template_key if instance.definition.registered_behavior
+                          else instance.definition.key),
             event=event,
             current_buff_key=instance.definition.key,
             buff_container=getattr(owner, "buffs", None),
             buff_instance=instance,
         )
         return self.behavior.execute_actions(list(actions), context)
+
+    def _validated_buff_events(self, spec: dict[str, Any], seen: frozenset[str] = frozenset(),
+                               blackboard: dict[str, Any] | None = None) -> dict | None:
+        """Preflight referenced child trees before registering any state."""
+        issue = registered_buff_spec_issue(spec)
+        if issue:
+            self.behavior._unsupported("RegisterBuff:" + issue)
+            return None
+        if self._behavior_buff_definition(spec, blackboard or {}) is None:
+            return None
+        board = self._behavior_buff_blackboard(spec, blackboard or {})
+        key = str(spec.get("templateKey") or "")
+        if key in seen:
+            self.behavior._unsupported(f"RegisterBuff:{key}:recursive_template")
+            return None
+        events = {}
+        if key and key != "empty":
+            template = self.behavior.templates.get(key)
+            if template is None:
+                self.behavior.validate_event(key, "ON_BUFF_START")
+                return None
+            events = template.get("eventToActions", {})
+            if any(event not in {"ON_BUFF_START", "ON_BUFF_FINISH", "ON_BUFF_TRIGGER"}
+                   for event in events):
+                self.behavior._unsupported(f"RegisterBuff:{key}:event")
+                return None
+            valid = True
+            for event in events:
+                valid = self.behavior.validate_event(key, event) and valid
+            def children(value):
+                nonlocal valid
+                if isinstance(value, dict):
+                    if node_name(value) in {"CreateBuffInRange", "EmitProjectileUseAbilitySelector", "AOEDamage"}:
+                        # These callbacks need actor selector/lifecycle
+                        # bindings that a passive child does not inherit.
+                        self.behavior._unsupported(f"RegisterBuff:{key}:nested_action_binding:{node_name(value)}")
+                        valid = False
+                    if node_name(value) == "CreateBuff":
+                        if (((value.get("_buff") or {}).get("attributes") or {}).get("attributeModifiers")
+                                and not value.get("_isDerivedBuff")):
+                            self.behavior._unsupported(f"RegisterBuff:{key}:nested_attribute_binding")
+                            valid = False
+                        yield value.get("_buff") or {}
+                    for child in value.values():
+                        yield from children(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        yield from children(child)
+            for child in children(events):
+                valid = (self._validated_buff_events(child, seen | {key}, board) is not None) and valid
+            if not valid:
+                return None
+        return events
+
+    def _behavior_buff_blackboard(self, spec: dict[str, Any], blackboard: dict[str, Any]) -> dict[str, Any]:
+        if spec.get("stripBlackboardParamsWithBuffKey"):
+            prefix = str(spec.get("buffKey", "")) + "."
+            board = {key[len(prefix):]: value for key, value in blackboard.items() if key.startswith(prefix)}
+        else:
+            board = dict(blackboard)
+        board.update(self._blackboard(spec))
+        return board
+
+    def _behavior_buff_definition(self, spec: dict[str, Any], blackboard: dict[str, Any],
+                                  events: dict | None = None) -> BuffDefinition | None:
+        board = self._behavior_buff_blackboard(spec, blackboard)
+        try:
+            return BuffDefinition.from_create_spec({**spec, "eventToActions": events or {},
+                "registered_behavior": True, "unique_by_key": False}, blackboard=board)
+        except (ValueError, TypeError, OverflowError):
+            self.behavior._unsupported("RegisterBuff:invalid_value/lifetime")
+            return None
+
+    def register_behavior_buff(
+        self, spec: dict[str, Any], *, owner: Any, source: Any,
+        blackboard: dict[str, Any] | None = None, parent: BuffInstance | None = None,
+        commit: bool = True,
+        refresh: bool = False,
+        finish_with_parent: bool = False,
+    ) -> BuffInstance | None:
+        """Register reviewed flags or ATK after an explicit actor adapter."""
+        if owner is None or getattr(owner, "dead", False):
+            return None
+        container = owner.buffs
+        if finish_with_parent and (parent is None or parent.owner is not owner
+                or parent.finished or not parent.enabled or container._is_pending_finish(parent)
+                or not parent.definition.registered_behavior
+                or not any(item is parent for item in (*container.active, *container.pending_add))):
+            self.behavior._unsupported("RegisterBuff:derived_parent_binding")
+            return None
+        events = self._validated_buff_events(spec, blackboard=blackboard)
+        if events is None:
+            return None
+        board = self._behavior_buff_blackboard(spec, blackboard or {})
+        definition = self._behavior_buff_definition(spec, blackboard or {}, events)
+        if definition is None:
+            return None
+        container.owner = owner
+        container.event_handler = self._dispatch_buff_event
+        instance = container.add(definition, source=source, parent=parent,
+            blackboard=board, attached_step=self.frame_index, finish_with_parent=finish_with_parent)
+        if refresh and definition.modifiers and definition.lifetime_type == "LIMITED":
+            # Only explicit adapters request this same-source timer refresh.
+            # This is not the general native DEFAULT/stack override algorithm.
+            instance.definition = definition
+            instance.blackboard = board
+            instance.remaining_lifetime = definition.lifetime
+            instance.attached_step = self.frame_index
+        if commit:
+            container.commit()
+        return instance
 
     def _living_herald_count(self) -> int:
         return sum(
@@ -5461,6 +6070,8 @@ class Battle:
                         + unit.statuses.attack_speed_delta + element_bonus
                         + (form.attack_speed if form else 0)
                         + (unit.skill_runtime.attack_speed() if unit.skill_runtime else 0)
+                        + sum(m.value for m in unit.buffs.modifiers("ATTACK_SPEED", registered_only=True)
+                              if m.formula == "ADDITION")
                         + (sum(r.aura_speed(unit) for r in live_runtimes(self)) if isinstance(self, Battle) else 0))
             return (unit.attack_interval * own_speed
                     + (form.attack_time_add * 100 if form else 0)
@@ -6790,68 +7401,36 @@ class Battle:
         self, context: BehaviorContext, node: dict[str, Any]
     ) -> bool:
         source = context.entity(node.get("_sourceType"))
-        center = context.entity(node.get("_targetType"))
-        if not isinstance(source, _Operator) or center is None:
+        if not self._validate_aoe_binding(context, node):
             return False
-
-        known_huang_range = (
-            context.template_key == "huang_s_3"
-            and not node.get("_useRadius")
-            and not node.get("_useAbilitySelector")
-        )
-        # Other ability selectors are not exported in this first slice. Keep
-        # those approximations visible instead of silently claiming accuracy.
-        if (
-            not known_huang_range
-            and not node.get("_useRadius")
-            and not node.get("_useAbilitySelector")
-        ):
-            key = "AOEDamage:ability_range_approximation"
-            self.behavior_diagnostics.unsupported_nodes[key] += 1
-            if self.behavior.strict:
-                raise BehaviorError(
-                    "AOEDamage requires an ability-range selector not yet modeled"
-                )
-
-        if node.get("_useRadius"):
-            radius = float(node.get("_radius", 0.0))
-            center_tile = center.tile if isinstance(center, _Operator) else center.tile()
-            targets = [
-                enemy
-                for enemy in self.enemies
-                if not enemy.dead
-                and math.hypot(
-                    enemy.tile()[0] - center_tile[0],
-                    enemy.tile()[1] - center_tile[1],
-                )
-                <= radius
-            ]
-        elif known_huang_range:
+        if context.template_key == "huang_s_3" and not node.get("_useRadius") and not node.get("_rangeId"):
+            # Preserve the older reviewed Huang finish adapter; its ability
+            # range is not part of the new generic selector coverage.
             cells = self._front_3x3_cells(source)
-            targets = [
-                enemy
-                for enemy in self.enemies
-                if not enemy.dead and enemy.tile() in cells
-            ]
-        else:
-            cells = set(source.range_cells) | {source.tile}
-            targets = [
-                enemy
-                for enemy in self.enemies
-                if not enemy.dead and enemy.tile() in cells
-            ]
-
-        scale_key = str(node.get("_damageScale", "atk_scale"))
-        scale = float(context.blackboard.get(scale_key, 1.0))
-        amount = source.atk * source.atk_scale * scale
+            amount = source.atk * source.atk_scale * float(context.blackboard.get(node.get("_damageScale"), 1))
+            hit = False
+            for enemy in tuple(self.enemies):
+                if not enemy.dead and enemy.tile() in cells:
+                    hit = self.behavior_deal_damage(source, enemy, amount, node.get("_damageType", "PHYSICAL")) or hit
+            return hit
+        targets = self.behavior_range_targets(context, node)
+        base = context.cached_attack
+        if base is None:
+            base = self.operator_attack_power(source) if isinstance(source, _Operator) else self._effective_enemy_atk(source)
+        scale = float(context.blackboard.get(node.get("_damageScale"), 1))
+        amount = base * scale
         hit = False
-        for enemy in list(targets):
-            hit = self.behavior_deal_damage(
-                source,
-                enemy,
-                amount,
-                str(node.get("_damageType", "PHYSICAL")),
-            ) or hit
+        for target in targets:
+            # Selection and base attack are fixed for this action. An earlier
+            # hit may nevertheless kill a later receiver through another hook.
+            if target.dead or (isinstance(target, _Enemy) and not self._enemy_is_attackable(target)):
+                continue
+            hit = self._behavior_hit_damage(source, target, amount,
+                node.get("_damageType", "PHYSICAL"), node.get("_attackType", "NORMAL"),
+                node.get("_sourceApplyWay", "NONE"), node.get("_modifierKey", "")) or hit
+            # Keep this adapter's existing post-damage status order, including
+            # a lethal packet; exact native disposal/notification is candidate.
+            self.behavior_apply_hit_buffs(target, node.get("_buffs") or [], context)
         return hit
 
     def behavior_create_buff(
@@ -6862,9 +7441,24 @@ class Battle:
         key = str(spec.get("buffKey", ""))
         if owner is None or not key:
             return False
+        if node.get("_isDerivedBuff") and not self._validate_derived_buff_binding(context, node):
+            return False
+
+        if context.register_buffs:
+            source = (context.entity(node.get("_specialBuffSource"))
+                      if node.get("_useSpecialBuffSource") else context.source)
+            return self.register_behavior_buff(spec, owner=owner, source=source,
+                blackboard=context.blackboard, refresh=context.refresh_attribute_buffs,
+                parent=context.buff_instance, finish_with_parent=bool(node.get("_isDerivedBuff"))) is not None
 
         container = getattr(owner, "buffs", None)
         if context.buff_container is not None and container is not None:
+            if context.buff_instance is not None and context.buff_instance.definition.registered_behavior:
+                source = (context.entity(node.get("_specialBuffSource"))
+                          if node.get("_useSpecialBuffSource") else context.source)
+                return self.register_behavior_buff(spec, owner=owner, source=source,
+                    blackboard=context.blackboard, parent=context.buff_instance, commit=False,
+                    finish_with_parent=bool(node.get("_isDerivedBuff"))) is not None
             definition = BuffDefinition.from_create_spec(
                 spec, blackboard=context.blackboard
             )
@@ -6916,7 +7510,8 @@ class Battle:
             return False
         container = getattr(owner, "buffs", None)
         if container is not None and hasattr(container, "finish_by_key"):
-            return bool(container.finish_by_key(key))
+            if container.finish_by_key(key):
+                return True
         boards = getattr(owner, "buff_blackboards", {})
         if key not in boards:
             return False
@@ -6938,9 +7533,14 @@ class Battle:
         if node.get("_restoreDefault"):
             mode_index = 0
         try:
-            target.mode_index = int(mode_index)
-        except (TypeError, ValueError):
+            if isinstance(mode_index, bool) or float(mode_index) != int(mode_index) or int(mode_index) < 0:
+                return False
+            mode_index = int(mode_index)
+        except (TypeError, ValueError, OverflowError):
             return False
+        if isinstance(target, _Operator):
+            return self.component_catalog.switch_operator_mode(self, target, mode_index)
+        target.mode_index = mode_index
         return True
 
     # ------------------------------------------------------------- deploy
@@ -7058,6 +7658,9 @@ class Battle:
         if op.departure_processed:
             return
         op.departure_processed = True
+        self._dispatch_component_lifecycle(op, "ON_OWNER_FINISH")
+        self._dispatch_component_lifecycle(op, "ON_BUFF_FINISH")
+        self.component_catalog.detach(op)
         respawn_scale = min([1.0] + [r.departure_respawn_scale(op) for r in effect_runtimes(self)
                                     if not r.op.dead or r.op is op])
         if op.form_runtime is not None:
@@ -7066,6 +7669,9 @@ class Battle:
             op.healing_runtime.depart()
         if op.skill_runtime is not None:
             op.skill_runtime.depart()
+        for instance in (*op.buffs.active, *op.buffs.pending_add):
+            op.buffs.finish(instance)
+        op.buffs.commit()
         for runtime in effect_runtimes(self):
             runtime.clear_angel_blessings(op)
             runtime.remove_element_aura_member(op)
@@ -7143,6 +7749,7 @@ class Battle:
 
     def _operator_deployed(self, deployed: _Operator) -> None:
         """Shared field-entry notifications, including cost-free relocation."""
+        self._dispatch_component_lifecycle(deployed, "ON_BUFF_START")
         if deployed.skill_runtime is not None:
             deployed.skill_runtime.born()
         for runtime in live_runtimes(self):
