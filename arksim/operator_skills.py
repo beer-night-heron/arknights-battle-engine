@@ -23,6 +23,9 @@ NEXT = frozenset({
     "skchr_etlchi_1", "skchr_angel_1", "skchr_skybx_1",
 })
 HEAL_ACTION = frozenset({"skchr_demkni_1", "skchr_demkni_2", "skchr_thorn2_1"})
+POST_DELAY_ATTACKS = frozenset({"skchr_horn_1", "skchr_halo2_2", "skchr_wisdel_1", "skchr_oblvns_1",
+                              "skchr_ascln_1", "skchr_phatm2_1", "skchr_ines_1", "skchr_cello_1",
+                              "skchr_svrash_1", "skchr_etlchi_1", "skchr_angel_1"})
 PERSISTENT = frozenset({"skchr_sbell2_2", "skchr_hsgma2_1", "skchr_ulpia_2",
                         "skchr_logos_1", "skchr_phatm2_2", "skchr_agoat2_1",
                         "skchr_swire2_3"})
@@ -123,10 +126,12 @@ class OperatorSkillRuntime:
         self.events = []
         self.snow = {}
         self.snow_occupants = {}
+        self.snow_effects = {}
         self.next_snow = battle.time + float(self.talent(1).get("interval", 5.5))
         self.coins = 0
         self.end_volley = None
         self.ammo_bombs = []
+        self.ammo_action_end = -1.0
         self.upkeep = battle.time + 3.0
         self.stacks = 0
         self.tokens = []
@@ -143,6 +148,8 @@ class OperatorSkillRuntime:
         self.last_damage = battle.time
         self.revive_count = 0
         self.first_hits = set()
+        self.skybx_block_at = -1.0
+        self.skybx_block_air = True
         self.remnants = {}
         self.ward_spawn_at = None
         self.ward_camouflage_sources = {}
@@ -153,6 +160,7 @@ class OperatorSkillRuntime:
         self.deck_discounts = {}
         self.deck_affected_at = {}
         self.deck_shields = {}
+        self.svrash_redeploy_cards = set()
         self.attack_speed_delta = 0.0
         self.block_delta = 0
         self.growth_block_delta = 0
@@ -186,6 +194,7 @@ class OperatorSkillRuntime:
         self.weakness_check_interval = float(weak_check.get("check_interval", 0))
         self.weakness_members = {}
         self.extra_upkeep_stacks = 0
+        self.swire_heal_at = -1.0
         self.attack_bonuses = {}
         self.penetration_stacks = 0
         self.penetration_until = -1.0
@@ -196,10 +205,14 @@ class OperatorSkillRuntime:
         self.agoat_aura_checks = {}
         self.return_at = -1.0
         self.glady_flight_target = None
+        self.glady_pull_link = None
         self.glady_landed = False
         self.glady_post_until = -1.0
         self.glady_emitted = False
         self.glady_anim_end = -1.0
+        self.ulpia_links = []
+        self.ulpia_post_until = -1.0
+        self.ulpia_anim_end = -1.0
         self._init_traits()
         battle.mechanic_diagnostics[f"OPERATOR_SKILL_TIMING_CANDIDATE:{self.sid}"] = 1
 
@@ -268,6 +281,7 @@ class OperatorSkillRuntime:
             op.elements.max_value = op.max_hp
         if self.sid == "skchr_skybx_1":
             op.air_blocking = True
+            op.liftoff = True
             op.block_radius = math.sqrt(.8)
         if op.char_id == "char_103_angel":
             self.attack_speed_delta += float(self.talent(1).get("attack_speed", 0))
@@ -336,6 +350,12 @@ class OperatorSkillRuntime:
         op, b = self.op, self.b
         if packet.normalized_damage_type() in {DamageType.HEAL, DamageType.LIFE_LOSS}:
             return
+        if (self.sid == "skchr_oblvns_1" and not op.dead and packet.source is op
+                and target in b.enemies and not target.dead and not self.free_cast()):
+            # oblvns_t_2[fever] is ON_OUTPUT_DAMAGE, rather than preparation or
+            # successful HP loss; zero/absorbed/later-cancelled output counts.
+            self.fever = min(450, self.fever + float(self.talent(2).get("cnt", 0)))
+            b.mechanic_diagnostics["SAKIKO_FEVER_OUTPUT_PHASE_CANDIDATE"] = 1
         if (op.char_id == "char_4145_ulpia" and not op.dead
                 and op.module_id == "uniequip_003_ulpia" and packet.source is op
                 and target in b.enemies and target.blocked_by is not None):
@@ -454,7 +474,7 @@ class OperatorSkillRuntime:
         sources = [p for p in b.operators if not p.dead
                    and self.has_group_tag(p, "laterano")]
         present = {e.enemy_index for e in b.enemies if b._enemy_is_attackable(e)
-                   and b._enemy_targetable(e) and not e.statuses.has(Status.CAMOUFLAGE)
+                   and b._enemy_targetable(e)
                    and e.level_type in {"ELITE", "BOSS"}
                    and any(b._enemy_intersects_range(e, p.range_cells) for p in sources)}
         self.wanted_entered = {k: v for k, v in self.wanted_entered.items() if k in present}
@@ -465,6 +485,11 @@ class OperatorSkillRuntime:
                 if self.op.target_selector is not None:
                     self.op.target_selector.mark_dirty()
         b.mechanic_diagnostics["LEMUEN_WANTED_RANGE_TIMER_PHASE_CANDIDATE"] = 1
+
+    def cello_skill_candidates(self, candidates=None):
+        # S1 requires an enemy outside any elemental break-recovery period.
+        return [e for e in (self.candidates() if candidates is None else candidates)
+                if e.elements.active_break is None]
 
     def can_cast(self):
         op = self.op
@@ -487,6 +512,8 @@ class OperatorSkillRuntime:
                 return bool(self.candidates()) or self.front_passable()
             if self.op.char_id == "char_4039_horn":
                 return self.b._search_operator_target_now(self.op) is not None
+            if self.sid == "skchr_cello_1":
+                return bool(self.cello_skill_candidates())
             return bool(self.candidates())
         return True
 
@@ -526,7 +553,7 @@ class OperatorSkillRuntime:
             if self.sid == "skchr_thorn2_1":
                 from .battle import _PendingOperatorAttack
                 target = self.heal_targets()[0]
-                extra = float(self.talent(1).get("projectile_extend", 0)) if any(p is not op and not p.dead and p.tile in op.range_cells for p in b.operators) else 0
+                extra = self.thorn_projectile_extension()
                 frame, time = b._operator_attack_deadline(op)
                 op.pending_attack = _PendingOperatorAttack(time, frame, "ALCHEMY", target, [target],
                     1, op.atk_scale, True, True, profile=AttackProfile(payload={
@@ -553,6 +580,11 @@ class OperatorSkillRuntime:
         b._apply_stat_buff(op, self.bb, timed=True,
                            duration=float(op.skill.get("duration", 0)) if self.sid in TIMED else None)
         self.interval_delta = self.value("base_attack_time")
+        if self.sid == "skchr_angel_3":
+            # Both timed buffs load BASE_ATTACK_TIME from the same blackboard:
+            # the mode-switch buff and its separate attribute buff add together.
+            self.interval_delta *= 2
+            b.mechanic_diagnostics["ANGEL_S3_INTERVAL_BUFFS_PHASE_CANDIDATE"] = 1
         self.attack_speed_delta += self.value("attack_speed")
         self.block_delta = int(self.value("block_cnt"))
         op.block_count += self.block_delta
@@ -600,6 +632,8 @@ class OperatorSkillRuntime:
             1, op.atk_scale, op.skill_active, True, profile=p, followup_frames=followups)
         b._register_ability_use(op)
         b._mark_operator_attack_started(op, not op.attack_chain_active)
+        if self.armed and self.sid in POST_DELAY_ATTACKS:
+            self.action_end = b.time + b._operator_action_duration(op)
         b._land_zero_delay_operator_attack(op)
 
     def land_state_action(self, attack):
@@ -612,6 +646,16 @@ class OperatorSkillRuntime:
         elif kind == "DECK":
             self.b.dp = min(self.b.max_cost, self.b.dp + self.value("cost"))
             self.select_deck_discount()
+
+    def thorn_projectile_extension(self):
+        # T1's profession mask 639 excludes TOKEN/TRAP; the S1 selector's
+        # mask 767 includes TOKEN. Keep duration qualification separate.
+        count = sum(unit is not self.op and not unit.dead and unit.tile in self.op.range_cells
+                    and self.b.characters.get(unit.char_id, {}).get("profession")
+                    not in {"TOKEN", "TRAP"} for unit in self.b.operators)
+        t = self.talent(1)
+        return min(float(t.get("projectile_extend_max", 0)),
+                   count * float(t.get("projectile_extend", 0)))
 
     def heal_targets(self):
         if self.sid == "skchr_thorn2_1":
@@ -629,7 +673,10 @@ class OperatorSkillRuntime:
         op, b = self.op, self.b
         if self.end_volley is not None:
             return True
-        if self.active and not self.armed and self.sid in {"skchr_skybx_1", "skchr_glady_1"}:
+        if self.active and self.sid in AMMO and self.action_end >= 0:
+            return True
+        if self.active and not self.armed and (self.sid in POST_DELAY_ATTACKS
+                or self.sid in {"skchr_skybx_1", "skchr_glady_1", "skchr_ulpia_1"}):
             return True
         if self.sid == "skchr_oblvns_1":
             if b.frame_index < (op.selector_first_search_frame or 0):
@@ -685,8 +732,6 @@ class OperatorSkillRuntime:
             p.blocked_only = True
         elif op.subprofession == "bombarder":
             p.radius = .9
-        elif op.subprofession == "skybreaker":
-            p.radius = 1.0
         elif op.subprofession == "fortress":
             p.radius = 0 if horn_melee or op.blocked else 1.1
             p.payload["horn_melee"] = horn_melee
@@ -732,6 +777,8 @@ class OperatorSkillRuntime:
     def begin_attack(self, first_attack):
         from .battle import _PendingOperatorAttack
         b, op = self.b, self.op
+        if self.active and self.sid in AMMO and self.action_end >= 0:
+            return False
         b._finish_depleted_ammo_before_attack(op)
         primary = b._current_operator_target(op)
         if primary is None:
@@ -746,9 +793,27 @@ class OperatorSkillRuntime:
                 p.payload[key] = timing[key]
         if op.subprofession == "lord" and op.blocked:
             p.payload["projectile_key"] = None
+        if op.char_id == "char_172_svrash" and (p.skill or not op.blocked):
+            # These carriers have no movement component. Their stop event
+            # hits the trace target when the fixed lifetime expires.
+            p.payload["projectile_key"] = "projectile_svrash_s1" if p.skill else "projectile_svrash"
+            p.payload["hit_on_expiry"] = .2199999988079071
+            p.payload["keep_projectile_after_departure"] = True
         if op.char_id == "char_103_angel":
             p.payload["keep_projectile_after_departure"] = True
         candidates = self.candidates()
+        if self.sid in {"skchr_glady_1", "skchr_ulpia_1"} and p.skill:
+            # DIST_TO_SOURCE_DES uses map-position distance, independently
+            # of the ordinary threat/exit selector. Equal keys keep creation
+            # order in this candidate schedule.
+            if self.sid == "skchr_ulpia_1":
+                candidates = [e for e in candidates if not b._is_airborne(e)]
+            candidates.sort(key=lambda e: (
+                -sum((e.position()[i] - op.tile[i]) ** 2 for i in (0, 1)), e.creation_index))
+            if candidates:
+                primary = candidates[0]
+            prefix = "GLADY" if self.sid == "skchr_glady_1" else "ULPIA"
+            b.mechanic_diagnostics[f"{prefix}_SKILL_DISTANCE_SELECTOR_PHASE_CANDIDATE"] = 1
         if self.sid == "skchr_halo2_2" and p.skill:
             # The first selector limits by descending distance to the exit;
             # the group then applies its ordinary ordering to that subset.
@@ -763,7 +828,7 @@ class OperatorSkillRuntime:
             if candidates:
                 primary = candidates[0]
         if self.sid == "skchr_cello_1":
-            candidates = [e for e in candidates if e.elements.active_break is not ElementType.DARK]
+            candidates = self.cello_skill_candidates(candidates)
             if not candidates:
                 return False
             primary = candidates[0]
@@ -780,8 +845,12 @@ class OperatorSkillRuntime:
             targets = [primary] + [e for e in candidates if e is not primary][:p.target_count - 1]
         if not targets:
             return False
+        if p.skill and self.sid == "skchr_ulpia_1":
+            self.ulpia_links.clear()
+            self.ulpia_post_until = self.ulpia_anim_end = -1.0
         if p.skill and self.sid == "skchr_glady_1":
             self.glady_flight_target = primary
+            self.glady_pull_link = None
             self.glady_landed = False
             self.glady_post_until = -1.0
             self.glady_emitted = False
@@ -807,9 +876,17 @@ class OperatorSkillRuntime:
         b._register_ability_use(op)
         b._mark_operator_attack_started(op, first_attack,
             timing=timing if op.char_id == "char_4039_horn" else None)
-        if p.skill and self.sid == "skchr_horn_1":
-            # This skill does not finish early at the emission event, nor wait
-            # for its projectiles to disappear. Cache the action's own duration.
+        if p.skill and self.sid in AMMO:
+            self.ammo_action_end = b.time + b._operator_action_duration(op)
+        if p.skill and self.sid == "skchr_skybx_1":
+            # CAST_START suppresses motion target-free immediately; the
+            # block-walk buff changes blocking only when its lifetime ends.
+            op.liftoff = False
+            self.skybx_block_air = False
+            self.skybx_block_at = b.time + float(timing.get("walk_block_delay", .20000000298023224))
+        if p.skill and self.sid in POST_DELAY_ATTACKS:
+            # These skills keep their post-delay after emission without waiting
+            # for projectiles to disappear. Cache each action's own duration.
             self.action_end = b.time + b._operator_action_duration(op)
         b._land_zero_delay_operator_attack(op)
         return True
@@ -842,7 +919,7 @@ class OperatorSkillRuntime:
     def refund_dead_attack_target(self, attack):
         timing = self.op.skill_attack_timing.get(self.sid, {})
         if (not self.armed or self.skill_spent <= 0 or not attack.primary.dead
-                or not timing.get("recover_sp_if_target_dead")
+                or not timing.get("recover_sp_if_target_dead", self.sid == "skchr_cello_1")
                 or any(self.b._enemy_is_attackable(e) for e in attack.targets)):
             return False
         self.b._store_sp_gain(self.op, self.skill_spent)
@@ -851,9 +928,50 @@ class OperatorSkillRuntime:
         return True
 
     def cancel_attack_sequence(self, attack):
+        if self.sid == "skchr_hsgma2_2" and attack.profile is not None and attack.profile.skill and self.armed:
+            # The three-hit attack is separate from the skill's shield ability.
+            # Its sequence does not interrupt its current sub-ability, and
+            # stopAffectOnInterrupt is false: retain the pending/emitted shield.
+            self.armed = False
+            self.b.mechanic_diagnostics["HSGMA2_SHIELD_INTERRUPT_HANDOFF_CANDIDATE"] = 1
+            return
+        if self.sid in {"skchr_glady_1", "skchr_ulpia_1", "skchr_wisdel_1"} and attack.profile is not None and attack.profile.skill and self.armed:
+            # An interrupted, un-emitted RangedAttack has no projectile left
+            # to keep affecting the skill; it consumes its charge without
+            # waiting forever for a hit callback that cannot arrive.
+            self.b._finish_skill(self.op, "ATTACK_INTERRUPTED")
+            return
+        if self.sid == "skchr_skybx_1" and attack.profile is not None and attack.profile.skill and self.armed:
+            # The sequence always advances when its Begin sub-action is
+            # interrupted; it must not keep SP blocked without an End action.
+            self.armed = False
+            self.start_skybx_return(self.b.time)
+            return
         if (attack.profile is not None and attack.profile.payload.get("sequenced")
                 and self.armed):
             self.b._finish_skill(self.op, "ATTACK_INTERRUPTED")
+
+    def set_skybx_block_mode(self, air):
+        if self.op.air_blocking != air:
+            for enemy in list(self.op.blocked):
+                self.b._release_enemy_block(enemy)
+            self.op.air_blocking = air
+
+    def start_skybx_return(self, started_at):
+        op = self.op
+        timing = op.skill_attack_timing.get(self.sid, {})
+        # Starting block-fly finishes block-walk first, including its delayed
+        # WALK callback, then restores motion target-free immediately.
+        self.set_skybx_block_mode(False)
+        op.liftoff = True
+        self.skybx_block_air = True
+        self.skybx_block_at = started_at + float(timing.get("fly_block_delay", .3499999940395355))
+        self.action_end = started_at + float(timing.get("return_duration", 1))
+        op.graphic_animation = timing.get("return_anim", "Skill_1_End")
+        op.graphic_started_at = started_at
+        op.graphic_rate = 1.0
+        self.return_at = -1.0
+        self.b.mechanic_diagnostics["SKYBX_BLOCK_MODE_AND_RETURN_PHASE_CANDIDATE"] = 1
 
     def wisdel_specs(self, skilled):
         skilled = skilled and self.sid == "skchr_wisdel_1"
@@ -1129,6 +1247,8 @@ class OperatorSkillRuntime:
         for primary in originals:
             if not b._enemy_is_attackable(primary):
                 continue
+            if p.skill and self.sid == "skchr_ines_1":
+                self.attach_ines_skill_damage(primary)
             targets = self.near(primary.position(), p.radius) if p.radius else [primary]
             for _ in range(p.hits):
                 if op.dead and not (ranged and p.payload.get("keep_projectile_after_departure")):
@@ -1161,7 +1281,7 @@ class OperatorSkillRuntime:
                         b._queue_lemuen_survivor_sp(op, enemy, float(op.trait_blackboard.get("sp", 0)))
             if p.skill:
                 hit_profile = (replace(p, payload={**p.payload, "pull_source_key": projectile_id})
-                    if self.sid == "skchr_glady_1" and projectile_id is not None else p)
+                    if self.sid in {"skchr_glady_1", "skchr_ulpia_1"} and projectile_id is not None else p)
                 self.skill_hit(primary, amount, hit_profile)
         if op.subprofession == "reaper" and op.char_id != "char_4010_etlchi":
             count = min(landed_hits, op.block_count * p.hits)
@@ -1214,6 +1334,10 @@ class OperatorSkillRuntime:
             self.add_coins(1)
 
     def attack_emitted(self, attack):
+        if self.sid == "skchr_ulpia_1" and attack.profile.skill:
+            timing = self.op.skill_attack_timing.get(self.sid, {})
+            self.ulpia_anim_end = self.op.graphic_started_at + float(
+                timing.get("attack_duration", self.op.attack_duration)) / max(self.op.graphic_rate, 1e-9)
         if self.sid == "skchr_glady_1" and attack.profile.skill:
             timing = self.op.skill_attack_timing.get(self.sid, {})
             offset = float(timing.get("pull_source_offset", .5))
@@ -1246,6 +1370,7 @@ class OperatorSkillRuntime:
                 1.0, op.atk_scale, True, True,
                 profile=AttackProfile(payload={"keep_projectile_after_departure": True,
                     "sluggish": float(talent.get("sluggish", 0)),
+                    "element_bonus_enabled": "element_atk_scale" in talent,
                     "element_amount": base_atk * float(talent.get("element_atk_scale", 0))}))
             b._new_projectile(key="projectile_chr_logos_t", side="OPERATOR", source=op,
                               target=extra, operator_attack=payload, cached_atk=amount)
@@ -1258,18 +1383,38 @@ class OperatorSkillRuntime:
         if amount is None or not self.b._enemy_is_attackable(target):
             return
         payload = projectile.operator_attack.profile.payload
-        self.damage(target, amount, attack_type=AttackType.NORMAL, apply_way=ApplyWay.RANGED)
-        if (op.module_id == "uniequip_002_logos" and target.elements.active_break is ElementType.DARK
+        self.damage(target, amount, attack_type=AttackType.NORMAL, apply_way=ApplyWay.NONE)
+        if (op.module_id == "uniequip_002_logos" and payload.get("element_bonus_enabled", False)
+                and target.elements.active_break is ElementType.DARK
                 and not target.dead):
-            self.damage(target, payload["element_amount"], "ELEMENTAL", attack_type=AttackType.ADDITION)
+            self.damage(target, payload["element_amount"], "ELEMENTAL", attack_type=AttackType.NORMAL,
+                        apply_way=ApplyWay.NONE)
         if not target.dead:
             target.statuses.apply(Status.SLUGGISH, payload["sluggish"])
 
     def skill_hit(self, enemy, amount, profile):
         b, op = self.b, self.op
-        if self.sid in {"skchr_glady_1", "skchr_ulpia_1"}:
-            if self.sid == "skchr_glady_1":
-                self.glady_landed = True
+        if self.sid == "skchr_ulpia_1":
+            # NetCatcher's first part has zero duration. Its second part uses
+            # a cached, randomized point in front of the source, not its tile.
+            # Start on the next update; native coroutine/event phase remains
+            # diagnosed separately from the component values.
+            if b._enemy_is_attackable(enemy) and not op.dead:
+                key = profile.payload.get("pull_source_key")
+                if key is None:
+                    # The explicit no-flight fallback still needs independent
+                    # source identities for its two targets.
+                    b.projectile_counter += 1
+                    key = b.projectile_counter
+                    b.mechanic_diagnostics["ULPIA_NET_NO_FLIGHT_DATA_FALLBACK"] = 1
+                origin = profile.payload.get("pull_origin")
+                if origin is None:
+                    origin = self.ulpia_pull_origin(enemy)
+                self.ulpia_links.append({"unit": enemy, "key": key, "origin": origin,
+                    "start": b.time + b.dt, "pull": None})
+            return
+        if self.sid == "skchr_glady_1":
+            self.glady_landed = True
             force = int(self.value("force"))
             if op.char_id == "char_474_glady":
                 t = self.talent(10)
@@ -1281,15 +1426,16 @@ class OperatorSkillRuntime:
                 interrupt_source=op if op.char_id == "char_474_glady" else None,
                 stop_radius=.55 if op.char_id == "char_474_glady" else None,
                 stop_within_source_block_range=op.char_id == "char_474_glady")
+            if op.char_id == "char_474_glady":
+                source_key = profile.payload.get("pull_source_key")
+                self.glady_pull_link = (enemy, source_key, enemy.pull_sources[source_key]) if pulled else None
             if pulled and op.char_id == "char_474_glady":
                 if op.trait_blackboard.get("value"):
                     self.pull_damage[enemy.enemy_index] = {"unit":enemy, "pos":enemy.position(),
-                        "distance":0.0, "next":b.time + float(op.trait_blackboard.get("interval", .066))}
+                        "distance":0.0, "next":b.time + float(op.trait_blackboard.get("interval", .066)),
+                        "source_key": source_key, "pull": enemy.pull_sources[source_key]}
         elif self.sid == "skchr_phatm2_1":
             enemy.statuses.apply(Status.BIND, self.value("unmove"))
-        elif self.sid == "skchr_ines_1":
-            b.dp = min(b.max_cost, b.dp + self.value("cost"))
-            self.add_dot(enemy, "INES", self.value("bleed_duration"), amount * self.value("bleed_atk_scale"))
         elif self.sid == "skchr_cello_1":
             b.apply_element_damage(enemy, ElementType.DARK, amount * self.value("ep_damage_ratio"), source=op)
         elif self.sid == "skchr_halo2_2":
@@ -1299,12 +1445,17 @@ class OperatorSkillRuntime:
                 target.statuses.apply(Status.STUNNED, self.value("stun_duration"))
 
     def attack_complete(self):
-        if self.armed and self.sid == "skchr_horn_1":
+        if self.sid == "skchr_oblvns_1" and self.free_cast():
+            # The Fever buff restores max SP at ON_AFTER_ATTACK with forceFlag,
+            # independently of the still-running post-delay/SP block.
+            self.b._store_sp_gain(self.op, self.op.sp_max)
+            self.b.mechanic_diagnostics["SAKIKO_FEVER_AFTER_ATTACK_SP_PHASE_CANDIDATE"] = 1
+        if self.armed and self.sid in POST_DELAY_ATTACKS:
             self.armed = False
             return
         if self.sid == "skchr_hsgma2_2":
             self.armed = False
-        if self.armed and self.sid in {"skchr_skybx_1", "skchr_glady_1"}:
+        if self.armed and self.sid in {"skchr_skybx_1", "skchr_glady_1", "skchr_ulpia_1"}:
             self.armed = False
             if self.sid == "skchr_skybx_1":
                 timing = self.op.skill_attack_timing.get(self.sid, {})
@@ -1315,7 +1466,10 @@ class OperatorSkillRuntime:
         if self.armed and self.sid != "skchr_hsgma2_2":
             self.b._finish_skill(self.op, "ATTACK_COMPLETE")
         if self.sid in AMMO and self.op.ammo is not None and self.op.ammo <= 0:
-            self.b._finish_skill(self.op, "AMMO_EXHAUSTED")
+            # Exhausting the progress does not skip the final attack's
+            # post-delay. Already emitted projectiles remain independent.
+            self.action_end = max(self.b.time, self.ammo_action_end)
+            self.b.mechanic_diagnostics["AMMO_FINAL_ACTION_FINISH_PHASE_CANDIDATE"] = 1
 
     def finish(self, reason):
         op, b = self.op, self.b
@@ -1327,11 +1481,15 @@ class OperatorSkillRuntime:
             self.begin_ammo_end()
         self.armed = self.active = False
         self.action_end = -1.0
+        self.ammo_action_end = -1.0
         self.return_at = -1.0
         self.glady_flight_target = None
+        self.glady_pull_link = None
         self.glady_post_until = -1.0
         self.glady_emitted = False
         self.glady_anim_end = -1.0
+        self.ulpia_links.clear()
+        self.ulpia_post_until = self.ulpia_anim_end = -1.0
         self.heal_spent = 0.0
         self.skill_spent = 0.0
         self.next_continuous_hit = math.inf
@@ -1347,7 +1505,9 @@ class OperatorSkillRuntime:
             self.zones = [zone for zone in self.zones if zone["kind"] != "SHIELD_ORBIT"]
             self.events = [event for event in self.events if event[1] != "SHIELD_LAUNCH"]
         if self.sid == "skchr_skybx_1":
-            op.air_blocking = True
+            self.skybx_block_at = -1.0
+            self.set_skybx_block_mode(True)
+            op.liftoff = True
         if self.sid == "skchr_kalts2_3":
             self.anchor_ready = False
         b._squad_field_signature = None
@@ -1366,6 +1526,27 @@ class OperatorSkillRuntime:
         self.dots[ident] = (target, expiries, amount, current_atk)
         interval = float(self.talent(1).get("interval", 1)) if key == "ASCLN" else 1.0
         self.dot_next.setdefault(ident, self.b.time + max(self.b.dt, interval))
+
+    def attach_ines_skill_damage(self, target):
+        b, op = self.b, self.op
+        if target.dead:
+            return
+        key = ("INES", target.enemy_index)
+        # The active buff is EXTEND with a shared character source and no
+        # snapshot replacement. Each incoming buff still runs its start cost.
+        b.dp = min(b.max_cost, b.dp + self.value("cost"))
+        owner = next((r for r in effect_runtimes(b)
+                      if key in r.dots and any(v > b.time for v in r.dots[key][1])), self)
+        old = owner.dots.get(key)
+        until = max([b.time + self.value("bleed_duration"),
+                     *(old[1] if old and any(v > b.time for v in old[1]) else [])])
+        if old is not None and any(v > b.time for v in old[1]):
+            owner.dots[key] = (target, [until], old[2], old[3])
+        else:
+            owner.dots[key] = (target, [until],
+                b.operator_attack_power(op) * self.value("bleed_atk_scale"), False)
+            owner.dot_next[key] = b.time + .8999999761581421
+        b.mechanic_diagnostics["INES_SKILL_ATTACHMENT_AND_EXTEND_PHASE_CANDIDATE"] = 1
 
     def refreshed_stack_expiries(self, expiries, duration, maximum):
         valid = [v for v in expiries if v > self.b.time]
@@ -1396,22 +1577,29 @@ class OperatorSkillRuntime:
             op.negative_hp_heal_free = op.hp <= 0 and bool(self.talent(1))
         self.tick_wanted_targets()
         self.tick_abyssal_sharing()
+        self.tick_svrash_redeploy_aura()
         self.tick_servant_queue()
         self.tick_reaper_heals()
         self.tick_module_enemy_count()
         self.tick_module_low_hp()
         self.tick_module_element_count()
         self.tick_module_pre_reborn()
-        if self.sid == "skchr_skybx_1" and self.return_at >= 0 and b.time+1e-9 >= self.return_at:
-            op.graphic_animation = op.skill_attack_timing.get(self.sid, {}).get("return_anim", "Skill_1_End")
-            op.graphic_started_at = self.return_at
-            op.graphic_rate = 1.0
-            self.return_at = -1.0
+        if self.sid == "skchr_skybx_1":
+            if self.skybx_block_at >= 0 and b.time+1e-9 >= self.skybx_block_at:
+                self.set_skybx_block_mode(self.skybx_block_air)
+                self.skybx_block_at = -1.0
+            if self.return_at >= 0 and b.time+1e-9 >= self.return_at:
+                self.start_skybx_return(self.return_at)
+                if b.time+1e-9 >= self.skybx_block_at:
+                    self.set_skybx_block_mode(True)
+                    self.skybx_block_at = -1.0
         if self.sid == "skchr_glady_1" and self.active and not self.armed:
             target = self.glady_flight_target
             in_flight = any(p.source is op and p.key == "projectile_chr_glady_s1" for p in b.projectiles)
+            link = self.glady_pull_link
             pull_finished = (target is None or target.dead or target.disappeared
-                             or not self.glady_landed or not target.unbalanced)
+                             or not self.glady_landed or not target.unbalanced
+                             or link is None or link[0].pull_sources.get(link[1]) is not link[2])
             if self.glady_emitted and not in_flight and pull_finished:
                 if self.glady_post_until < 0:
                     self.glady_post_until = b.time + float(op.skill_attack_timing.get(self.sid, {}).get("min_post_delay_after_pull", 1))
@@ -1420,8 +1608,12 @@ class OperatorSkillRuntime:
             b.mechanic_diagnostics["GLADY_CHAIN_FLIGHT_RETURN_HANDOFF_CANDIDATE"] = 1
         if self.sid == "skchr_halo2_2":
             self.tick_weakness_aura()
+        if self.sid == "skchr_ulpia_1" and self.active and not self.armed:
+            self.tick_ulpia_links()
         if self.action_end >= 0 and b.time + 1e-9 >= self.action_end and op.pending_attack is None:
-            b._finish_skill(op, "ATTACK_COMPLETE" if self.sid in NEXT else "HEAL_ACTION_COMPLETE")
+            reason = ("AMMO_EXHAUSTED" if self.sid in AMMO else
+                      "ATTACK_COMPLETE" if self.sid in NEXT else "HEAL_ACTION_COMPLETE")
+            b._finish_skill(op, reason)
         if self.sid == "skchr_sbell2_2":
             self.tick_snow()
         if self.sid == "skchr_whitw2_3":
@@ -1442,6 +1634,7 @@ class OperatorSkillRuntime:
                     self.add_coins(int(self.talent(1).get("trait_sp", 0)), upkeep=True)
         if self.sid == "skchr_lemuen_1" and not self.lemuen_bonus and b.time - op.deployed_at >= float(self.talent(2).get("interval", math.inf)):
             self.lemuen_bonus = True
+            b.mechanic_diagnostics["LEMUEN_AMMO_BONUS_TRIGGER_PHASE_CANDIDATE"] = 1
         self.tick_events()
         self.tick_end_volley()
         self.tick_ammo_bombs()
@@ -1563,7 +1756,11 @@ class OperatorSkillRuntime:
             return
         from .battle import _PendingOperatorAttack
         b, op = self.b, self.op
-        targets = self.candidates()
+        # The execute aura uses TargetOptions, without the combat camouflage
+        # filter. The independent talent/transfer RandomSelectors keep it.
+        targets = [enemy for enemy in b.enemies if b._enemy_is_attackable(enemy)
+                   and b._enemy_targetable(enemy)
+                   and b._enemy_intersects_range(enemy, op.range_cells)]
         present = {enemy.enemy_index for enemy in targets}
         self.logos_execute_checks = {i: due for i, due in self.logos_execute_checks.items() if i in present}
         interval = max(b.dt, float(b.attack_timing.get(op.char_id, {}).get(
@@ -1636,7 +1833,11 @@ class OperatorSkillRuntime:
         timing = op.skill_attack_timing.get(self.sid, {}).get("coin_end", {})
         count = self.coins
         cells = b.range_cells_from_id(timing.get("range_id", "2-4"), op.tile, op.facing)
-        marked = self.candidates(cells=cells, ground=True)
+        # Range marks use TargetOptions independently of the later combat
+        # selector. A camouflaged enemy can become eligible after marking.
+        marked = [e for e in b.enemies if b._enemy_is_attackable(e)
+                  and b._enemy_targetable(e) and not b._is_airborne(e)
+                  and b._enemy_intersects_range(e, cells)]
         marked += [e for e in op.blocked if e not in marked and b._enemy_is_attackable(e)
                    and not b._is_airborne(e)]
         hit = float(timing.get("hit_time", .4333333373069763))
@@ -1724,15 +1925,26 @@ class OperatorSkillRuntime:
                 pending.append((time, kind, target, amount)); continue
             if kind == "AFTERSHOCK":
                 self.wisdel_stop_packet(target, amount)
+            elif kind == "NECRAS_DRAGON_UPGRADE" and not self.op.dead:
+                # Each delayed ability selects the current dragon, rather
+                # than retaining a token that may already have disappeared.
+                self.upgrade_necras_dragon()
+            elif kind == "SWIRE_REVIVE_HEAL" and not self.op.dead:
+                self.swire_heal_at = -1.0
+                self.b._resolve_operator_heal(self.op, self.op,
+                    self.op.max_hp * amount, secondary=True, ignore_heal_free=True)
             elif kind == "RESTORE_RES":
                 if self.b.time + 1e-9 >= getattr(target, "logos_core_until", time):
                     target.roster_res_delta = 0.0
                     target.roster_arts_addition = 0.0
             elif kind == "AMMO_BOMB_EMIT" and not self.op.dead:
-                candidates = [e for e in target if self.b._enemy_is_attackable(e)
-                              and self.b._enemy_targetable(e) and not e.statuses.has(Status.CAMOUFLAGE)]
-                chosen = self.b.choose_random_target(candidates, source=self.op,
-                                                     mechanism="angel2_bomb_target")
+                if not target["started"]:
+                    target["chosen"] = self.select_ammo_bomb_target(target["marked"])
+                    target["started"] = True
+                    target["marked"] = []  # The cast-start cleaner removes marks.
+                chosen = target["chosen"]
+                if chosen is not None and not self.b._enemy_is_attackable(chosen):
+                    chosen = None
                 if chosen is not None:
                     origin, mount = self.b._operator_projectile_origin(self.op, "projectile_chr_angel2_t1", chosen)
                     self.b.projectile_counter += 1
@@ -1779,7 +1991,7 @@ class OperatorSkillRuntime:
                 pos = (center[0]+radius*math.sin(phase), center[1]+radius*math.cos(phase))
                 zone["pos"] = pos
                 targets = [enemy for enemy in b.enemies if b._enemy_is_attackable(enemy)
-                    and b._enemy_targetable(enemy) and not enemy.statuses.has(Status.CAMOUFLAGE)
+                    and b._enemy_targetable(enemy)
                     and (not timing.get("shield_ground_only", True) or not b._is_airborne(enemy))
                     and b._enemy_intersects_circle(enemy, pos, float(timing.get("shield_collision_radius", 1)))]
                 speed = zone.setdefault("angular_speed", float(timing.get("shield_angular_speed", 90)))
@@ -1813,16 +2025,18 @@ class OperatorSkillRuntime:
                                                  secondary=True, ignore_heal_free=True)
                 b.mechanic_diagnostics["HSGMA2_SHIELD_COLLISION_UPDATE_ORDER_CANDIDATE"] = 1
             elif zone["kind"] == "LURE_BURST":
-                for target in self.near(zone["pos"], zone["radius"]):
-                    target.statuses.apply(Status.SLUGGISH, b.dt * 2)
                 while b.time + 1e-9 >= zone["next"] and zone["next"] <= zone["end"] + 1e-9:
                     zone["next"] += self.value("interval_damage", default=.5)
-                    for target in self.near(zone["pos"], zone["radius"]):
-                        self.damage(target, zone["atk"] * self.value("atk_scale"))
+                    # These are independent buffs on the explosion's targets,
+                    # not an aura that rescans the former device position.
+                    for target in zone["targets"]:
+                        if not b._enemy_is_attackable(target):
+                            continue
                         b.apply_element_damage(target, ElementType.SANITY, zone["atk"] * self.value("ep_damage_ratio_token"), source=op)
+                        self.damage(target, zone["atk"] * self.value("atk_scale"))
 
     def select_deck_discount(self):
-        """Deterministic reserve order; ties retain squad order."""
+        """Reserve selection with explicit candidate ordering for equal costs."""
         b = self.b
         deck = [p for p in b.squad if b._active_operator(p.char_id) is None and p.char_id != self.op.char_id]
         # The eye insertion/deck ordering is not observable in existing plans.
@@ -1843,13 +2057,17 @@ class OperatorSkillRuntime:
         eye_cost = 16  # S1 fixes the reserve token's cost, independent of ordinary DP modifiers.
         candidates = [p for p in deck if cost(p) > eye_cost and
             b.characters[p.char_id].get("profession") in {"WARRIOR", "CASTER", "SNIPER"}]
-        plan = candidates[0] if candidates else min(deck, key=lambda p: abs(cost(p) - eye_cost))
+        # Each selector is a fallback: preferred right, any right, then left.
+        right = [p for p in deck if cost(p) > eye_cost]
+        plan = candidates[0] if candidates else (right[0] if right else deck[-1])
         self.deck_discount = plan.char_id
         self.deck_discounts[plan.char_id] = self.deck_discounts.get(plan.char_id, 0) + self.value("svash2_s_1[deck].cost")
         self.deck_affected_at.setdefault(plan.char_id, b.time)
         self.deck_shields[plan.char_id] = self.deck_shields.get(plan.char_id, 0) + self.op.max_hp * self.value("svash2_s_1[deck].shield")
 
     def deployed(self, unit):
+        self.svrash_redeploy_cards.discard(unit.char_id)
+        self.tick_svrash_redeploy_aura()
         self.register_abyssal_ally(unit)
         self.bless_angel_ally(unit)
         self.tick_module_element_count()
@@ -1878,15 +2096,28 @@ class OperatorSkillRuntime:
             t = self.talent(2)
             if not t:
                 return False
+            if self.swire_heal_at >= 0:
+                # The short Y-module UNDEADABLE buff remains until this
+                # entity updates it; another lethal hit does not pay again.
+                op.hp = 1.0
+                return True
             cost = abs(float(t.get("cost", -5)))
             cost = (cost + abs(float(t["cost_addition"])) * self.revive_count if "cost_addition" in t
                     else cost * float(t.get("cost_multi", 2)) ** self.revive_count)
             if b.dp >= cost:
                 b.dp -= cost; self.cost_spent(cost); self.revive_count += 1
-                op.hp = 0.0
-                b._resolve_operator_heal(op, op, op.max_hp * float(t.get("hp_ratio", 0)),
-                                         secondary=True, ignore_heal_free=True)
-                return op.hp > 0
+                # SetHpInternal clamps consumed/undeadable HP-zero attempts
+                # to one before the post-event healing action.
+                op.hp = 1.0
+                ratio = float(t.get("hp_ratio", 0))
+                if op.module_id == "uniequip_003_swire2" and op.module_level >= 2:
+                    self.swire_heal_at = b.time + .009999999776482582
+                    self.events.append((self.swire_heal_at, "SWIRE_REVIVE_HEAL", op, ratio))
+                else:
+                    b._resolve_operator_heal(op, op, op.max_hp * ratio,
+                                             secondary=True, ignore_heal_free=True)
+                b.mechanic_diagnostics["SWIRE_LETHAL_CONSUME_AND_HEAL_PHASE_CANDIDATE"] = 1
+                return True
         if self.revive_count:
             return False
         if op.char_id == "char_4039_horn":
@@ -1911,8 +2142,10 @@ class OperatorSkillRuntime:
             b._resolve_operator_heal(op, op, op.max_hp * float(t.get("hp_ratio", 0)),
                                      secondary=True, ignore_heal_free=True)
             op.statuses.apply(Status.FROZEN, float(t.get("freeze", 0)))
-            for enemy in self.candidates():
-                enemy.statuses.apply(Status.FROZEN, float(t.get("c2e_freeze", 0)))
+            for enemy in b.enemies:
+                if (b._enemy_is_attackable(enemy) and b._enemy_targetable(enemy)
+                        and b._enemy_intersects_range(enemy, op.range_cells)):
+                    enemy.statuses.apply(Status.FROZEN, float(t.get("c2e_freeze", 0)))
             return op.hp > 0
         return False
 
@@ -1956,13 +2189,16 @@ class OperatorSkillRuntime:
         self.check_low_hp_recovery()
 
     def heal_landed(self, target, amount, result):
-        if result.cancelled:
-            return
-        if self.op.char_id == "char_1016_agoat2":
-            element = target.elements.current_damaged_element
-            if element is not None:
+        # Heal's AlwaysNext runs its separate elemental action even when HP
+        # healing is cancelled. It does not use the received HP-heal delta.
+        if self.op.char_id == "char_1016_agoat2" and not target.dead:
+            for element in ElementType:
                 target.elements.recover(element, amount * float(self.op.trait_blackboard.get("ep_heal_ratio", .5)))
-        if self.op.char_id == "char_1016_agoat2" and self.talent(1):
+
+    def attach_heal_buffs(self, target):
+        # Projectile attachments precede action nodes and do not depend on
+        # the subsequent HP-heal result. Raw and secondary packets omit them.
+        if self.op.char_id == "char_1016_agoat2" and self.talent(1) and not target.dead:
             key = ("AGOAT", target.deployment_index)
             # EXTEND does not separate character sources. Keep the first
             # live buff's source/blackboard and refresh only its ATK snapshot.
@@ -1978,6 +2214,7 @@ class OperatorSkillRuntime:
             owner.dots[key] = (target, values,
                               self.b.operator_attack_power(self.op) * float(owner.talent(1).get("heal_scale", .1)), False)
             owner.dot_next.setdefault(key, self.b.time + 1.0)
+            self.b.mechanic_diagnostics["AGOAT_HEAL_ATTACHMENT_HIT_PHASE_CANDIDATE"] = 1
 
     def refund_dead_heal_target(self, attack):
         # S1's skill component requests a single refund, unlike S2's area heal.
@@ -2018,6 +2255,8 @@ class OperatorSkillRuntime:
             self.alchemy_flights.remove(flight)
 
     def depart(self):
+        # The trait's finish action clears the granted aura card buffs.
+        self.svrash_redeploy_cards.clear()
         self.op.negative_hp_heal_free = False
         self.enemy_count_bonus = False
         self.low_hp_bonus = False
@@ -2033,14 +2272,19 @@ class OperatorSkillRuntime:
         self.reaper_pending_hits = self.reaper_heal_count = 0
         self.reaper_batch_at = self.reaper_heal_at = None
         self.end_volley = None
+        self.swire_heal_at = -1.0
         self.ammo_bombs.clear()  # The bomb is explicitly managed by its source.
-        self.events = [e for e in self.events if e[1] != "AMMO_BOMB_EMIT"]
+        self.events = [e for e in self.events if e[1] not in {
+            "AMMO_BOMB_EMIT", "NECRAS_DRAGON_UPGRADE", "SWIRE_REVIVE_HEAL"}]
         if self.op.char_id == "char_4087_ines":
             for runtime in effect_runtimes(self.b):
                 if runtime is not self and runtime.op.char_id == self.op.char_id:
                     runtime.shadow_cells.clear()
             self.shadow_cells=set(self.op.base_range_cells)
         self.finish("DEPARTURE")
+        self.snow.clear()
+        self.snow_occupants.clear()
+        self.snow_effects.clear()
         self.clear_invalid_remnants(force=True)
         self.ward_spawn_at = None
         self.clear_ward_camouflage(force=True)
@@ -2088,8 +2332,7 @@ class OperatorSkillRuntime:
                     value = amount * count * (b.operator_attack_power(self.op) if current else 1)
                     if key[0] == "AGOAT":
                         b._resolve_operator_heal(self.op, unit, value, secondary=True)
-                        element = unit.elements.current_damaged_element
-                        if element is not None and not unit.statuses.has(Status.HEAL_FREE):
+                        for element in ElementType:
                             unit.elements.recover(element, value * float(self.op.trait_blackboard.get("ep_heal_ratio", .5)))
                     else:
                         self.damage(unit, value, apply_way=ApplyWay.MELEE if key[0] == "ASCLN" else ApplyWay.NONE)
@@ -2271,8 +2514,9 @@ class OperatorSkillRuntime:
             if not self.op.dead or not any(r.op.char_id == self.op.char_id and r.reveals(enemy)
                                           for r in live_runtimes(self.b)):
                 value *= 1 + float(self.talent(2).get("move_speed", 0))
-        if self.sid == "skchr_sbell2_2":
-            value *= max(0, 1 + self.snow.get(enemy.tile(), 0) * float(self.talent(1).get("move_speed", 0)))
+        if self.sid == "skchr_sbell2_2" and not self.op.dead and not self.b._is_airborne(enemy):
+            effect = self.snow_effects.get(enemy.enemy_index, {})
+            value *= max(0, 1 + effect.get("layers", 0) * float(self.talent(1).get("move_speed", 0)))
         if self.sid == "skchr_whitw2_3" and self.active and any(
                 math.dist(d["pos"], enemy.position()) <= self.value("attack@range_radius") for d in self.drones):
             value *= 1 + self.value("attack@move_speed")
@@ -2293,8 +2537,6 @@ class OperatorSkillRuntime:
                 packet = replace(packet, target_resistance_override=self.b._effective_resistance(target))
                 self.b.mechanic_diagnostics["LOGOS_T2_CALCULATE_FILTER_PHASE_CANDIDATE"] = 1
         if self.sid == "skchr_oblvns_1":
-            if not self.free_cast():
-                self.fever = min(450, self.fever + float(self.talent(2).get("cnt", 0)))
             count = min(sum(not note.dead for note in self.notes), int(self.talent(1).get("max_cnt", 10)))
             packet = replace(packet, physical_penetration_ratio=packet.physical_penetration_ratio + count * float(self.talent(1).get("def_penetrate_ratio", 0)),
                              arts_penetration_ratio=packet.arts_penetration_ratio + count * float(self.talent(1).get("magic_resist_penetrate_ratio", 0)))
@@ -2510,9 +2752,11 @@ class OperatorSkillRuntime:
             if dot and any(t > self.b.time for t in dot[1]):
                 self.b._resolve_operator_heal(self.op, self.op,
                     self.op.max_hp * float(self.talent(1).get("hp_ratio", 0)), secondary=True)
-        if self.op.char_id == "char_450_necras" and self.talent(1) and any(
-                self.b._enemy_intersects_range(enemy, unit.range_cells)
-                for unit in [self.op,*self.tokens] if not unit.dead):
+        if (self.op.char_id == "char_450_necras" and not self.op.dead and self.talent(1)
+                and (self.b._enemy_intersects_range(enemy, self.op.range_cells)
+                     or (self.op.module_id == "uniequip_002_necras" and self.op.module_level >= 2
+                         and any(not token.dead and self.b._enemy_intersects_range(enemy, token.range_cells)
+                                 for token in self.tokens)))):
             if sum(not p.dead for p in self.tokens) >= int(self.talent(1).get("max_token_cnt", 0)):
                 self.summon_servant(enemy.tile())
             else:
@@ -2530,7 +2774,7 @@ class OperatorSkillRuntime:
                 and self.has_group_tag(unit, "abyssal"))
 
     def ammo_capacity_bonus(self, target):
-        if self.op.char_id != "char_4193_lemuen" or self.b.time-self.op.deployed_at < float(self.talent(2).get("interval", math.inf)):
+        if self.op.char_id != "char_4193_lemuen" or self.op.dead or not self.lemuen_bonus:
             return 0.0
         if target is self.op:
             return float(self.talent(2).get("add_count", 0))
@@ -2538,10 +2782,74 @@ class OperatorSkillRuntime:
             return float(self.talent(2).get("ex_add_count", 0))
         return 0.0
 
+    def tick_svrash_redeploy_aura(self):
+        if self.op.char_id != "char_172_svrash" or self.op.dead or not self.talent(11):
+            return
+        # Leaving the eight surrounding cells does not remove an awarded
+        # UNTIL_NEXT_SPAWN card buff. Source departure clears the aura key.
+        for unit in self.b.operators:
+            if not unit.dead and unit is not self.op and max(
+                    abs(unit.tile[i] - self.op.tile[i]) for i in (0, 1)) <= 1:
+                self.svrash_redeploy_cards.add(unit.char_id)
+        self.b.mechanic_diagnostics["SVRASH_REDEPLOY_CARD_NOTIFICATION_CANDIDATE"] = 1
+
     def departure_respawn_scale(self, target):
-        if self.op.char_id == "char_172_svrash" and max(abs(target.tile[0]-self.op.tile[0]),abs(target.tile[1]-self.op.tile[1]))<=1:
+        if (self.op.char_id == "char_172_svrash"
+                and (target is self.op or target.char_id in self.svrash_redeploy_cards)):
             return max(0,1+float(self.talent(11).get("respawn_time", 0)))
         return 1.0
+
+    def ulpia_pull_origin(self, target):
+        b, op = self.b, self.op
+        timing = op.skill_attack_timing.get(self.sid, {})
+        direction = FACING[op.facing % 4]
+        offset = float(timing.get("pull_source_offset", .5)) + b.random_uniform(
+            0, float(timing.get("pull_random_offset", .30000001192092896)),
+            mechanism="ulpia_net_destination", source=op, target=target)
+        return tuple(op.tile[i] + offset * direction[i] for i in (0, 1))
+
+    def emit_ulpia_projectiles(self, attack):
+        b, op = self.b, self.op
+        timing = op.skill_attack_timing.get(self.sid, {})
+        for target in attack.targets:
+            if not b._enemy_is_attackable(target):
+                continue
+            profile = replace(attack.profile, payload={**attack.profile.payload,
+                "pull_origin": self.ulpia_pull_origin(target)})
+            packet = replace(attack, kind="SINGLE", primary=target, targets=[target], profile=profile)
+            b._new_projectile(key=timing.get("projectile_key", "projectile_chr_ulpia_s1"),
+                side="OPERATOR", source=op, target=target, operator_attack=packet,
+                will_hit=attack.will_hit)
+        b.mechanic_diagnostics["ULPIA_NET_FIRST_SECOND_PART_PHASE_CANDIDATE"] = 1
+
+    def tick_ulpia_links(self):
+        b, op = self.b, self.op
+        timing = op.skill_attack_timing.get(self.sid, {})
+        for entry in list(self.ulpia_links):
+            target, key = entry["unit"], entry["key"]
+            if not b._enemy_is_attackable(target):
+                self.ulpia_links.remove(entry)
+                continue
+            if entry["start"] >= 0:
+                if b.time + 1e-9 < entry["start"]:
+                    continue
+                pulled = b.apply_pull(target, *entry["origin"], int(self.value("force")),
+                    source_key=key, interrupt_source=op, stop_radius=.05,
+                    stop_after_reached=True, stop_within_source_block_range=True,
+                    duration=float(timing.get("pull_duration", 1.2999999523162842)))
+                entry["start"] = -1.0
+                entry["pull"] = target.pull_sources.get(key) if pulled else None
+            if entry["pull"] is None or target.pull_sources.get(key) is not entry["pull"]:
+                self.ulpia_links.remove(entry)
+        in_flight = any(p.source is op and p.key == "projectile_chr_ulpia_s1" for p in b.projectiles)
+        if not in_flight and not self.ulpia_links:
+            if self.ulpia_post_until < 0:
+                self.ulpia_post_until = b.time + float(timing.get("min_post_delay_after_pull", 1))
+                op.graphic_animation = "Skill_1_End"
+                op.graphic_started_at = b.time
+            if b.time + 1e-9 >= max(self.ulpia_post_until, self.ulpia_anim_end):
+                b._finish_skill(op, "PULL_COMPLETE")
+        b.mechanic_diagnostics["ULPIA_NET_FLIGHT_PULL_RETURN_HANDOFF_CANDIDATE"] = 1
 
     def tick_pull_damage(self):
         for key,entry in list(self.pull_damage.items()):
@@ -2550,16 +2858,21 @@ class OperatorSkillRuntime:
                 self.pull_damage.pop(key);continue
             position=enemy.position()
             entry["distance"]+=math.dist(position,entry["pos"]);entry["pos"]=position
-            if self.b.time+1e-9>=entry["next"] or not enemy.unbalanced:
+            # EndPulling is sent to this chain's source, even when another
+            # source or inertia still keeps the enemy unbalanced. A detached
+            # source retains the independent buff's old unbalance fallback.
+            own_finished = (not self.op.dead and "source_key" in entry
+                            and enemy.pull_sources.get(entry["source_key"]) is not entry["pull"])
+            if self.b.time+1e-9>=entry["next"] or own_finished or not enemy.unbalanced:
                 entry["next"]=self.b.time+float(self.op.trait_blackboard.get("interval",.066))
                 distance=entry["distance"]
                 amount=distance*float(self.op.trait_blackboard.get("value",0))/max(float(self.op.trait_blackboard.get("dist",1)),1e-9)
                 entry["distance"]=0
                 # DamageByDistance discards a sampled travel delta above four,
                 # rather than capping or carrying it into the next sample.
-                if 0 < amount and 0 < distance <= 4:
+                if enemy.unbalanced and 0 < amount and 0 < distance <= 4:
                     self.damage(enemy,amount,"ARTS")
-            if not enemy.unbalanced:self.pull_damage.pop(key,None)
+            if own_finished or not enemy.unbalanced:self.pull_damage.pop(key,None)
         if self.pull_damage:self.b.mechanic_diagnostics["GLADY_DISTANCE_DAMAGE_NOTIFY_CANDIDATE"]=1
 
     def tick_agoat_element_aura(self):
@@ -2700,7 +3013,7 @@ class OperatorSkillRuntime:
             return float(self.talent(2).get("atk", 0))
         if self.op.char_id == "char_1041_angel2" and target.skill_duration_type == "AMMO":
             bonus = float(self.talent(2).get("atk", 0))
-            return bonus * (float(self.talent(2).get("mult", 1)) if char.get("nationId") == "laterano" else 1)
+            return bonus * (float(self.talent(2).get("mult", 1)) if self.has_group_tag(target, "laterano") else 1)
         return 0
 
     def aura_def(self, target):
@@ -2720,6 +3033,10 @@ class OperatorSkillRuntime:
         return 0
 
     def long_road(self, cell, minimum):
+        # The native card modifier collects only tiles passing CheckPassable,
+        # including the starting tile; a platform cannot bridge two segments.
+        if not self.b._ground_passable_cell(*cell):
+            return False
         for dr, dc in ((0, 1), (1, 0)):
             count = 1
             for direction in (-1, 1):
@@ -2890,14 +3207,25 @@ class OperatorSkillRuntime:
                 self.op.max_hp * float(t.get("hp_ratio", 0)), secondary=True)
             if self.b._roll_probability(float(t.get("prob", 0)), mechanism="angel2_ammo_bomb", source=self.op, target=user):
                 successes += 1
-        # The template marks the consuming unit's range once, before casting.
-        marked = self.candidates(cells=user.range_cells)
+        # Range marking uses TargetOptions without the combat selector's
+        # camouflage/target-free exclusions. The cast then selects once.
+        marked = [e for e in self.b.enemies if self.b._enemy_is_attackable(e)
+                  and self.b._enemy_intersects_range(e, user.range_cells)] if successes else []
+        cast = {"marked": marked, "chosen": None, "started": False}
         cfg = self.b.attack_timing.get(self.op.char_id, {}).get("ammo_bomb", {})
         for index in range(successes):
             self.events.append((self.b.time + index * float(cfg.get("interval", .10000000149011612)),
-                "AMMO_BOMB_EMIT", marked, float(t.get("aoe_atk_scale", 0))))
+                "AMMO_BOMB_EMIT", cast, float(t.get("aoe_atk_scale", 0))))
         if successes:
             self.b.mechanic_diagnostics["ANGEL2_BOMB_STOP_PHASE_CANDIDATE"] = 1
+            self.b.mechanic_diagnostics["ANGEL2_BOMB_SELECTOR_AND_MARK_PHASE_CANDIDATE"] = 1
+
+    def select_ammo_bomb_target(self, marked):
+        candidates = [e for e in marked if self.b._enemy_is_attackable(e)
+                      and self.b._enemy_targetable(e) and not e.statuses.has(Status.CAMOUFLAGE)]
+        candidates.sort(key=cmp_to_key(lambda a, z: compare_operator_target_keys(
+            operator_target_key(a), operator_target_key(z))))
+        return candidates[0] if candidates else None
 
     def tick_ammo_bombs(self):
         for bomb in list(self.ammo_bombs):
@@ -2911,43 +3239,97 @@ class OperatorSkillRuntime:
     def tick_snow(self):
         b, op = self.b, self.op
         t = self.talent(1)
+        if not t or op.dead:
+            return
         gates = {p.tile for p in self.tokens if not p.dead}
         while b.time + 1e-9 >= self.next_snow:
             self.next_snow += float(t.get("interval", 5.5))
-            for cell in set(self.snow) | op.base_range_cells:
-                if b._ground_passable_cell(*cell) and cell not in gates:
-                    self.snow[cell] = min(int(t.get("max_cast_cnt", 5)), self.snow.get(cell, 0) + 1)
             if self.active:
-                cap = int(self.value("talent@max_cast_tile_count", default=20))
-                # Direction order is established; tile receiver order remains a candidate.
-                for r, col in sorted(cell for cell, layers in self.snow.items() if layers >= 5):
-                    for cell in ((r + 1, col), (r, col - 1), (r - 1, col), (r, col + 1)):
-                        if cell in self.snow or cell in gates or not b._ground_passable_cell(*cell):
-                            continue
-                        if cell not in op.base_range_cells and sum(p not in op.base_range_cells for p in self.snow) >= cap:
-                            continue
-                        self.snow[cell] = 1
-                        break
+                self.expand_snow(gates)
                 for cell, layers in list(self.snow.items()):
-                    if layers >= 5 and b.tile(*cell).get("tileKey") == "tile_end":
+                    if (layers >= int(t.get("max_cast_cnt", 5))
+                            and b.tile(*cell).get("tileKey") == "tile_end"
+                            and not any(not unit.dead and unit.tile == cell for unit in b.operators)):
                         self.freeze_gate(cell)
                         self.snow.pop(cell, None)
                         gates.add(cell)
                 b.mechanic_diagnostics["SBELL2_SNOW_EXPANSION_ORDER_CANDIDATE"] = 1
+            # CastToTarget accumulates only the cached attack range. Outside
+            # tiles gain layers from adjacent full tiles, not from this cast.
+            for cell in op.base_range_cells:
+                if self.snow_tile_valid(cell, gates):
+                    self.snow[cell] = min(int(t.get("max_cast_cnt", 5)), self.snow.get(cell, 0) + 1)
         previous = self.snow_occupants
+        for key, (enemy, cell) in previous.items():
+            if not b._enemy_is_attackable(enemy) or enemy.tile() != cell or b._is_airborne(enemy):
+                effect = self.snow_effects.pop(key, {})
+                # Only a walking receiver carrying the derived slow removes
+                # its tile listener. Losing targetability is not tile exit.
+                if effect.get("layers", 0) and not b._is_airborne(enemy):
+                    self.snow.pop(cell, None)
+                    if self.active and not enemy.dead:
+                        enemy.statuses.apply(Status.COLD, self.value("talent@cold"))
         current = {e.enemy_index: (e, e.tile()) for e in b.enemies if b._enemy_is_attackable(e)
                    and not b._is_airborne(e) and e.tile() in self.snow}
-        for key, (enemy, cell) in previous.items():
-            if key not in current or current[key][1] != cell:
-                self.snow.pop(cell, None)
-                if self.active and not enemy.dead:
-                    enemy.statuses.apply(Status.COLD, self.value("talent@cold"))
+        for key in self.snow_effects.keys() - current.keys():
+            self.snow_effects.pop(key)
         for key, (enemy, cell) in current.items():
-            if key not in previous or previous[key][1] != cell:
-                self.damage(enemy, b.operator_attack_power(op) * float(t.get("talent_magic_scale", 0)))
-            if self.active:
-                self.damage(enemy, b.operator_attack_power(op) * self.value("talent@s2_magic_scale") * b.dt)
+            valid = self.snow_target_valid(enemy)
+            if key not in self.snow_effects or key not in previous or previous[key][1] != cell:
+                self.snow_effects[key] = {"check_at": b.time + .5,
+                    "layers": self.snow[cell] if valid else 0,
+                    "dot_at": b.time + 1.0 if valid and self.active else None}
+                if valid:
+                    self.damage(enemy, b.operator_attack_power(op) * float(t.get("talent_magic_scale", 0)),
+                                attack_type=AttackType.NORMAL)
+            effect = self.snow_effects[key]
+            if b.time + 1e-9 >= effect["check_at"]:
+                effect["check_at"] += .5
+                effect["layers"] = self.snow[cell] if valid else 0
+                if not valid:
+                    effect["dot_at"] = None
+                elif self.active and effect["dot_at"] is None:
+                    effect["dot_at"] = b.time + 1.0
+            if not self.active:
+                effect["dot_at"] = None
+            elif effect["dot_at"] is not None and b.time + 1e-9 >= effect["dot_at"]:
+                effect["dot_at"] += 1.0
+                if valid and not enemy.dead:
+                    self.damage(enemy, b.operator_attack_power(op) * self.value("talent@s2_magic_scale"))
         self.snow_occupants = current
+        b.mechanic_diagnostics["SBELL2_TILE_LISTENER_NOTIFICATION_PHASE_CANDIDATE"] = 1
+
+    def snow_target_valid(self, enemy):
+        # These template checks do not use ordinary camouflage selection.
+        return not any(enemy.statuses.has(status) for status in
+                       (Status.UNTARGETABLE, Status.INVINCIBLE, Status.INVISIBLE, Status.SLEEP))
+
+    def snow_tile_valid(self, cell, gates):
+        tile = self.b.tile(*cell)
+        return (cell not in gates and self.b._ground_passable_cell(*cell)
+                and tile.get("heightType", "LOWLAND") != "HIGHLAND"
+                and tile.get("tileKey") != "tile_start")
+
+    def expand_snow(self, gates):
+        op, t = self.op, self.talent(1)
+        maximum = int(t.get("max_cast_cnt", 5))
+        additions = {}
+        for (row, col), layers in self.snow.items():
+            if layers != maximum:
+                continue
+            for cell in ((row + 1, col), (row, col - 1), (row - 1, col), (row, col + 1)):
+                if self.snow_tile_valid(cell, gates):
+                    additions[cell] = additions.get(cell, 0) + 1
+        cap = int(self.value("talent@max_cast_tile_count", default=20))
+        outside = sum(cell not in op.base_range_cells for cell in self.snow)
+        # Default S2SnowTileStruct sorts Manhattan distance, then grid x/y.
+        # Current hotfix and map coordinate boundary still need runtime evidence.
+        for cell in sorted(additions, key=lambda c: (abs(c[0] - op.tile[0]) + abs(c[1] - op.tile[1]), c[1], c[0])):
+            if cell not in self.snow and cell not in op.base_range_cells:
+                if outside >= cap:
+                    continue
+                outside += 1
+            self.snow[cell] = min(maximum, self.snow.get(cell, 0) + additions[cell])
 
     def freeze_gate(self, cell):
         b, op = self.b, self.op
@@ -3392,23 +3774,49 @@ class OperatorSkillRuntime:
                 self.medical_shields.remove(entry)
         b.mechanic_diagnostics["KALTS2_FIELD_ENTRY_PHASE_CANDIDATE"] = 1
 
+    def upgrade_necras_dragon(self):
+        unit = self.special_token
+        if unit is None or unit.dead or self.op.dead:
+            return
+        # The STACK buff adds its attributes before ON_BUFF_START heals.
+        # Unlike the ordinary token's skipModifierEvent heal, this healing
+        # packet ignores HEAL_FREE but still runs the normal heal modifiers.
+        self.upgrade_servant(unit, 1)
+        self.b._resolve_operator_heal(unit, unit,
+            unit.max_hp * self.value("attack@hp_ratio", default=.2),
+            ignore_heal_free=True, secondary=True)
+
     def necras_action(self):
         b, op = self.b, self.op
+        from .battle import _PendingOperatorAttack
         for enemy in self.candidates():
-            self.damage(enemy, b.operator_attack_power(op) * self.value("attack@atk_scale"), attack_type=AttackType.NORMAL)
+            # This is an immediate, target-mounted logical projectile. Keep
+            # its own hit/invalid-target lifecycle and the emitted identity
+            # after the skill finishes; do not invent a flight-speed delay.
+            p = AttackProfile(kind="ARTS", scale=self.value("attack@atk_scale"), skill=True,
+                payload={"sid": self.sid, "keep_projectile_after_departure": True})
+            attack = _PendingOperatorAttack(b.time, b.frame_index, "SINGLE", enemy, [enemy],
+                p.scale, op.atk_scale, True, True, profile=p)
+            b._new_projectile(key="projectile_chr_necras_s3", side="OPERATOR", source=op,
+                target=enemy, operator_attack=attack, immediate=True)
         normal = [p for p in self.tokens if not p.dead and p is not self.special_token]
         if normal and self.special_token is not None and not self.special_token.dead:
             unit = normal[0]
-            times = 2 if self.token_levels.get(unit.deployment_index, 0) else 1
+            upgraded = bool(self.token_levels.get(unit.deployment_index, 0))
+            self.upgrade_necras_dragon()
+            if upgraded:
+                self.events.append((b.time + .10000000149011612,
+                                    "NECRAS_DRAGON_UPGRADE", None, 0))
             unit.dead = unit.retreated = True
+            unit.pending_attack = None
+            unit.attack_chain_active = False
             for enemy in list(unit.blocked):
                 b._release_enemy_block(enemy)
-            for _ in range(times):
-                self.regen(self.special_token, self.special_token.max_hp * self.value("attack@hp_ratio", default=.2))
-                self.upgrade_servant(self.special_token, 1)
+            b._process_operator_departure(unit, retreated=False)
         self.stacks += 1
         if self.stacks >= int(self.value("attack@necras_s_3[attack_cnt].max_stack_cnt", default=2)):
             b._finish_skill(op, "ATTACK_COUNT_COMPLETE")
+        b.mechanic_diagnostics["NECRAS_SKILL_PROJECTILE_CONSUME_AND_UPGRADE_PHASE_CANDIDATE"] = 1
 
     def deploy_token(self, plan):
         from .operations import OperationAttempt
@@ -3455,7 +3863,7 @@ class OperatorSkillRuntime:
         if key == "token_10054_phatm2_encdool":
             self.lure_ready_at = b.time + unit.respawn_time
             self.lure = {"unit": unit, "expiry": b.time + 10, "next": b.time,
-                         "targets": set(), "atk": b.operator_attack_power(op)}
+                         "targets": set()}
         elif key == "token_10068_kalts2_mtship":
             self.anchor_ready = False
             others = sorted([p for p in b.operators if p is not op and p is not unit and not p.dead
@@ -3484,7 +3892,14 @@ class OperatorSkillRuntime:
         from .induced_movement import paths_from
         b, lure = self.b, self.lure
         unit = lure["unit"]
-        if unit.dead or b.time + 1e-9 >= lure["expiry"]:
+        if unit.dead:
+            self.finish_lure()
+            return
+        if "boom_at" in lure:
+            if b.time + 1e-9 >= lure["boom_at"]:
+                self.finish_lure()
+            return
+        if b.time + 1e-9 >= lure["expiry"]:
             self.lure_arrived(None)
             return
         if b.time + 1e-9 < lure["next"]:
@@ -3509,17 +3924,31 @@ class OperatorSkillRuntime:
     def lure_arrived(self, enemy):
         if self.lure is None:
             return
+        if self.lure["unit"].dead:
+            self.finish_lure()
+            return
+        # Boom has a fixed 0.1-second pre-delay; repeated arrivals do not
+        # restart it. Source-forced death uses the independent finish callback.
+        self.lure.setdefault("boom_at", self.b.time + .1)
+        self.b.mechanic_diagnostics["PHATM2_LURE_BOOM_NOTIFICATION_PHASE_CANDIDATE"] = 1
+
+    def finish_lure(self):
+        if self.lure is None:
+            return
         b, lure = self.b, self.lure
         unit = lure["unit"]
+        targets = self.candidates(cells=unit.range_cells)
+        cached_atk = b.operator_attack_power(self.op)
+        self.lure = None  # Guard departure callbacks from finishing twice.
         unit.dead = unit.retreated = True
         b._process_operator_departure(unit, retreated=False)
-        self.add_zone(unit.tile, self.value("buff_time", default=6), "LURE_BURST", radius=1.5)
-        self.zones[-1]["atk"] = lure["atk"]
-        self.zones[-1]["next"] = b.time + self.value("interval_damage", default=.5)
+        for target in targets:
+            target.statuses.apply(Status.SLUGGISH, self.value("sluggish", default=6))
+        self.add_zone(unit.tile, self.value("buff_time", default=6), "LURE_BURST", cells=set(unit.range_cells))
+        self.zones[-1].update(atk=cached_atk, targets=targets, next=b.time + .1)
         for target in b.enemies:
             if getattr(target, "lure_target", None) and target.lure_target[2] is self:
                 target.lure_target = None; target.induced_path = None
-        self.lure = None
 
     def tick_anchor(self):
         if self.anchor_move is None:
@@ -3584,7 +4013,8 @@ class OperatorSkillRuntime:
         if plan.tile not in self.op.range_cells:
             return OperationAttempt("skip", "outside_relocation_range")
         original = self.relocation_reserve[plan.char_id]
-        required = b.characters[plan.char_id].get("position")
+        from .loadout import deployment_position
+        required = deployment_position(b.characters[plan.char_id])
         if not b.is_buildable(*plan.tile, required):
             return OperationAttempt("skip", "not_buildable")
         if b.tile_occupied(*plan.tile):
@@ -3604,6 +4034,8 @@ class OperatorSkillRuntime:
 
     def snapshot(self):
         return {"armed": self.armed, "coins": self.coins if self.sid == "skchr_swire2_3" else None,
+                "liftoff": self.op.liftoff if self.sid == "skchr_skybx_1" else None,
+                "blockMotion": ("FLY" if self.op.air_blocking else "WALK") if self.sid == "skchr_skybx_1" else None,
                 "endVolley": ({"kind": self.end_volley["kind"], "remaining": self.end_volley["remaining"]}
                               if self.end_volley is not None else None),
                 "pendingHitFrames": ([self.op.pending_attack.execute_frame, *self.op.pending_attack.followup_frames]
@@ -3645,7 +4077,7 @@ class NecrasServantRuntime(OperatorSkillRuntime):
         super().__init__(battle, owner)
         self.next_hit = math.inf
 
-    def profile(self):
+    def profile(self, primary=None):
         return AttackProfile(kind="ARTS", target_count=max(1, self.op.block_count))
 
     def candidates(self, *, cells=None, ground=True):

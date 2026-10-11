@@ -46,10 +46,10 @@ class Whitw2S1Runtime(OperatorSkillRuntime):
                     and b.frame_index < enemy.attack_move_resume_frame)
                 or not enemy.route)
 
-    def valid_funnel_target(self, enemy, *, stationary=False):
+    def valid_funnel_target(self, enemy, *, stationary=False, locked=False):
         return (enemy is not None and self.b._enemy_is_attackable(enemy)
                 and self.b._enemy_targetable(enemy)
-                and not enemy.statuses.has(Status.CAMOUFLAGE)
+                and (locked or not enemy.statuses.has(Status.CAMOUFLAGE))
                 and (not stationary or self.stationary(enemy)))
 
     def select_funnel_target(self, index):
@@ -117,7 +117,7 @@ class Whitw2S1Runtime(OperatorSkillRuntime):
         if self.active or not attack.will_hit:
             return
         target = attack.primary
-        if not self.valid_funnel_target(target):
+        if not self.valid_funnel_target(target, locked=True):
             return
         if target is not self.normal_target:
             self.normal_target, self.normal_hits = target, 0
@@ -147,7 +147,9 @@ class Whitw2S1Runtime(OperatorSkillRuntime):
         pending = self.normal_flights
         self.normal_flights = []
         for flight in pending:
-            if self.active or not self.valid_funnel_target(flight["target"]):
+            # Collision explicitly ignores camouflage; acquisition still
+            # uses the combat selector. Do not reacquire an issued carrier.
+            if self.active or not self.valid_funnel_target(flight["target"], locked=True):
                 continue
             if b.time + 1e-9 < flight["at"]:
                 self.normal_flights.append(flight)
@@ -162,7 +164,7 @@ class Whitw2S1Runtime(OperatorSkillRuntime):
                                      next=b.time, period=None))
         for funnel in self.funnels:
             target = funnel["target"]
-            if not self.valid_funnel_target(target, stationary=True):
+            if not self.valid_funnel_target(target, stationary=True, locked=True):
                 if target is not None:
                     # StopProjectile snapshots the unused timer minus one
                     # logic tick; the ability stays active until restoration.

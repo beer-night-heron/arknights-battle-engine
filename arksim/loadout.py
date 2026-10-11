@@ -13,6 +13,17 @@ if TYPE_CHECKING:
     from .battle import OperatorPlan
 
 
+def deployment_position(char: dict[str, Any]) -> str:
+    """Hookmasters retain their trait's melee/highland placement permission."""
+    return "ALL" if char.get("subProfessionId") == "hookmaster" else str(char.get("position", "RANGED"))
+
+
+def deployment_tile_matches(position: str, buildable_type: str) -> bool:
+    if buildable_type not in {"MELEE", "RANGED"}:
+        return False
+    return position == "ALL" or buildable_type == position
+
+
 def phase_number(value: Any) -> int:
     if isinstance(value, str) and value.startswith("PHASE_"):
         value = int(value[6:])

@@ -21,6 +21,7 @@ TALENT_INDICES = {
     "char_218_cuttle": 0, "char_249_mlyss": 1, "char_298_susuro": 0,
     "char_4141_marcil": 1,
     "char_1038_whitw2": 1,
+    "char_1051_headb2": 1,
 }
 
 
@@ -187,6 +188,16 @@ class SquadEffects:
                 active = sum(skill_in_effect(op) and self.characters[op.char_id].get("teamId") == "student"
                              for op in field)
                 atk += min(extra.get("max_atk", 0.0), extra.get("init_atk", 0.0) * active)
+            elif source == "char_1051_headb2":
+                owner = next((op for op in field if op.char_id == source), None)
+                receiver = next((op for op in field if op.char_id == cid), None)
+                # S2 already stores its self share in the cast blackboard.
+                self_in_cast = cid == source and owner is not None and owner.skill_prefab_id == "skchr_headb2_2"
+                if (owner is not None and skill_in_effect(owner) and not self_in_cast
+                        and receiver is not None and receiver.statuses.targetable):
+                    scale = data.get("scale_bonus", 1.0) if char.get("teamId") == "student" else 1.0
+                    atk += data.get("atk", 0.0) * scale
+                    defense += data.get("def", 0.0) * scale
             elif source == "char_2014_nian":
                 if profession == "TANK":
                     hp += data.get("max_hp", 0.0)

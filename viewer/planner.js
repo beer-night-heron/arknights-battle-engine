@@ -4,6 +4,9 @@ const escapeText = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'
 const labels = {DEPLOY:'部署',RETREAT:'撤退',SKILL:'开技能',SKILL_END:'主动结束技能',SWITCH_MODE:'切换模式'};
 const professionNames = {PIONEER:'先锋',WARRIOR:'近卫',TANK:'重装',SNIPER:'狙击',CASTER:'术师',MEDIC:'医疗',SUPPORT:'辅助',SPECIAL:'特种'};
 const buildFields = ['char_id','elite','level','trust','potential_rank','skill_id','skill_level','module_id','module_level','auto_skill'];
+function deploymentTileMatches(position,build) {
+  return (build==='MELEE'||build==='RANGED')&&(position==='ALL'||position===build);
+}
 const freshProject = () => ({format:'arksim-plan-editor',version:1,stage:'',squad:[],operations:[],options:{spawn_timing:'fast',enemy_attack_timing:'float',seed:0,enemy_muzzle:false,enemy_turning:false}});
 const state = {project:freshProject(),catalog:null,stage:null,details:new Map(),selectedBuild:null,editIndex:null,tile:null,facing:0,preview:0,dirty:false,draftDirty:false,operationDirty:false,savedLabel:'未保存方案',running:false,revision:0,branch:null};
 const embedded=window.parent!==window;
@@ -303,10 +306,10 @@ function renderMaps() {
   for(const [id,mini] of [['miniMap',true],['mapBoard',false]]) {
     const board=$(id); if(!map){board.innerHTML='';continue;}
     board.style.gridTemplateColumns=`repeat(${map.width},minmax(0,1fr))`;board.style.setProperty('--ratio',`${map.width}/${map.height}`);
-    const units=mini?[]:plannedUnits(),member=selectedMember(),position=detailFor(member?.char_id)?.position;
+    const units=mini?[]:plannedUnits(),member=selectedMember(),detail=detailFor(member?.char_id),position=detail?.buildablePosition??detail?.position;
     const tiles=[];
     for(let r=map.height-1;r>=0;r--)for(let c=0;c<map.width;c++) {
-      const tile=map.cells[r][c],allowed=!mini&&$('opAction').value==='DEPLOY'&&tile.build===position;
+      const tile=map.cells[r][c],allowed=!mini&&$('opAction').value==='DEPLOY'&&deploymentTileMatches(position,tile.build);
       const names=units.filter(o=>o.tile?.[0]===r&&o.tile?.[1]===c);
       const unit=names.at(-1);
       const door=tile.key==='tile_start'?'RED':tile.key==='tile_end'?'BLUE':tile.key==='tile_telin'?'IN':tile.key==='tile_telout'?'OUT':'';
@@ -344,8 +347,8 @@ function operationDraft() {
   if(!op.char_id) throw new Error('请选择携带干员');
   if(action==='DEPLOY') {
     if(!state.tile) throw new Error('请在地图上选择部署格');
-    const tile=state.stage.map.cells[state.tile[0]][state.tile[1]],position=detailFor(op.char_id)?.position;
-    if(tile.build!==position) throw new Error('此干员不能部署在该格子');
+    const tile=state.stage.map.cells[state.tile[0]][state.tile[1]],detail=detailFor(op.char_id),position=detail?.buildablePosition??detail?.position;
+    if(!deploymentTileMatches(position,tile.build)) throw new Error('此干员不能部署在该格子');
     op.tile=[...state.tile];op.facing=state.facing;
   }
   if(action==='SWITCH_MODE'&&$('opMode').value!=='') op.mode=Number($('opMode').value);

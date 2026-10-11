@@ -33,6 +33,12 @@ class ShuHealing:
         if range_id:
             self.sow(self.owner, str(range_id))
 
+    def output_modifier(self, packet: Any, target: Any) -> None:
+        if packet.normalized_damage_type() is DamageType.HEAL and packet.source is self.owner:
+            # shu_t_1 listens to output, before HealFree may cancel the packet.
+            self.sow(target)
+            self.battle.mechanic_diagnostics["SHU_SOW_HEAL_OUTPUT_PHASE_CANDIDATE"] = 1
+
     def own_damage_resistance(self, kind: DamageType) -> float:
         # GUA-Y uses the nonstackable IncludePure resistance template.
         if (self.owner.module_id == "uniequip_003_shu"

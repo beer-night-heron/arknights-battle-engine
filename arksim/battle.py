@@ -63,7 +63,7 @@ from .graphics import (
     EnemyGraphicProfile, OperatorGraphicProfile, FacingRuntime, ProjectileMotionProfile, map_offset,
 )
 from .targeting import FramePeriodicTicker, TargetSelectorRuntime
-from .loadout import module_phase, resolve_plan, select_abilities
+from .loadout import deployment_position, deployment_tile_matches, module_phase, resolve_plan, select_abilities
 from .forms import MAKOTO, MakotoS3
 from .healing import SHU, SHU_S1, ShuHealing
 from .operator_skills import (SUPPORTED as ROSTER_SKILLS, TOKEN_SKILLS,
@@ -588,6 +588,9 @@ class _Operator:
     healing_runtime: ShuHealing | None = None
     skill_runtime: OperatorSkillRuntime | None = None
     air_blocking: bool = False
+    # A landing action can suppress motion target-free before its block mode
+    # changes. None preserves the existing gate for other aerial blockers.
+    liftoff: bool | None = None
     lethal_handler: Any = None
 
     @property
@@ -816,12 +819,16 @@ class Battle:
             self.mechanic_diagnostics["SHU_Y_COMBINED_CONDITION_CANDIDATE"] = 1
         if "char_249_mlyss" in self.squad_effects.boards:
             self.mechanic_diagnostics["MLYSS_FIRST_DEPLOY_COST_LIFETIME_CANDIDATE"] = 1
+        if "char_1051_headb2" in self.squad_effects.boards:
+            self.mechanic_diagnostics["HEADB2_TEAM_AURA_SKILL_EVENT_PHASE_CANDIDATE"] = 1
 
     def _sync_squad_effects(self) -> None:
         live = [op for op in self.operators if not op.dead]
         signature = tuple((op.deployment_index, skill_in_effect(op), op.tile,
                            op.char_id == "char_1045_svash2" and self.time - op.deployed_at >=
-                           float(op.talent_blackboards.get("2", {}).get("interval", 15))) for op in live)
+                           float(op.talent_blackboards.get("2", {}).get("interval", 15)),
+                           op.statuses.targetable if "char_1051_headb2" in self.squad_effects.boards else False)
+                          for op in live)
         if signature == self._squad_field_signature:
             return
         self._squad_field_signature = signature
@@ -841,7 +848,7 @@ class Battle:
             op.squad_bonus = bonus
             op.received_heal_scale = (1.0 + bonus.heal) * (
                 float(op.trait_blackboard.get("heal_scale", 1)) if op.char_id == "char_4145_ulpia" else 1)
-            immune = any(r.op.char_id == "char_1045_svash2" and r.sjerag_ally(op)
+            immune = any(r.op.char_id == "char_1045_svash2" and r.talent(2) and r.sjerag_ally(op)
                          for r in live_runtimes(self))
             if immune and Status.FROZEN not in op.statuses.immunities:
                 op.statuses.immunities.add(Status.FROZEN)
@@ -876,7 +883,8 @@ class Battle:
     def deployment_cost(self, char_id: str, base_cost: float) -> int:
         penalty = self.redeploy_penalty.get(char_id, 0)
         value = math.floor(base_cost * (1.0 + .5 * penalty) + self.squad_effects.cost_modifier(char_id))
-        discount = sum(r.deck_discounts.get(char_id, 0) for r in live_runtimes(self))
+        # UNTIL_NEXT_SPAWN card effects outlive the character that issued them.
+        discount = sum(r.deck_discounts.get(char_id, 0) for r in effect_runtimes(self))
         scale = 1.0
         carried = next((p for p in self.squad if p.char_id == char_id), None)
         if carried and carried.module_id:
@@ -1791,11 +1799,7 @@ class Battle:
         if (row, col) in self.forbidden_locations:
             return False
         tile = self.tile(row, col)
-        if tile.get("buildableType") == "NONE":
-            return False
-        if profession == "MELEE":
-            return tile.get("buildableType") == "MELEE"
-        return tile.get("buildableType") == "RANGED"
+        return deployment_tile_matches(profession, tile.get("buildableType"))
 
     def tile_occupied(self, row: int, col: int) -> _Operator | None:
         for op in self.operators:
@@ -2093,12 +2097,6 @@ class Battle:
                 pass
             elif (board or prefab not in ("#", "")) and not (op.char_id == "char_1051_headb2" and prefab in ("1", "2")):
                 self.mechanic_diagnostics[f"OPERATOR_TALENT:{op.char_id}:{index}"] += 1
-            elif op.char_id == "char_1051_headb2" and prefab == "2" and plan.skill_id:
-                # Only the S2 self bonus is executed; the team aura is not.
-                if plan.skill_id != "skchr_headb2_2" or any(
-                    item.action == "DEPLOY" and item.char_id != op.char_id for item in self.plan
-                ):
-                    self.mechanic_diagnostics[f"OPERATOR_TALENT_SCOPE:{op.char_id}:{index}"] += 1
         for part in deferred:
             if op.char_id == "char_450_necras" and plan.module_id == "uniequip_002_necras" and part.endswith(":token"):
                 self.mechanic_diagnostics["NECRAS_TOKEN_DEATH_LISTENER_CANDIDATE"] = 1
@@ -2651,6 +2649,12 @@ class Battle:
     def _skill_starting(op: _Operator) -> bool:
         return op.skill_startup_until >= 0.0
 
+    @staticmethod
+    def _skill_blocks_sp(op: _Operator) -> bool:
+        # This selected skill explicitly allows recovery while affecting.
+        return (op.skill_active and not op.skill_controls.can_switch
+                and op.skill_prefab_id != "skchr_svash2_1")
+
     def _update_operator_hp_recovery(self, op: _Operator) -> None:
         if op.dead or op.hp_recovery_frame == self.frame_index:
             return
@@ -2688,7 +2692,7 @@ class Battle:
         if op.skill is None:
             return
         recovery_was_stopped = (
-            (op.skill_active and not op.skill_controls.can_switch)
+            self._skill_blocks_sp(op)
             or self._skill_starting(op)
             or op.statuses.has(Status.SP_BLOCKED)
         )
@@ -2722,7 +2726,7 @@ class Battle:
             self._finish_skill(op, "DURATION_END")
         if (
             op.sp_type == "INCREASE_WITH_TIME"
-            and (not op.skill_active or op.skill_controls.can_switch)
+            and not self._skill_blocks_sp(op)
             and not self._skill_starting(op)
             and not op.statuses.has(Status.SP_BLOCKED)
         ):
@@ -2804,8 +2808,9 @@ class Battle:
             op.skill_runtime.cast_automatic = automatic
         if op.healing_runtime is not None and op.skill_prefab_id == SHU_S1:
             return op.healing_runtime.start_s1()
-        free_cast = op.skill_runtime is not None and op.skill_runtime.free_cast()
-        if not no_charge and not free_cast:
+        # Fever may cast without enough SP, but still spends any stored SP;
+        # its forced after-attack recovery is a separate notification.
+        if not no_charge:
             op.sp = max(0.0, op.sp - self._skill_cost(op))
         if op.skill_controls.can_switch:
             op.skill_mode_target = 1 - op.skill_mode
@@ -2946,7 +2951,7 @@ class Battle:
     def _gain_sp(self, op: _Operator, amount: float) -> float:
         if (
             amount <= 0
-            or (op.skill_active and not op.skill_controls.can_switch)
+            or self._skill_blocks_sp(op)
             or self._skill_starting(op)
             or op.statuses.has(Status.SP_BLOCKED)
         ):
@@ -3155,7 +3160,11 @@ class Battle:
         timing = self.attack_timing.get(op.char_id, {})
         if op.skill_active:
             timing = op.skill_attack_timing.get(op.skill_prefab_id, timing)
-        profile = AttackProfile(payload={"ignore_heal_free": True}) if timing.get("ignore_heal_free") else None
+        flags = {"ignore_heal_free": True} if timing.get("ignore_heal_free") else {}
+        if op.char_id == "char_1016_agoat2" and op.skill_active and op.skill_prefab_id == "skchr_agoat2_1":
+            # S1's own Heal selector runs at emission; ordinary Heal locks at start.
+            flags["reselect_heal_count"] = 2
+        profile = AttackProfile(payload=flags) if flags else None
         op.pending_attack = _PendingOperatorAttack(
             execute_at, execute_frame, "HEAL", targets[0], targets, scale,
             op.atk_scale, op.skill_active and not op.skill_controls.can_switch, True,
@@ -3165,8 +3174,11 @@ class Battle:
         self._land_zero_delay_operator_attack(op)
 
     def _resolve_operator_heal(self, op: _Operator, target: _Operator, amount: float,
-                               *, secondary: bool = False, ignore_heal_free: bool = False) -> Any:
+                               *, secondary: bool = False, ignore_heal_free: bool = False,
+                               ability_heal: bool = False) -> Any:
         self._sync_squad_effects()
+        if ability_heal and op.skill_runtime is not None:
+            op.skill_runtime.attach_heal_buffs(target)
         output_scale = 1.0
         if op.module_id in {"uniequip_002_shu", "uniequip_002_demkni"}:
             if target.hp / target.max_hp < float(op.trait_blackboard.get("hp_ratio", 0)):
@@ -3174,10 +3186,9 @@ class Battle:
         result = apply_damage(DamagePacket(amount=amount, damage_type=DamageType.HEAL,
                                           source=op, output_scale=output_scale,
                                           ignore_heal_free=ignore_heal_free), target,
-                              on_output=op.skill_runtime.output_modifier if op.skill_runtime else None)
-        if op.healing_runtime is not None and not result.cancelled:
-            op.healing_runtime.sow(target)
-        if op.skill_runtime is not None and not secondary:
+                              on_output=(op.healing_runtime.output_modifier if op.healing_runtime else
+                                         op.skill_runtime.output_modifier if op.skill_runtime else None))
+        if ability_heal and op.skill_runtime is not None and not secondary:
             op.skill_runtime.heal_landed(target, amount, result)
         return result
 
@@ -3487,6 +3498,10 @@ class Battle:
         if attack.kind == "HEAL":
             amount = self.operator_attack_power(op, attack.source_atk_scale) * attack.attack_scale
             healing_flags = attack.profile.payload if attack.profile else {}
+            if healing_flags.get("reselect_heal_count"):
+                targets = self._operator_heal_targets(op, include_element_damage=True)
+                attack = replace(attack, targets=targets[:int(healing_flags["reselect_heal_count"])])
+                self.mechanic_diagnostics["AGOAT_HEAL_SELECTOR_EVENT_PHASE_CANDIDATE"] = 1
             timing = (op.skill_attack_timing.get(op.skill_prefab_id, {}) if op.skill_active else
                       self.attack_timing.get(op.char_id, {}))
             key = timing.get("heal_projectile_key")
@@ -3504,7 +3519,7 @@ class Battle:
                         self.mechanic_diagnostics["HEAL_PROJECTILE_CURVE_AND_HIT_PHASE_CANDIDATE"] = 1
                     else:
                         self._resolve_operator_heal(op, target, amount,
-                            ignore_heal_free=bool(healing_flags.get("ignore_heal_free")))
+                            ignore_heal_free=bool(healing_flags.get("ignore_heal_free")), ability_heal=True)
                 elif op.healing_runtime is not None:
                     op.healing_runtime.refund_dead_target()
                 elif op.skill_runtime is not None:
@@ -3524,7 +3539,8 @@ class Battle:
             if primary_valid:
                 op.skill_runtime.attack_emitted(attack)
             key = attack.profile.payload.get("projectile_key", op.projectile_key)
-            if primary_valid and self._projectile_speed(key) is not None:
+            if primary_valid and (self._projectile_speed(key) is not None
+                                  or "hit_on_expiry" in attack.profile.payload):
                 self._emit_operator_projectiles(op, attack)
             elif op.skill_runtime is not None:
                 op.skill_runtime.land(attack)
@@ -3595,8 +3611,10 @@ class Battle:
         cached_atk: float | None = None,
         mount_point: str | None = None,
         origin_override: tuple[float, float, float] | None = None,
+        immediate: bool = False,
+        hit_on_expiry: float | None = None,
     ) -> None:
-        speed = self._projectile_speed(key)
+        speed = 0.0 if immediate or hit_on_expiry is not None else self._projectile_speed(key)
         if speed is None:
             return
         if isinstance(source, _Operator):
@@ -3636,6 +3654,10 @@ class Battle:
         self.projectile_counter += 1
         lifecycle = (dict(self.attack_timing.get(source.char_id, {}).get(
             "projectile_lifecycle", {}).get(key, {})) if isinstance(source, _Operator) else {})
+        if hit_on_expiry is not None:
+            lifecycle.update(lifetime=hit_on_expiry, no_movement=True,
+                             stop_when_source_invalid=False, always_hit_in_end=True)
+            self.mechanic_diagnostics["OPERATOR_FIXED_LIFETIME_HIT_PHASE_CANDIDATE"] = 1
         birth_delay = 0.0
         if lifecycle.get("random_birth_delay", 0) > 0:
             birth_delay = self.random_uniform(0, lifecycle["random_birth_delay"],
@@ -3651,9 +3673,9 @@ class Battle:
                 side=side,
                 source=source,
                 target=target,
-                position_row=source_row,
-                position_col=source_col,
-                position_z=source_z,
+                position_row=target_row if immediate else source_row,
+                position_col=target_col if immediate else source_col,
+                position_z=target_z if immediate else source_z,
                 motion_profile=profile,
                 launched_at=self.time,
                 operator_attack=operator_attack,
@@ -3666,6 +3688,7 @@ class Battle:
                 lifecycle=lifecycle,
                 last_destination=(target_row, target_col, target_z),
                 born_at=self.time + birth_delay,
+                impact_at=self.time if immediate else None,
                 fixed_destination=((target_row, target_col, target_z)
                                    if lifecycle.get("fixed_endpoint") else None),
             )
@@ -3801,6 +3824,10 @@ class Battle:
                 and attack.profile.skill and op.skill_runtime is not None):
             op.skill_runtime.emit_skybx_skill_projectile(attack)
             return
+        if (attack.profile is not None and attack.profile.skill
+                and attack.profile.payload.get("sid") == "skchr_ulpia_1"):
+            op.skill_runtime.emit_ulpia_projectiles(attack)
+            return
         key = (attack.profile.payload.get("projectile_key", op.projectile_key)
                if attack.profile is not None else op.projectile_key)
         if not key:
@@ -3835,6 +3862,8 @@ class Battle:
                 target=enemy,
                 operator_attack=payload,
                 will_hit=attack.will_hit,
+                hit_on_expiry=(attack.profile.payload.get("hit_on_expiry")
+                               if attack.profile is not None else None),
             )
 
     def _land_hammer_attack(
@@ -3846,6 +3875,7 @@ class Battle:
             enemy
             for enemy in self.enemies
             if self._enemy_is_attackable(enemy)
+            and not (op.char_id == "char_1051_headb2" and self._is_airborne(enemy))
             and self._enemy_intersects_circle(
                 enemy, target_position, radius=radius
             )
@@ -4244,6 +4274,9 @@ class Battle:
             if source_invalid or (lifetime is not None and self.time - start + 1e-9 >= lifetime):
                 self._expire_operator_projectile(projectile, wisdel=wisdel)
                 continue
+            if rules.get("no_movement"):
+                active.append(projectile)
+                continue
             if projectile.impact_at is not None:
                 if self.time + 1e-9 >= projectile.impact_at:
                     self._projectile_lands(projectile)
@@ -4361,7 +4394,8 @@ class Battle:
             self._resolve_operator_heal(projectile.source, projectile.target,
                 projectile.cached_atk if projectile.cached_atk is not None else
                 self.operator_attack_power(projectile.source, attack.source_atk_scale) * attack.attack_scale,
-                ignore_heal_free=bool(attack.profile and attack.profile.payload.get("ignore_heal_free")))
+                ignore_heal_free=bool(attack.profile and attack.profile.payload.get("ignore_heal_free")),
+                ability_heal=True)
             return
         if attack.kind == "LOGOS_TALENT":
             projectile.source.skill_runtime.land_talent_projectile(projectile)
@@ -4373,7 +4407,7 @@ class Battle:
             return
         if attack.profile is not None and projectile.source.skill_runtime is not None:
             pull_source = ({"projectile_id": projectile.projectile_id}
-                           if projectile.source.char_id == "char_474_glady" else {})
+                           if projectile.source.char_id in {"char_474_glady", "char_4145_ulpia"} else {})
             projectile.source.skill_runtime.land(attack, target=projectile.target, ranged=True,
                 **pull_source)
             return
@@ -4450,6 +4484,7 @@ class Battle:
                                               "apply_way": str(getattr(packet.apply_way, "value", packet.apply_way))})
         runtime = getattr(target, "skill_runtime", None)
         source_runtime = getattr(packet.source, "skill_runtime", None)
+        source_healing = getattr(packet.source, "healing_runtime", None)
         if source_runtime is None:
             summoner = getattr(packet.source, "summoner", None)
             if summoner is not None and summoner.char_id == "char_450_necras":
@@ -4482,7 +4517,8 @@ class Battle:
                 packet = replace(packet, damage_resistance=resistance)
         result = apply_damage(packet, target, roll=self._roll_probability, roll_labeled=labeled,
             on_calculate=source_runtime.calculate_damage_modifier if source_runtime is not None else None,
-            on_output=source_runtime.output_modifier if source_runtime is not None else None,
+            on_output=(source_healing.output_modifier if source_healing is not None else
+                       source_runtime.output_modifier if source_runtime is not None else None),
             on_taking_damage=runtime.taking_damage_modifier if runtime is not None else None,
             before_apply=source_runtime.before_apply_damage
                 if source_runtime is not None else None)
@@ -4695,6 +4731,8 @@ class Battle:
         if target is None or not self._enemy_is_attackable(target):
             return False
         if not self._enemy_targetable(target):
+            return False
+        if op.char_id == "char_1051_headb2" and self._is_airborne(target):
             return False
         if op.char_id == "char_4039_horn" and self._is_airborne(target):
             return False
@@ -4979,7 +5017,7 @@ class Battle:
                 continue
             if not op.statuses.targetable or op.statuses.has(Status.CAMOUFLAGE):
                 continue
-            if op.air_blocking and not self._is_airborne(enemy):
+            if (op.air_blocking if op.liftoff is None else op.liftoff) and not self._is_airborne(enemy):
                 continue
             dist = math.hypot(op.tile[0] - r, op.tile[1] - c)
             if dist <= enemy.range_radius + OPERATOR_HITBOX_RADIUS + 1e-9:
@@ -6178,6 +6216,7 @@ class Battle:
         *, interrupt_source: _Operator | None = None, source_key: int | None = None,
         stop_radius: float | None = None, stop_after_reached: bool = False,
         stop_within_source_block_range: bool = False,
+        duration: float = 1.0,
     ) -> bool:
         if enemy.dead or enemy.disappeared or self._is_airborne(enemy):
             return False
@@ -6193,7 +6232,7 @@ class Battle:
         if source_key is None and None in enemy.pull_sources:
             self.mechanic_diagnostics["PULL_STACK:SOURCE_ID_MISSING"] = 1
         enemy.pull_sources[source_key] = _PullForce(float(origin_row), float(origin_col), distance,
-            PULL_FORCE_BY_FORCE_LEVEL[effective_level], 0.5 if effective_level < -1 else 1.0,
+            PULL_FORCE_BY_FORCE_LEVEL[effective_level], duration * (0.5 if effective_level < -1 else 1.0),
             interrupt_source, stop_radius, stop_after_reached,
             stop_within_source_block_range=stop_within_source_block_range)
         if stop_radius is not None:
@@ -7072,7 +7111,7 @@ class Battle:
         base_cost = int(attrs.get("cost", 0))
         cost = self.deployment_cost(plan.char_id, base_cost)
         row, col = plan.tile
-        profession = str(self.characters[plan.char_id].get("position", "RANGED"))
+        profession = deployment_position(self.characters[plan.char_id])
         details = {"tile": list(plan.tile), "cost": cost, "available_cost": self.dp,
                    "cost_lower_bound": self.cost_lower_bound,
                    "occupied_slots": sum(1 for op in self.operators if not op.dead and getattr(op, "uses_deployment_slot", True)),
@@ -7108,6 +7147,7 @@ class Battle:
             deployed.skill_runtime.born()
         for runtime in live_runtimes(self):
             runtime.deployed(deployed)
+        for runtime in effect_runtimes(self):
             shield = runtime.deck_shields.pop(deployed.char_id, None)
             if shield:
                 deployed.damage_rules.append(DamageRule("BARRIER", value=shield))

@@ -7,7 +7,7 @@ from typing import Any
 
 from . import data as D
 from .cli import parse_plan, resolve_level_file
-from .loadout import resolve_plan
+from .loadout import deployment_position, deployment_tile_matches, resolve_plan
 from .skill_controls import skill_controls
 from .squad import BUILD_FIELDS
 from .runes import select_stage_runes, forbidden_locations
@@ -48,6 +48,7 @@ class EditorData:
                 stages.append({"id": key, "code": value.get("code") or key,
                                "name": value.get("name") or key, "difficulty": value.get("difficulty")})
         operators = [{"id": k, "name": v.get("name", k), "position": v.get("position"),
+                      "buildablePosition": deployment_position(v),
                       "profession": v.get("profession"), "rarity": v.get("rarity")}
                      for k, v in self.characters.items() if k.startswith("char_")]
         return {"stages": stages, "operators": operators}
@@ -104,6 +105,7 @@ class EditorData:
                             "unlock": {"phase": meta.get("unlockEvolvePhase", 0),
                                        "level": meta.get("unlockLevel", 1)}, "trust": trust})
         return {"id": key, "name": char.get("name", key), "position": char.get("position"),
+                "buildablePosition": deployment_position(char),
                 "maxLevels": [p.get("maxLevel", 1) for p in char.get("phases", [])],
                 "maxPotential": char.get("maxPotentialLevel", 0), "skills": skills, "modules": modules,
                 "defaultModuleId": CARRIED_MODULE_DEFAULTS.get(key),
@@ -179,8 +181,8 @@ class EditorData:
                     grid = stage["map"]
                     if not (r < grid["height"] and c < grid["width"]):
                         raise ValueError("部署坐标超出地图")
-                    required = self.characters[key].get("position")
-                    if grid["cells"][r][c]["build"] != required:
+                    required = deployment_position(self.characters[key])
+                    if not deployment_tile_matches(required, grid["cells"][r][c]["build"]):
                         raise ValueError("此干员不能部署在所选格子")
                 elif item.action in ("SKILL", "SKILL_END", "SWITCH_MODE"):
                     build = builds[key]
