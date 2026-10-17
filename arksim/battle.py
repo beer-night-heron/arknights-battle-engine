@@ -39,15 +39,23 @@ from .behavior import (
     BehaviorInterpreter,
     rounded_sp_ratio,
     registered_buff_spec_issue,
+    read_blackboard_value,
+    contains_entity_value_read,
     node_name,
+    ABNORMAL_READ_FLAGS,
     resolve_behavior_template,
 )
-from .buffs import BuffCatalog, BuffContainer, BuffDefinition, BuffInstance
-from .behavior_components import ComponentCatalog, ComponentListener, module_resources, CALCULATE, OUTPUT
+from .buffs import BuffCatalog, BuffContainer, BuffDefinition, BuffInstance, calculate_attribute, element_break_buff_keys
+from .health import gain_hp
+from .buff_database import BuffDatabase
+from .vision import blind_tile
+from .behavior_components import ComponentCatalog, ComponentListener, module_resources, numeric_issue, CALCULATE, OUTPUT
+from .behavior_preview import BuffAttributePreview
 from .mechanics import (
     ApplyWay,
     AttackType,
     DamagePacket,
+    DamageResult,
     DamageRule,
     DamageType,
     ElementController,
@@ -78,6 +86,11 @@ from .induced_movement import temporary_move
 from .funnels import WHITW2_S1, Whitw2S1Runtime
 from .runes import blackboard as rune_blackboard, forbidden_locations, select_runes
 from .squad import SquadBonus, SquadEffects, resolve_squad, skill_in_effect
+from .vecbreak import VecBreakRuntime, predefined_builds, normalize_predefined, TRAP as VEC_TRAP
+from .mansfield import MansfieldRuntime, DEVICE as MANSFIELD_DEVICE
+from .cw import CwRuntime
+from .wdex import WdExRuntime
+from .dublin import DublinRuntime
 from .operations import OperationAttempt, OperationLog
 from .waves import DynamicWaveScheduler, SpawnFragment
 from .spawn_core import PREVIEW_CURSOR_COUNT, PREVIEW_CURSOR_INTERVAL
@@ -170,6 +183,7 @@ class SpawnEvent:
     enemy_key: str
     route_index: int
     wave_start_time: float = 0.0
+    fragment_start_time: float = 0.0
     nominal_time: float = 0.0
     scheduler_delay_frames: int = 0
     logic_frame: int | None = None
@@ -311,6 +325,7 @@ class _Enemy:
     dont_block_wave: bool = False
     block_fragment: bool = False
     attack_duration: float = 0.0
+    not_count_in_total: bool = False
     attack_hit_time: float = 0.0
     wait_for_attack_event: bool = False
     projectile_key: str | None = None
@@ -401,10 +416,20 @@ class _Enemy:
     mode_index: int = 0
     shell_active: bool = False
     shell_reflect: float = 0.0
+    registered_max_hp_base: float | None = None
+    attribute_steals: dict[str, dict[int, tuple[Any, float]]] = field(default_factory=dict)
+    position_jump_index: int = 0
+    sanity_bind_bonuses: dict[int, tuple[float, float]] = field(default_factory=dict)
+    extra_hp: float = 0.0
+    max_extra_hp_ratio: float = 0.0
+    minus_hp: float = 0.0
+    max_minus_hp_ratio: float = 0.0
+    negative_hp_heal_free: bool = False
     enemy_tags: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         self.buffs.owner = self
+        self.statuses.base_motion_flying = self.motion.upper() in {"FLY", "FLYING"}
 
     def tile(self) -> tuple[int, int]:
         return (
@@ -460,6 +485,7 @@ class _Projectile:
     last_destination: tuple[float, float, float] | None = None
     born_at: float | None = None
     behavior_payload: dict[str, Any] | None = None
+    enemy_attack_context: dict[str, Any] | None = None
 
     def position(self) -> tuple[float, float]:
         return self.position_row, self.position_col
@@ -507,6 +533,8 @@ class _Operator:
     attack_cd_interval: float = 0.0
     dead: bool = False
     elemental_resistance: float = 0.0
+    extra_hp: float = 0.0
+    max_extra_hp_ratio: float = 0.0
     taunt_level: int = 0
     creation_index: int = 0
     update_priority: int = 0
@@ -543,6 +571,8 @@ class _Operator:
     hp_recovery_remaining: float = 0.0
     hp_recovery_frame: int = -1
     negative_hp_heal_free: bool = False
+    minus_hp: float = 0.0
+    max_minus_hp_ratio: float = 0.0
     base_range_cells: set[tuple[int, int]] = field(default_factory=set)
     deployed_at: float = 0.0
     death_time: float | None = None
@@ -561,6 +591,8 @@ class _Operator:
     skill_type: str = ""
     skill_controls: SkillControls = field(default_factory=SkillControls)
     skill_mode: int = 0
+    skill_progress_locked: bool = False
+    skill_progress_remaining: float | None = None
     skill_mode_target: int | None = None
     skill_duration_type: str = "NONE"
     skill_active: bool = False
@@ -579,6 +611,7 @@ class _Operator:
     behavior_template_key: str | None = None
     behavior_active: bool = False
     skill_prefab_id: str = ""
+    skill_index: int | None = None
     behavior_trigger_count: int = 0
     behavior_next_trigger_at: float = -1.0
     behavior_finish_dispatched: bool = False
@@ -598,6 +631,7 @@ class _Operator:
     selector_pause_until_frame: int | None = None
     base_max_hp: float = 0.0
     max_hp_final_scale: float = 1.0
+    registered_max_hp_active: bool = False
     base_attack_speed: float = 100.0
     squad_bonus: SquadBonus = field(default_factory=SquadBonus)
     received_heal_scale: float = 1.0
@@ -664,6 +698,8 @@ class Battle:
         random_tape: dict | None = None,
         module_context: dict[str, Any] | None = None,
         behavior_components: dict[str, Any] | None = None,
+        element_break_data: dict[str, Any] | None = None,
+        buff_database: dict[str, Any] | None = None,
     ) -> None:
         if "selectedDifficulty" not in level:
             level = select_runes(level)
@@ -693,18 +729,31 @@ class Battle:
         for rune in level.get("runes", []):
             if rune.get("key") not in supported_runes:
                 self.mechanic_diagnostics[f"STAGE_RUNE_UNIMPLEMENTED:{rune.get('key')}"] = 1
+        self.buff_database = BuffDatabase(D.load_buff_database() if buff_database is None and D.DATA_DIR is not None
+                                          else buff_database)
         self.behavior = BehaviorInterpreter(
             behavior_templates,
             strict=strict_behaviors,
             diagnostics=self.behavior_diagnostics,
+            buff_database=self.buff_database,
         )
         self.battle_equips = battle_equips or {}
         self.component_catalog = ComponentCatalog(behavior_components)
         self.component_status: list[dict[str, Any]] = []
         self.projectile_data = projectile_data or {}
+        element_break_data = (D.load_element_break_buffs() if element_break_data is None and D.DATA_DIR is not None
+                              else {} if element_break_data is None else element_break_data)
+        self.element_break_buff_keys = element_break_buff_keys(element_break_data)
+        self.element_break_durations = {key: (float(entry["elementBreakDuration"]),
+            float(entry["enemyElementBreakDuration"])) for key, entry in element_break_data.items()}
+        if not element_break_data:
+            self.mechanic_diagnostics["EP_BREAK_BUFF_DIRECTORY_MISSING"] = 1
         if buff_abilities is None and D.DATA_DIR is not None:
             buff_abilities = D.load_enemy_buff_abilities()
         self.buff_catalog = BuffCatalog.from_dict(buff_abilities)
+        self.buff_catalog.definitions = {key: replace(item, element_break=True)
+            if key in self.element_break_buff_keys else item
+            for key, item in self.buff_catalog.definitions.items()}
         self.projectile_speeds: dict[str, float] = {
             str(key): float(value)
             for key, value in self.projectile_data.get("speeds", {}).items()
@@ -718,13 +767,13 @@ class Battle:
         resolved_plan = []
         for index, item in enumerate(plan, 1):
             try:
-                resolved_plan.append(resolve_plan(item, self.characters, self.skills,
+                resolved_plan.append(resolve_plan(normalize_predefined(item, level), self.characters, self.skills,
                                                    self.battle_equips, self.module_index, self.favor_table))
             except ValueError as error:
                 raise ValueError(f"plan item {index}: {error}") from error
         self.plan = sorted(resolved_plan, key=lambda p: p.time)
         self.squad, ambiguous = resolve_squad(self.plan, squad, self.characters, self.skills,
-                                              self.battle_equips, self.module_index, self.favor_table)
+                                              self.battle_equips, self.module_index, self.favor_table, set(predefined_builds(level)))
         for cid in ambiguous:
             self.mechanic_diagnostics[f"SQUAD_INFERRED_BUILD_AMBIGUOUS:{cid}"] = 1
         self.squad_effects = SquadEffects(self.squad, self.characters, self.battle_equips)
@@ -804,6 +853,7 @@ class Battle:
             tuple[tuple[int, int], bool],
             dict[tuple[int, int], tuple[int, int]],
         ] = {}
+        self.dublin = DublinRuntime(self)
         self.routes = self._build_routes(level.get("routes", []))
         self.paths = self._routes_to_paths(self.routes)
         self.spawn_events = self._build_spawn_events(level.get("waves", []))
@@ -833,6 +883,15 @@ class Battle:
         self.targeting_diagnostics: list[dict[str, Any]] = []
         self._targeting_diagnostic_index: dict[tuple[int, int], int] = {}
         self._targeting_first_in_range: dict[tuple[int, int], int] = {}
+        self.vecbreak = VecBreakRuntime(self)
+        self.mansfield = MansfieldRuntime(self)
+        self.wdex = WdExRuntime(self)
+        self.cw = CwRuntime(self)
+        self.mansfield.initialize_devices()
+        self.dublin.initialize()
+        self.initial_passable_cells = frozenset((row, col)
+            for row, cells in enumerate(self.map_grid) for col in range(len(cells))
+            if self._ground_passable_cell(row, col))
         for cid in self.squad_effects.boards:
             if self.squad_effects.partial_talent(cid):
                 self.mechanic_diagnostics[f"OPERATOR_TALENT_PARTIAL:{cid}"] = 1
@@ -855,17 +914,7 @@ class Battle:
         self._squad_field_signature = signature
         for op in live:
             bonus = self.squad_effects.bonus(op.char_id, op.base_cost, live)
-            maximum = op.base_max_hp * (1.0 + bonus.max_hp +
-                                        (op.form_runtime.hp_bonus if op.form_runtime else 0) +
-                                        (op.skill_runtime.hp_bonus if op.skill_runtime else 0) +
-                                        sum(r.aura_hp(op) for r in live_runtimes(self)) +
-                                        float(getattr(op, "roster_hp_bonus", 0))) * op.max_hp_final_scale
-            if maximum != op.max_hp:
-                ratio = op.hp / op.max_hp if op.max_hp > 0 else 0.0
-                op.max_hp = maximum
-                op.hp = min(maximum, ratio * maximum)
-                if not (op.skill_runtime and op.char_id == "char_1044_hsgma2"):
-                    op.hp = max(0.0, op.hp)
+            self._set_maximum_hp(op, self._operator_maximum_hp(op, bonus))
             op.squad_bonus = bonus
             op.received_heal_scale = (1.0 + bonus.heal) * (
                 float(op.trait_blackboard.get("heal_scale", 1)) if op.char_id == "char_4145_ulpia" else 1)
@@ -878,26 +927,96 @@ class Battle:
                 op.statuses.immunities.discard(Status.FROZEN)
                 op.roster_freeze_immunity_added = False
 
-    def operator_attack_power(self, op: _Operator, scale: float | None = None) -> float:
-        self._sync_squad_effects()
+    def operator_attack_power(self, op: _Operator, scale: float | None = None, *, synchronize: bool = True,
+                              modifiers=None) -> float:
+        if synchronize:
+            self._sync_squad_effects()
         runtime = op.skill_runtime
-        return (op.atk + (runtime.flat_attack() if runtime else 0)) * (
+        modifiers = op.buffs.modifiers("ATK", registered_only=True) if modifiers is None else modifiers
+        # Stage base-attribute bonuses precede the ordinary skill/team pools.
+        base_atk = op.atk * (1.0 + float(getattr(op, "mode_base_atk_bonus", 0)))
+        return max(calculate_attribute(base_atk,
+            modifiers, multiplier=(
             (op.atk_scale if scale is None else scale) + op.squad_bonus.atk
             + (op.form_runtime.atk_bonus if op.form_runtime else 0)
             + (runtime.attack_bonus() if runtime else 0)
             + float(getattr(op, "roster_atk_bonus", 0))
-            + sum(m.value for m in op.buffs.modifiers("ATK", registered_only=True)
-                  if m.formula == "MULTIPLIER")
-            + sum(r.aura_atk(op) for r in live_runtimes(self)))
+            + sum(r.aura_atk(op) for r in live_runtimes(self))),
+            final_addition=runtime.flat_attack() if runtime else 0), 0.0)
 
-    def operator_defense(self, op: _Operator) -> float:
-        self._sync_squad_effects()
-        return op.defense * (op.def_scale + op.squad_bonus.defense
+    def _operator_maximum_hp(self, op: _Operator, bonus: Any = None, extra=(), modifiers=None) -> float:
+        bonus = op.squad_bonus if bonus is None else bonus
+        modifiers = (*(op.buffs.modifiers("MAX_HP", registered_only=True) if modifiers is None else modifiers), *extra)
+        return calculate_attribute(op.base_max_hp, modifiers, multiplier=(1.0 + bonus.max_hp
+            + (op.form_runtime.hp_bonus if op.form_runtime else 0)
+            + (op.skill_runtime.hp_bonus if op.skill_runtime else 0)
+            + sum(r.aura_hp(op) for r in live_runtimes(self))
+            + float(getattr(op, "roster_hp_bonus", 0))),
+            final_addition=op.skill_runtime.stolen_hp if op.skill_runtime else 0,
+            final_scale=op.max_hp_final_scale)
+
+    @staticmethod
+    def _set_maximum_hp(actor: Any, maximum: float) -> None:
+        if not math.isfinite(maximum):
+            raise ValueError("non-finite maximum HP")
+        maximum = max(1.0, maximum)
+        if maximum == actor.max_hp:
+            return
+        previous = actor.max_hp
+        actor.max_hp = maximum
+        if actor.dead or actor.hp < 0:
+            # The legacy signed debt represents a separate negative HP pool.
+            # Changing its limit must not scale the amount already owed.
+            return
+        ratio = max(0.0, min(1.0, actor.hp / previous)) if previous > 0 else 0.0
+        actor.hp = ratio * maximum
+
+    def _registered_attributes_changed(self, container: BuffContainer) -> None:
+        actor = container.owner
+        modifiers = container.modifiers("MAX_HP", registered_only=True)
+        if isinstance(actor, _Operator):
+            if not modifiers and not actor.registered_max_hp_active:
+                return
+            actor.registered_max_hp_active = bool(modifiers)
+            self._squad_field_signature = None
+            self._sync_squad_effects()
+            if actor.dead or not any(unit is actor for unit in self.operators):
+                self._set_maximum_hp(actor, self._operator_maximum_hp(actor))
+        elif isinstance(actor, _Enemy):
+            if not modifiers and actor.registered_max_hp_base is None:
+                return
+            if actor.registered_max_hp_base is None:
+                actor.registered_max_hp_base = actor.max_hp
+            self._set_maximum_hp(actor, calculate_attribute(actor.registered_max_hp_base, modifiers,
+                final_addition=-self._enemy_attribute_stolen(actor, "MAX_HP")))
+
+    @staticmethod
+    def _enemy_attribute_stolen(enemy: _Enemy, attribute: str) -> float:
+        # Different character sources reduce each attribute by the highest steal.
+        return max((amount for source, amount in enemy.attribute_steals.get(attribute, {}).values()
+                    if not source.dead), default=0.0)
+
+    def set_enemy_attribute_steal(self, enemy: _Enemy, source: _Operator,
+                                attribute: str, amount: float) -> None:
+        entries = enemy.attribute_steals.setdefault(attribute, {})
+        if amount > 0:
+            entries[id(source)] = (source, amount)
+        else:
+            entries.pop(id(source), None)
+        if attribute == "MAX_HP":
+            if enemy.registered_max_hp_base is None:
+                enemy.registered_max_hp_base = enemy.max_hp
+            self._registered_attributes_changed(enemy.buffs)
+
+    def operator_defense(self, op: _Operator, *, synchronize: bool = True, modifiers=None) -> float:
+        if synchronize:
+            self._sync_squad_effects()
+        modifiers = op.buffs.modifiers("DEF", registered_only=True) if modifiers is None else modifiers
+        return max(calculate_attribute(op.defense, modifiers,
+            multiplier=(op.def_scale + op.squad_bonus.defense
             + (op.skill_runtime.defense_bonus() if op.skill_runtime else 0)
-            + sum(m.value for m in op.buffs.modifiers("DEF", registered_only=True)
-                  if m.formula == "MULTIPLIER")
-            + sum(r.aura_def(op) for r in live_runtimes(self))) + sum(
-                runtime.flat_defense_for(op) for runtime in effect_runtimes(self))
+            + sum(r.aura_def(op) for r in live_runtimes(self))), final_addition=sum(
+                runtime.flat_defense_for(op) for runtime in effect_runtimes(self))), 0.0)
 
     def _module_ability_tags(self, module_id: str | None) -> dict[str, Any]:
         # Keep ISW-A effects paused until integrated strategy is in scope.
@@ -918,6 +1037,9 @@ class Battle:
                 carried.potential_rank, phase, **self._module_ability_tags(carried.module_id))
             scale = next((float(self._blackboard(c).get("cost_scale", 1)) for c in talents.values()
                           if c.get("prefabKey") == "14_root"), 1.0)
+        if getattr(self, "vecbreak", None) and self.vecbreak.enabled:
+            if char_id == VEC_TRAP: value = base_cost
+            value = self.vecbreak.cost(char_id, value)
         return max(0, min(math.floor((value - discount) * scale), self.max_cost))
 
     # ------------------------------------------------------------------ setup
@@ -987,6 +1109,7 @@ class Battle:
         non_spatial = {
             "WAIT_FOR_SECONDS",
             "WAIT_CURRENT_WAVE_TIME",
+            "WAIT_CURRENT_FRAGMENT_TIME",
             "DISAPPEAR",
         }
         return [
@@ -1330,7 +1453,11 @@ class Battle:
         from .spawn_core import build_spawn_frame_schedule
 
         timings: list[dict[str, Any]] = []
-        rows = build_spawn_frame_schedule(waves, fragment_timings=timings, truncate_on_timeout=False)
+        hidden_groups = {rune_blackboard(r).get("key") for r in self.level.get("runes", [])
+                         if r.get("key") == "level_hidden_group_enable"}
+        rows = build_spawn_frame_schedule(waves, fragment_timings=timings,
+                                         enabled_hidden_groups=hidden_groups,
+                                         truncate_on_timeout=False)
         events = []
         for row in rows:
             if row["actionType"] != "SPAWN":
@@ -1352,6 +1479,8 @@ class Battle:
             self._record_spawn_fragment(wi, fi, (timing["completion"] + 1) / CLIENT_LOGIC_RATE,
                                         (timing["wave_start"] + 1) / CLIENT_LOGIC_RATE, waves[wi],
                                         [e for e in events if e.wave_index == wi and e.fragment_index == fi])
+            for event in self._spawn_fragments[-1].events:
+                event.fragment_start_time = (timing["fragment_start"] + 1) / CLIENT_LOGIC_RATE
             self._spawn_fragments[-1].last = timing["last"]
             self._spawn_fragments[-1].wave_end_time = (timing["wave_end"] + 1) / CLIENT_LOGIC_RATE
         self.used_assumptions.add("SPAWN_CORE_FRAME_SCHEDULER")
@@ -1370,6 +1499,7 @@ class Battle:
                 event_begin = len(events)
                 t += frag.get("preDelay", 0.0) or 0.0
                 frag_end = t
+                fragment_start_time = t
                 for action in Battle._client_sorted_actions(
                     frag.get("actions", [])
                 ):
@@ -1386,6 +1516,7 @@ class Battle:
                                 enemy_key=action.get("key", ""),
                                 route_index=route_index,
                                 wave_start_time=wave_start_time,
+                                fragment_start_time=fragment_start_time,
                                 nominal_time=t + pre_delay + k * interval,
                                 **self._spawn_flags(wi, fi, action),
                             )
@@ -1470,6 +1601,7 @@ class Battle:
                 nominal_cursor += float(fragment.get("preDelay", 0.0) or 0.0)
                 fragment_start = nominal_cursor
                 fragment_end = fragment_start
+                fragment_start_time = (self._client_logic_frame(fragment_start) + completed_work_frames) / CLIENT_LOGIC_RATE
                 order = 0
                 work_items = [
                     _SpawnWorkItem(fragment_start, order, "FRAGMENT_ENTER")
@@ -1598,6 +1730,7 @@ class Battle:
                                 enemy_key=item.enemy_key,
                                 route_index=item.route_index,
                                 wave_start_time=wave_start_time,
+                                fragment_start_time=fragment_start_time,
                                 nominal_time=item.nominal_time,
                                 scheduler_delay_frames=(
                                     completed_work_frames + preview_after
@@ -1638,15 +1771,23 @@ class Battle:
 
     @staticmethod
     def _is_airborne(enemy: _Enemy) -> bool:
-        return (
-            enemy.statuses.has(Status.LEVITATE)
-            or enemy.motion.upper() in {"FLY", "FLYING"}
-        )
+        lifted, grounded = enemy.statuses.motion_counts()
+        return (enemy.statuses.levitate_active() if lifted or grounded else
+                enemy.motion.upper() in {"FLY", "FLYING"})
 
     def _is_hole_cell(self, row: int, col: int) -> bool:
         return self.tile(row, col).get("tileKey") == "tile_hole"
 
+    def _uses_ground_navigation(self, enemy: _Enemy) -> bool:
+        runtime = getattr(self, "dublin", None)
+        return (runtime.uses_ground_navigation(enemy) if runtime
+                else not self._is_airborne(enemy))
+
     def _ground_passable_cell(self, row: int, col: int) -> bool:
+        if getattr(self, "dublin", None) and self.dublin.blocked_tile(row, col):
+            return False
+        if getattr(self, "cw", None) and self.cw.blocked_tile(row, col):
+            return False
         tile = self.tile(row, col)
         if not tile:
             return False
@@ -1711,7 +1852,7 @@ class Battle:
         reflect_collision: bool = False,
     ) -> str:
         start = enemy.position()
-        if not hasattr(self, "map_grid") or self._is_airborne(enemy):
+        if not hasattr(self, "map_grid") or not self._uses_ground_navigation(enemy):
             enemy.position_row, enemy.position_col = end
             return "MOVED"
 
@@ -1781,7 +1922,7 @@ class Battle:
         if (
             not hasattr(self, "map_grid")
             or enemy.disappeared
-            or self._is_airborne(enemy)
+            or not self._uses_ground_navigation(enemy)
         ):
             return False
         row, col = self._position_cell(*enemy.position())
@@ -1871,7 +2012,10 @@ class Battle:
     def _make_enemy(
         self, key: str, route_index: int, *, wave_start_time: float = 0.0
     ) -> _Enemy:
-        enemy_data = D.enemy_data_at(self.enemy_index, key, level=0)
+        enemy_data = (self.mansfield.enemy_data(key) if self.mansfield.enabled else
+                      self.vecbreak.enemy_data(key) if self.vecbreak.enabled
+                      else D.enemy_data_for_level(self.enemy_index, key, self.level) if self.wdex.enabled
+                      else D.enemy_data_at(self.enemy_index, key, level=0))
         attr = enemy_data.get("attributes", {})
         hp = float(D.mdef(attr.get("maxHp"), 0))
         motion = str(D.mdef(enemy_data.get("motion"), "WALK"))
@@ -2003,6 +2147,12 @@ class Battle:
             enemy.target_search_ticker.next(self.frame_index)
             self.used_assumptions.add("RANGED_SPAWN_SEARCH_PHASE")
         self._initialize_enemy_buffs(enemy)
+        if self.vecbreak.enabled:
+            self.vecbreak.born_enemy(enemy, enemy_data)
+        self.mansfield.born(enemy, enemy_data)
+        self.cw.born(enemy, enemy_data)
+        self.wdex.born(enemy, enemy_data)
+        self.dublin.born(enemy, enemy_data)
         if key in SHIELDGUARD_KEYS:
             enemy.taunt_level += 1
         enemy.remaining_path_distance = self._targeting_path_distance(enemy)
@@ -2097,6 +2247,7 @@ class Battle:
         op.plan_profile = next((index for index, item in enumerate(self.plan) if item is plan), None)
         op.buffs.owner = op
         op.buffs.event_handler = self._dispatch_buff_event
+        op.buffs.change_handler = self._registered_attributes_changed
         op.build_plan = plan
         equipped_phase = module_phase(module, plan.module_level) if module is not None else None
         trait, talents, deferred = select_abilities(
@@ -2118,7 +2269,7 @@ class Battle:
                         board["born_range_id"] = item["valueStr"]
             op.talent_blackboards[prefab] = board
             op.talent_blackboards_by_index[index] = board
-            if self.squad_effects.handled_talent(op.char_id, index):
+            if self.squad_effects.handled_talent(op.char_id, index) or (self.vecbreak.enabled and op.char_id == VEC_TRAP):
                 pass
             elif op.char_id == SHU and prefab == "1":
                 pass
@@ -2132,6 +2283,9 @@ class Battle:
         if equipped_phase and not (shu_module or (op.char_id == "char_1051_headb2" and plan.module_id == "uniequip_002_headb2")):
             if equipped_phase.get("parts"):
                 self.mechanic_diagnostics[f"OPERATOR_MODULE_EFFECT:{plan.module_id}"] += 1
+        if self.vecbreak.enabled:
+            op.roster_hp_bonus = self.vecbreak.char_bonus(op.char_id, "max_hp")
+            op.mode_base_atk_bonus = self.vecbreak.char_bonus(op.char_id, "atk")
         if plan.skill_id:
             self._attach_skill(op, plan.skill_id, plan.skill_level)
             op.sp = min(op.sp_max, op.sp + self.squad_effects.initial_sp_bonus(op.char_id))
@@ -2193,6 +2347,8 @@ class Battle:
         sp_cost = float(sp_data.get("spCost", 0) or 0)
         max_charge_time = max(int(sp_data.get("maxChargeTime", 1) or 1), 1)
         op.skill = level
+        op.skill_index = next((i for i, item in enumerate(self.characters[op.char_id].get("skills", []))
+                              if item.get("skillId") == skill_id), None)
         op.skill_controls = skill_controls(level)
         op.sp_cost = sp_cost
         op.max_charge_time = max_charge_time
@@ -2240,15 +2396,16 @@ class Battle:
     def step(self) -> None:
         self.time += self.dt
         self.frame_index += 1
+        self.dublin.pre_tick()
 
         for unit in (*self.operators, *self.enemies):
             if not unit.dead:
                 unit.statuses.tick(self.dt)
-                self._tick_element_burst(unit)
-                if unit.elements.tick(self.dt) is not None:
-                    unit.element_burst = None
-                    for runtime in live_runtimes(self):
-                        runtime.element_break_finished(unit)
+                burst_delta = self._tick_element_burst(unit)
+                if unit.elements.tick(self.dt, burst_dt=burst_delta) is not None:
+                    self._finish_element_burst(unit)
+            elif unit.element_burst is not None:
+                self._finish_element_templates(unit)
 
         # Losing block capability immediately releases held enemies.
         for op in self.operators:
@@ -2344,6 +2501,9 @@ class Battle:
         # derived state created here is committed for the next fixed frame.
         self._sync_herald_auras()
         self._tick_enemy_buffs()
+        self.vecbreak.tick()
+        self.cw.tick()
+        self.dublin.tick()
         self._cleanup()
         self._sync_squad_effects()
 
@@ -2380,14 +2540,22 @@ class Battle:
             )
             enemy.wave_index = ev.wave_index
             enemy.fragment_index = ev.fragment_index
-            enemy.dont_block_wave = ev.dont_block_wave
-            enemy.block_fragment = ev.block_fragment
+            enemy.fragment_start_time = ev.fragment_start_time
+            enemy.dont_block_wave = ev.dont_block_wave or enemy.not_count_in_total
+            if self.vecbreak.enabled and ev.wave_index in self.vecbreak.released_waves:
+                enemy.dont_block_wave = True
+            enemy.block_fragment = ev.block_fragment and not enemy.not_count_in_total
             self.enemies.append(enemy)
             self.wave_scheduler.last_births[ev.wave_index] = self.time
-            self.enemies_spawned += 1
+            if not enemy.not_count_in_total:
+                self.enemies_spawned += 1
 
     def all_spawns_finished(self) -> bool:
         return self.spawn_index >= len(self.spawn_events) and self.wave_scheduler.finished
+
+    def all_counted_enemies_finished(self) -> bool:
+        return not any(not enemy.not_count_in_total and not enemy.dead and not enemy.leaked
+                       for enemy in self.enemies)
 
     def _tick_operator(self, op: _Operator) -> None:
         self._update_skill(op)
@@ -2428,6 +2596,13 @@ class Battle:
     def _tick_enemy(self, enemy: _Enemy) -> None:
         if enemy.dead or enemy.leaked:
             return
+        if self.dublin.before_tick(enemy):
+            return
+        if self.cw.move_debris(enemy):
+            return
+        if self.vecbreak.before_enemy_tick(enemy) or self.mansfield.before_tick(enemy):
+            return
+        self.wdex.before_tick(enemy)
         self._tick_lemuen_survivor_sp(enemy)
         spawn_move_locked = enemy.spawn_move_lock_frames > 0
         if spawn_move_locked:
@@ -2553,8 +2728,11 @@ class Battle:
             self.mechanic_diagnostics["FEAR_TEMPORARY_NAVIGATION_CANDIDATE"] = 1
             return
         enemy.induced_path = None
+        if self.vecbreak.enabled and self.vecbreak.trace_summon(enemy):
+            return
         self._request_enemy_route_facing(enemy)
         self._move_enemy(enemy)
+        if self.vecbreak.enabled: self.vecbreak.after_enemy_move(enemy)
 
     def _start_operator_action(self, op: _Operator) -> None:
         if op.dead:
@@ -2635,7 +2813,7 @@ class Battle:
             if self.life_points <= 0:
                 self.end_reason = "life_points_depleted"
                 break
-            if self.all_spawns_finished() and not self.enemies:
+            if self.all_spawns_finished() and self.all_counted_enemies_finished():
                 self.end_reason = "all_clear"
                 break
         if not self.end_reason:
@@ -2708,6 +2886,8 @@ class Battle:
         rate = sum(runtime.passive_hp_recovery_for(op) for runtime in effect_runtimes(self))
         rate += sum(unit.healing_runtime.passive_hp_recovery_for(op) for unit in self.operators
                     if unit.healing_runtime is not None)
+        rate += self._registered_attribute_addition(op, "HP_RECOVERY_PER_SEC")
+        rate += op.max_hp * self._registered_attribute_addition(op, "HP_RECOVERY_PER_SEC_BY_MAX_HP_RATIO")
         if op.skill_runtime is not None and op.skill_runtime.anchor_move is not None:
             # The transporting mode scales both HP-recovery attributes to zero.
             rate = 0.0
@@ -2724,10 +2904,12 @@ class Battle:
         if op.hp_recovery_remaining <= 1e-9:
             count = math.floor((1e-9 - op.hp_recovery_remaining) / interval) + 1
             op.hp_recovery_remaining += count * interval
-            op.hp = min(op.max_hp, op.hp + count)
+            gain_hp(op, count)
         self.mechanic_diagnostics["OPERATOR_HP_RECOVERY_TIMER_PHASE_CANDIDATE"] = 1
 
     def _update_skill(self, op: _Operator) -> None:
+        if op.skill_progress_locked:
+            self.lock_skill_progress(op)
         if op.skill_runtime is not None:
             op.skill_runtime.tick()
         self._update_operator_hp_recovery(op)
@@ -2800,6 +2982,7 @@ class Battle:
         self, op: _Operator, *, recovery_was_stopped: bool
     ) -> None:
         self._sync_squad_effects()
+        attribute_bonus = self._registered_attribute_addition(op, "SP_RECOVERY_PER_SEC")
         # The observed S2 profile shares SpController's integer-count path.
         # Other rates/characters keep the explicit historical model until
         # their timer period and initial phase have been checked.
@@ -2809,9 +2992,10 @@ class Battle:
             and math.isclose(self.dt, 1 / CLIENT_LOGIC_RATE, abs_tol=1e-12)
             and op.sp_increment == 1.0
             and op.squad_bonus.sp_recovery == 0.0
+            and attribute_bonus == 0.0
         ):
             extra = op.skill_runtime.sp_recovery_bonus() if op.skill_runtime else 0
-            self._gain_sp(op, (op.sp_increment + op.squad_bonus.sp_recovery + extra) * self.dt)
+            self._gain_sp(op, (op.sp_increment + op.squad_bonus.sp_recovery + extra + attribute_bonus) * self.dt)
             return
         self.used_assumptions.add("HEADB2_PERIODIC_SP_RECOVERY")
         # SpController sees the old lock before the skill's expiry transition.
@@ -2844,6 +3028,8 @@ class Battle:
 
     def _cast_skill(self, op: _Operator, *, switch_mode: bool = False,
                     automatic: bool = False) -> bool:
+        if self.mansfield.enabled and op.char_id == MANSFIELD_DEVICE:
+            return self.mansfield.cast_device(op)
         if op.form_runtime is not None and op.form_runtime.mode == "THANATOS":
             return op.form_runtime.manual_switch()
         level = op.skill
@@ -2867,7 +3053,11 @@ class Battle:
             op.sp = max(0.0, op.sp - self._skill_cost(op))
         if op.skill_controls.can_switch:
             op.skill_mode_target = 1 - op.skill_mode
-        self._register_ability_use(op)
+        # The ward activates its ability once; Wisdel S1 arms its next attack.
+        # Their runtimes register the actual spell, not this early bookkeeping.
+        if not (self.vecbreak.enabled and op.skill_prefab_id in {
+                "sktok_wisdel_wward", "skchr_wisdel_1"}):
+            self._register_ability_use(op)
         op.skill_end_reason = None
         op.skill_cast_count += 1
         if op.skill_prefab_id == "skchr_headb2_2":
@@ -3080,6 +3270,7 @@ class Battle:
     def _finish_skill(self, op: _Operator, reason: str) -> None:
         if not op.skill_active:
             return
+        self.unlock_skill_progress(op)
         if op.skill_runtime is not None:
             op.skill_runtime.finish(reason)
         if not op.behavior_finish_dispatched:
@@ -3150,14 +3341,51 @@ class Battle:
             context.buff_container = getattr(buff_instance.owner, "buffs", None)
             context.current_buff_key = buff_instance.definition.key
         context.template_key, context.event = template_key, event
+        if not self._validate_behavior_bindings(context, self.behavior.templates[template_key]["eventToActions"][event]):
+            return None
+        if not validate_only:
+            self.behavior.dispatch(template_key, event, context)
+        return context
+
+    def _validate_behavior_bindings(self, context: BehaviorContext, actions: Any) -> bool:
+        """Check event bindings before callbacks, including registered snapshots."""
+        template_key, event = context.template_key, context.event
+        projectile_key, projectile_selector = context.projectile_key, context.projectile_selector
+        register_buffs = context.register_buffs or (context.buff_instance is not None
+            and context.buff_instance.definition.registered_behavior)
         # Selector bindings are actor adapters; reject a missing binding before
         # the event's Dice consumes a decision or any action changes state.
         def bound(value):
             if isinstance(value, dict):
+                if node_name(value) in {"SetMaxMinusHpRatio", "CheckIfAtMinusHpState", "CheckAbnormalFlag", "CheckAbnormalImmune"}:
+                    actor = context.entity(value.get("_targetType"))
+                    if actor is not None and not isinstance(actor, (_Enemy, _Operator)):
+                        return self.behavior._unsupported(f"{template_key}:{event}:hp_controller_binding")
+                    if node_name(value) == "SetMaxMinusHpRatio" and actor is not None:
+                        if not math.isfinite(actor.max_hp * value["_value"]):
+                            return self.behavior._unsupported(f"{template_key}:{event}:hp_capacity_overflow")
+                if node_name(value) in {"LockCharacterSkillProgress", "UnlockCharacterSkillProgress"}:
+                    actor = context.entity(value.get("_targetType"))
+                    if actor is not None and (not isinstance(actor, _Operator) or actor.skill is None):
+                        return self.behavior._unsupported(f"{template_key}:{event}:skill_progress_owner_binding")
+                    if isinstance(actor, _Operator) and self.component_catalog.skill_progress_hooker(actor.skill_prefab_id) is None:
+                        return self.behavior._unsupported(f"{template_key}:{event}:skill_progress_hooker_binding")
+                    if (node_name(value) == "LockCharacterSkillProgress" and actor is not None and actor.skill_active
+                            and (actor.skill_duration_type == "AMMO" or actor.active_until <= 0)):
+                        return self.behavior._unsupported(f"{template_key}:{event}:skill_progress_kind_binding")
+                if node_name(value) == "FinishAllBuffsWithCertainAbnormalFlag":
+                    if issue := self._flag_finish_binding_issue(context.entity(value.get("_targetType")), value["_abnormalFlag"]):
+                        return self.behavior._unsupported(f"{template_key}:{event}:{issue}")
                 if node_name(value) == "ModifySp":
                     owner = context.entity(value.get("_targetType"))
                     if owner is not None and not isinstance(owner, _Operator):
                         return self.behavior._unsupported(f"{template_key}:{event}:sp_controller_binding")
+                if node_name(value) == 'NoSourceDamage' and context.target is not None and not isinstance(context.target, (_Enemy, _Operator)):
+                    return self.behavior._unsupported(f"{template_key}:{event}:damage_target_binding")
+                if node_name(value) == "CheckContainsBuff" and value.get("_checkBuffSource"):
+                    source = context.entity(value.get("_buffSourceType"))
+                    if not isinstance(source, (_Enemy, _Operator)):
+                        return self.behavior._unsupported(f"{template_key}:{event}:buff_source_binding")
                 if node_name(value) == "EmitProjectileUseAbilitySelector":
                     key = value.get("_projectileKey") or projectile_key
                     if projectile_selector is None or not key or self._projectile_speed(key) is None:
@@ -3185,7 +3413,8 @@ class Battle:
                                    if value.get("_useSpecialBuffSource") else context.source)
                         if not isinstance(owner, (_Enemy, _Operator)) or not isinstance(emitter, (_Enemy, _Operator)):
                             return self.behavior._unsupported(f"{template_key}:{event}:buff_entity_binding")
-                        if self._validated_buff_events(spec, blackboard=context.blackboard) is None:
+                        if self._validated_buff_events(spec, blackboard=context.blackboard,
+                                owner=owner, source=emitter) is None:
                             return False
                 if node_name(value) in {"CheckContainsDerviedBuff", "FinishBuff"}:
                     if not self._validate_derived_buff_binding(context, {"_buffOwner": "BUFF_OWNER"}):
@@ -3194,11 +3423,52 @@ class Battle:
             if isinstance(value, list):
                 return all(bound(child) for child in value)
             return True
-        if not bound(self.behavior.templates[template_key]["eventToActions"][event]):
-            return None
-        if not validate_only:
-            self.behavior.dispatch(template_key, event, context)
-        return context
+        def validate_node(node, board):
+            previous = context.blackboard
+            context.blackboard = board
+            try:
+                return None if bound(node) else "event_binding"
+            finally:
+                context.blackboard = previous
+        issue = numeric_issue(actions, context.blackboard, node_validator=validate_node,
+            blackboard_reader=lambda node, board: self._read_preflight_blackboard(node, context, board),
+            actor_preview=self._behavior_attribute_preview(context))
+        if issue == "event_binding":
+            return False
+        return not issue or self.behavior._unsupported(f"{template_key}:{event}:{issue}")
+
+    def _behavior_attribute_preview(self, context, *, root_definition=None, event=None):
+        committing = (context.buff_owner if root_definition is not None and event in {
+            "ON_BUFF_START", "ON_BUFF_FINISH", "ON_BUFF_ENABLE", "ON_BUFF_DISABLE"} else None)
+        return BuffAttributePreview(self, context, root_definition=root_definition, committing_owner=committing)
+
+    def _read_preflight_blackboard(self, node, context, board):
+        preview = getattr(board, "actor_preview", None)
+        if preview is None:
+            return read_blackboard_value(node, context, board)
+        name = node_name(node)
+        if (name == "AssignBuffBlackboardFromOthers" and preview.changed
+                or preview.dirty and name in {"AssignBuffBlackboardFromOthers", "AssignCharacterSkillBlackboardToBB"}):
+            raise ValueError("blackboard_after_actor_mutation_binding")
+        return read_blackboard_value(node, context, board,
+            entity_value_reader=lambda actor, event, attribute:
+                self._preview_entity_value(preview, actor, event, attribute))
+
+    def _preview_entity_value(self, preview, actor, node, attribute):
+        if preview.dirty:
+            raise ValueError("after_actor_mutation_binding")
+        if not isinstance(actor, (_Operator, _Enemy)):
+            raise ValueError("attribute_entity_binding")
+        if node != "AssignAttributeToBB" or attribute == "MAX_HP":
+            return self.behavior_entity_value(actor, node, attribute)
+        source_limit = (1 if isinstance(actor, _Enemy) and attribute in {"ATK", "DEF"}
+            and preview.contains(actor, "enemy_9D0_talent_strength[attribute]")
+            and not self.assumptions.herald_auras_stack else None)
+        modifiers = preview.modifiers(actor, attribute,
+            registered_only=(isinstance(actor, _Operator) and attribute not in {
+                "ONE_MINUS_STATUS_RESISTANCE", "SLOW_DOWN", "EP_BREAK_RECOVER_SPEED"}) or attribute == "MAGIC_RESISTANCE",
+            source_limit=source_limit)
+        return self.behavior_entity_value(actor, node, attribute, modifiers=modifiers)
 
     @staticmethod
     def behavior_component_claimed(actor: Any, template: str) -> bool:
@@ -3213,10 +3483,15 @@ class Battle:
                 or isinstance(source, _Enemy) == isinstance(target, _Enemy) or target.dead):
             return packet
         for listener in source.component_listeners:
+            if listener.instance is not None and (listener.instance.finished
+                    or source.buffs._is_pending_finish(listener.instance)):
+                continue
             if listener.phase != phase or (listener.ignore_dead and source.dead):
                 continue
             if not self.component_catalog.validate(self, listener):
                 listener.record.update(state="rejected", reason="preflight")
+                if listener.instance is not None:
+                    source.buffs.finish(listener.instance)
                 continue
             context = self.execute_behavior_event(listener.template, CALCULATE,
                 source=source, target=target, buff_owner=source,
@@ -3228,6 +3503,41 @@ class Battle:
     def _dispatch_component_lifecycle(self, actor: Any, event: str, *, listeners=None) -> None:
         """Owner-only passive notifications shared by any attached actor."""
         for listener in tuple(actor.component_listeners if listeners is None else listeners):
+            if listener.finished:
+                continue
+            if listener.runtime_spec is not None:
+                if event == "ON_BUFF_START":
+                    if not listener.started:
+                        definition = self._behavior_buff_definition(listener.runtime_spec, listener.board)
+                        if definition is None:
+                            listener.record.update(state="rejected", reason="buff_preflight")
+                            continue
+                        if not self._validated_buff_owner_values(definition, actor):
+                            listener.record.update(state="rejected", reason="buff_owner_preflight")
+                            listener.finished = True
+                            if listener in actor.component_listeners:
+                                actor.component_listeners.remove(listener)
+                            continue
+                        actor.buffs.owner = actor
+                        actor.buffs.event_handler = self._dispatch_buff_event
+                        actor.buffs.change_handler = self._registered_attributes_changed
+                        listener.instance = actor.buffs.add(definition, source=actor,
+                            blackboard=listener.board, attached_step=self.frame_index)
+                        listener.instance.component_listener = listener
+                        listener.record["clock"] = {"lifetime_type": definition.lifetime_type,
+                            "lifetime": definition.lifetime, "trigger_interval": definition.trigger_interval,
+                            "first_trigger_interval": definition.first_trigger_interval,
+                            "trigger_limit": definition.trigger_limit}
+                        listener.record["triggers"] = {"completed": 0,
+                            "remaining": listener.instance.remaining_triggers}
+                        actor.buffs.commit()
+                elif listener.instance is not None:
+                    if event == "ON_BUFF_FINISH":
+                        actor.buffs.finish(listener.instance)
+                        actor.buffs.commit()
+                    else:
+                        self._dispatch_buff_event(listener.instance, event)
+                continue
             if listener.phase not in {"lifecycle", "owner-events"}:
                 continue
             if event == "ON_BUFF_START":
@@ -3269,10 +3579,15 @@ class Battle:
                 or not isinstance(target, (_Enemy, _Operator)) or target.dead):
             return
         for listener in tuple(source.component_listeners):
+            if listener.instance is not None and (listener.instance.finished
+                    or source.buffs._is_pending_finish(listener.instance)):
+                continue
             if listener.phase != "heal-output":
                 continue
             if not self.component_catalog.validate(self, listener):
                 listener.record.update(state="rejected", reason="preflight")
+                if listener.instance is not None:
+                    source.buffs.finish(listener.instance)
                 continue
             context = self.execute_behavior_event(listener.template, OUTPUT, source=source,
                 target=target, buff_owner=source, blackboard=listener.board, modifier=packet)
@@ -3283,11 +3598,17 @@ class Battle:
         parent = context.buff_instance
         owner = context.entity(node.get("_buffOwner"))
         container = getattr(owner, "buffs", None)
-        if (parent is None or container is None or context.buff_container is not container
-                or parent.owner is not owner or not parent.definition.registered_behavior
-                or parent.finished or not parent.enabled or container._is_pending_finish(parent)
-                or not any(item is parent for item in (*container.active, *container.pending_add))):
+        parent_container = parent.container if parent is not None else None
+        if (not isinstance(owner, (_Enemy, _Operator)) or owner.dead or container is None
+                or parent is None or context.buff_container is not parent_container
+                or parent_container is not getattr(parent.owner, "buffs", None)
+                or getattr(parent.owner, "dead", False)
+                or not parent.definition.registered_behavior or not BuffContainer.live_parent(parent)):
             return self.behavior._unsupported("CreateBuff:derived_parent_binding")
+        source = (context.entity(node.get("_specialBuffSource"))
+                  if node.get("_useSpecialBuffSource") else context.source)
+        if not isinstance(source, (_Enemy, _Operator)):
+            return self.behavior._unsupported("CreateBuff:derived_source_binding")
         return True
 
     def _validate_range_buff_binding(self, context: BehaviorContext, node: dict[str, Any]) -> bool:
@@ -3295,15 +3616,32 @@ class Battle:
         label = f"{context.template_key or '<range>'}:{context.event or '<direct>'}:CreateBuffInRange"
         if not self._validate_behavior_range(context, node, label):
             return False
-        if node.get("_isDerivedBuff") and not callable(context.range_buff_sink):
-            return self.behavior._unsupported(label + ":derived_lifecycle_binding")
-        return all(self._validated_buff_events(spec, blackboard=context.blackboard) is not None
-                   for spec in node.get("_buffs") or [])
+        if node.get("_isDerivedBuff"):
+            if context.buff_instance is not None:
+                if not self._validate_derived_buff_binding(context, {"_buffOwner": "BUFF_OWNER"}):
+                    return False
+            elif not callable(context.range_buff_sink):
+                return self.behavior._unsupported(label + ":derived_lifecycle_binding")
+        source = context.entity(node.get("_sourceType"))
+        # Validate even an empty selection; then bind SP and child receivers
+        # for every actual recipient before the first registration.
+        specs = node.get("_buffs") or []
+        receiver_kind = (type(source) if (node.get("_targetOptions") or {}).get("targetSide") == "ALLY"
+                         else {_Enemy: _Operator, _Operator: _Enemy}.get(type(source)))
+        return (all(self._validated_buff_events(spec, blackboard=context.blackboard,
+                    owner_kind=receiver_kind, source=source,
+                    derived=bool(node.get("_isDerivedBuff") and context.buff_instance is not None)) is not None for spec in specs)
+            and all(self._validated_buff_events(spec, blackboard=context.blackboard,
+                    owner=owner, source=source) is not None
+                for owner in self.behavior_range_targets(context, node) for spec in specs))
 
-    def _validate_behavior_range(self, context: BehaviorContext, node: dict[str, Any], label: str) -> bool:
+    def _validate_behavior_range(self, context: BehaviorContext, node: dict[str, Any], label: str,
+                                 *, source_kind: type | None = None, center_kind: type | None = None) -> bool:
         source = context.entity(node.get("_sourceType"))
         center = context.entity(node.get("_targetType"))
-        if not isinstance(source, (_Enemy, _Operator)) or not isinstance(center, (_Enemy, _Operator)):
+        source_kind = type(source) if source is not None else source_kind
+        center_kind = type(center) if center is not None else center_kind
+        if source_kind not in {_Enemy, _Operator} or center_kind not in {_Enemy, _Operator}:
             return self.behavior._unsupported(label + ":entity_binding")
         if node.get("_useRadius"):
             try:
@@ -3316,7 +3654,7 @@ class Battle:
             range_id = node.get("_rangeId")
             if not range_id or range_id not in self.ranges:
                 return self.behavior._unsupported(label + ":range_binding")
-            if isinstance(center, _Enemy):
+            if center_kind is _Enemy:
                 # Enemy facing is continuous, not an exported cardinal range
                 # orientation. Only rotation-invariant named ranges bind here.
                 cells = self.range_cells_from_id(range_id, (0, 0), 0)
@@ -3382,12 +3720,13 @@ class Battle:
         if source.dead:
             return False
         targets = self.behavior_range_targets(context, node)
+        parent = context.buff_instance if node.get("_isDerivedBuff") else None
         for owner in targets:
             for spec in node.get("_buffs") or []:
                 instance = self.register_behavior_buff(spec, owner=owner, source=source,
-                    blackboard=context.blackboard)
+                    blackboard=context.blackboard, parent=parent, finish_with_parent=parent is not None)
                 if (instance is not None and not instance.finished and node.get("_isDerivedBuff")
-                        and context.range_buff_sink is not None):
+                        and parent is None and context.range_buff_sink is not None):
                     context.range_buff_sink(owner, instance)
         return bool(targets)
 
@@ -3406,6 +3745,27 @@ class Battle:
         return self._behavior_hit_damage(source, target, base * scale,
             node.get("_damageType", "PHYSICAL"), node.get("_attackType", "NORMAL"),
             node.get("_applyWay", "NONE"), node.get("_modifierKey", ""))
+
+    def behavior_no_source_damage(self, context: BehaviorContext, node: dict, amount: float) -> bool:
+        """A target-side modifier with no character output or kill ownership."""
+        target = context.target
+        if target is None or target.dead:
+            return False
+        if not isinstance(target, (_Enemy, _Operator)):
+            return self.behavior._unsupported('NoSourceDamage:damage_target_binding')
+        kind = {'MAGICAL': 'ARTS', 'PURE': 'TRUE', 'ELEMENT': 'ELEMENTAL'}.get(
+            node.get('_damageType', 'PHYSICAL'), node.get('_damageType', 'PHYSICAL'))
+        packet = DamagePacket(amount, kind, attack_type=node.get('_attackType', 'NORMAL'),
+            lethal=not node.get('_isUndeadable', False), modifier_key=node.get('_modifierKey', ''),
+            target_defense_override=self._effective_enemy_defense(target) if isinstance(target, _Enemy)
+                else self.operator_defense(target), target_resistance_override=self._effective_resistance(target))
+        result = self._apply_damage(packet, target)
+        if result.killed and isinstance(target, _Enemy):
+            self.enemies_killed += 1
+        if (not node.get('_ignoreForSp', False) and result.final_amount > 0 and isinstance(target, _Operator)
+                and target.skill is not None and target.sp_type == 'INCREASE_WHEN_TAKEN_DAMAGE'):
+            self._gain_sp(target, target.sp_increment)
+        return result.final_amount > 0
 
     def _behavior_hit_damage(self, source: Any, target: Any, amount: float,
                              damage_type: str, attack_type: str, apply_way: str,
@@ -3610,7 +3970,8 @@ class Battle:
                    and not target.statuses.has(Status.UNTARGETABLE)
                    and (target.subprofession not in ("musha", "unyield", "reaper")
                         or target.char_id == heal_free_exception)
-                   and not (target.char_id == "char_1044_hsgma2" and target.hp <= 0)]
+                   and not target.negative_hp_heal_free
+                   and (target.char_id == heal_free_exception or self._operator_can_see(op, target))]
         targets = [target for target in targets
                    if (target.hp / target.max_hp <= hp_ratio if include_equal
                        else target.hp / target.max_hp < hp_ratio)
@@ -4079,6 +4440,7 @@ class Battle:
         hit_on_expiry: float | None = None,
         mount_rule: dict[str, Any] | None = None,
         behavior_payload: dict[str, Any] | None = None,
+        enemy_attack_context: dict[str, Any] | None = None,
     ) -> None:
         speed = 0.0 if immediate or hit_on_expiry is not None else self._projectile_speed(key)
         if speed is None:
@@ -4119,7 +4481,8 @@ class Battle:
             initial_distance = math.sqrt(initial_distance ** 2 + (target_z - source_z) ** 2)
         self.projectile_counter += 1
         lifecycle = (dict(self.attack_timing.get(source.char_id, {}).get(
-            "projectile_lifecycle", {}).get(key, {})) if isinstance(source, _Operator) else {})
+            "projectile_lifecycle", {}).get(key, {})) if isinstance(source, _Operator)
+            else self.wdex.projectile_lifecycle(key))
         if hit_on_expiry is not None:
             lifecycle.update(lifetime=hit_on_expiry, no_movement=True,
                              stop_when_source_invalid=False, always_hit_in_end=True)
@@ -4155,6 +4518,7 @@ class Battle:
                 last_destination=(target_row, target_col, target_z),
                 born_at=self.time + birth_delay,
                 behavior_payload=behavior_payload,
+                enemy_attack_context=enemy_attack_context,
                 impact_at=self.time if immediate else None,
                 fixed_destination=((target_row, target_col, target_z)
                                    if lifecycle.get("fixed_endpoint") else None),
@@ -4639,27 +5003,40 @@ class Battle:
                                   target_resistance_override=self._effective_resistance(source)),
                      source)
 
+    def _enemy_normal_damage_type(self, enemy: _Enemy) -> DamageType | str:
+        """Use the same scoped type for hit checks and damage resolution."""
+        if self.dublin.enabled:
+            return self.dublin.damage_type(enemy)
+        if self.mansfield.enabled:
+            return self.mansfield.damage_type(enemy)
+        return self.vecbreak.normal_damage_type(enemy)
+
     def _deal_damage_to_operator(
         self,
         enemy: _Enemy,
         op: _Operator,
         *,
         attack_override: float | None = None,
+        attack_context: dict[str, Any] | None = None,
     ) -> None:
         defense = self.operator_defense(op)
-        result = self._apply_damage(
-            DamagePacket(
+        if self.vecbreak.enabled:
+            attack_override = self.vecbreak.normal_attack(enemy, op, attack_override)
+            if op.dead: return
+        packet = DamagePacket(
                 amount=(
                     self._effective_enemy_atk(enemy)
                     if attack_override is None
                     else attack_override
                 ),
-                damage_type=DamageType.PHYSICAL,
+                damage_type=(attack_context["damage_type"] if attack_context is not None else
+                             self._enemy_normal_damage_type(enemy)),
                 attack_type=AttackType.NORMAL,
                 apply_way=(
+                    attack_context["apply_way"] if attack_context is not None else
                     ApplyWay.RANGED if enemy.range_radius > 0 else ApplyWay.MELEE
                 ),
-                output_scale=self._outgoing_damage_scale(enemy),
+                output_scale=self._outgoing_damage_scale(enemy) * self.wdex.attack_scale(enemy, attack_context),
                 source=enemy,
                 critical_chance=float(
                     getattr(enemy, "critical_chance", 0.0)
@@ -4669,9 +5046,9 @@ class Battle:
                 ),
                 target_defense_override=defense,
                 target_resistance_override=self._effective_resistance(op),
-            ),
-            op,
-        )
+            )
+        packet = self.mansfield.modify_packet(packet, op, context=attack_context)
+        result = self._apply_damage(packet, op)
         if (
             result.final_amount > 0
             and op.skill is not None
@@ -4684,26 +5061,36 @@ class Battle:
     def _fire_enemy_attack(
         self, enemy: _Enemy, target: _Operator, *, will_hit: bool
     ) -> None:
+        if self.mansfield.fire_attack(enemy, target, will_hit=will_hit):
+            return
+        if self.wdex.fire_attack(enemy, target, will_hit=will_hit):
+            return
+        self._fire_single_enemy_attack(enemy, target, will_hit=will_hit)
+
+    def _fire_single_enemy_attack(self, enemy, target, *, will_hit, attack_context=None):
+        """Shared launch path, with a per-cast context for scoped enemy skills."""
         spec = self.enemy_projectiles.get(enemy.key) or {}
+        key = enemy.projectile_key if attack_context is None else attack_context["projectile"]
         destination = int(spec.get("destination", 0) or 0)
-        if enemy.projectile_key and destination != 0:
+        if key and destination != 0:
             self.mechanic_diagnostics[
                 f"PROJECTILE_DESTINATION:{destination}"
             ] += 1
             if will_hit:
-                self._enemy_attack_lands(enemy, target)
+                self._enemy_attack_lands(enemy, target, attack_context=attack_context)
             return
-        speed = self._projectile_speed(enemy.projectile_key)
+        speed = self._projectile_speed(key)
         if speed is None:
             if will_hit:
-                self._enemy_attack_lands(enemy, target)
+                self._enemy_attack_lands(enemy, target, attack_context=attack_context)
             return
         self._new_projectile(
-            key=enemy.projectile_key or "",
+            key=key or "",
             side="ENEMY",
             source=enemy,
             target=target,
             will_hit=will_hit,
+            enemy_attack_context=attack_context,
             cached_atk=(
                 self._effective_enemy_atk(enemy)
                 if spec.get("useCachedAtkOnly")
@@ -4860,6 +5247,7 @@ class Battle:
                 projectile.source,
                 projectile.target,
                 attack_override=projectile.cached_atk,
+                attack_context=projectile.enemy_attack_context,
             )
             return
         attack = projectile.operator_attack
@@ -4900,11 +5288,13 @@ class Battle:
         target: _Operator,
         *,
         attack_override: float | None = None,
+        attack_context: dict[str, Any] | None = None,
     ) -> None:
         """Resolve one enemy hit, including target-centered splash attacks."""
         self._deal_damage_to_operator(
-            enemy, target, attack_override=attack_override
+            enemy, target, attack_override=attack_override, attack_context=attack_context
         )
+        self.mansfield.after_hit(enemy, target, attack_context)
         if enemy.key not in MORTAR_KEYS:
             return
         for op in self.operators:
@@ -4950,6 +5340,16 @@ class Battle:
         return self.rng.roll(probability)
 
     def _apply_damage(self, packet: DamagePacket, target: Any):
+        dublin = getattr(self, "dublin", None)
+        if (dublin and dublin.animation_damage_immune(target)
+                and packet.normalized_damage_type() is not DamageType.HEAL):
+            return DamageResult(0.0, 0.0, 0.0, cancelled=True)
+        if dublin:
+            packet = dublin.modify_packet(packet, target)
+        if getattr(self, "cw", None):
+            packet = self.cw.modify_packet(packet, target)
+        if getattr(self, "vecbreak", None):
+            packet = self.vecbreak.modify_packet(packet, target)
         labeled = None
         if isinstance(getattr(self, "rng", None), RandomDecisionRng):
             def labeled(probability: float, mechanism: str) -> bool:
@@ -4970,6 +5370,11 @@ class Battle:
         if runtime:
             packet = runtime.modify_taken_packet(packet)
         kind = packet.normalized_damage_type()
+        if (kind is DamageType.ARTS and packet.target_resistance_override is None
+                and isinstance(target, (_Enemy, _Operator))
+                and any(m.value for m in target.buffs.modifiers("MAGIC_RESISTANCE", registered_only=True)
+                        if m.formula == "ADDITION")):
+            packet = replace(packet, target_resistance_override=self._effective_resistance(target))
         if isinstance(target, _Enemy):
             if kind is not DamageType.LIFE_LOSS:
                 packet = replace(packet, taken_scale=packet.taken_scale * max(
@@ -5001,12 +5406,18 @@ class Battle:
                 source_healing.output_modifier(current_packet, current_target)
             elif source_runtime is not None:
                 source_runtime.output_modifier(current_packet, current_target)
+        def taking(current_packet, current_target):
+            if getattr(self, "cw", None):
+                self.cw.taking_damage(current_packet, current_target)
+            if runtime is not None:
+                runtime.taking_damage_modifier(current_packet, current_target)
         result = apply_damage(packet, target, roll=self._roll_probability, roll_labeled=labeled,
             on_calculate=calculate if packet.notify_calculate else None,
             on_output=output,
-            on_taking_damage=runtime.taking_damage_modifier if runtime is not None else None,
+            on_taking_damage=taking if runtime is not None or (getattr(self, "cw", None) and self.cw.enabled) else None,
             before_apply=source_runtime.before_apply_damage
-                if source_runtime is not None else None)
+                if source_runtime is not None else None,
+            on_block_damage=runtime.blocked_damage if runtime is not None else None)
         if source_runtime is not None and isinstance(target, _Enemy):
             source_runtime.damage_landed(packet, target, result)
         if (source_runtime is not None and source_runtime.op.char_id == "char_4133_logos"
@@ -5019,6 +5430,10 @@ class Battle:
         if result.killed and isinstance(target, _Enemy):
             for receiver in live_runtimes(self):
                 receiver.enemy_died(target, killer=packet.source)
+        if getattr(self, "vecbreak", None):
+            self.vecbreak.damage_landed(packet, target, result)
+        if result.killed:
+            self._finish_element_templates(target)
         return result
 
     def random_uniform(self, lower: float, upper: float, *, mechanism: str,
@@ -5200,15 +5615,24 @@ class Battle:
             index_by_key[key] = index
         diagnostics[index].update(updates)
 
+    def _enemy_has_invisibility_immunity(self, target: _Enemy) -> bool:
+        return any(not op.dead and op.char_id == "char_172_svrash"
+            and "2" in op.talent_blackboards and self._enemy_intersects_range(target, op.range_cells)
+            for op in self.operators) or any(r.reveals(target) for r in effect_runtimes(self))
+
+    def _enemy_camouflaged(self, target: _Enemy) -> bool:
+        return target.statuses.has(Status.CAMOUFLAGE) and not self._enemy_has_invisibility_immunity(target)
+
+    def _operator_can_see(self, source: _Operator, target: Any) -> bool:
+        cell = target.tile() if callable(target.tile) else target.tile
+        return not blind_tile(self, source, cell)
+
     def _enemy_targetable(self, target: _Enemy) -> bool:
         if target.statuses.targetable:
             return True
         if any(target.statuses.has(s) for s in (Status.INVINCIBLE, Status.UNTARGETABLE, Status.SLEEP)):
             return False
-        return target.statuses.has(Status.INVISIBLE) and (any(
-            not op.dead and op.char_id == "char_172_svrash"
-            and "2" in op.talent_blackboards and self._enemy_intersects_range(target, op.range_cells)
-            for op in self.operators) or any(r.reveals(target) for r in effect_runtimes(self)))
+        return target.statuses.has(Status.INVISIBLE) and self._enemy_has_invisibility_immunity(target)
 
     def _validate_operator_target(
         self, op: _Operator, target: _Enemy | None
@@ -5216,6 +5640,10 @@ class Battle:
         if target is None or not self._enemy_is_attackable(target):
             return False
         if not self._enemy_targetable(target):
+            return False
+        if not self.cw.valid_target(op, target):
+            return False
+        if not self.dublin.valid_target(op, target):
             return False
         if op.char_id == "char_1051_headb2" and self._is_airborne(target):
             return False
@@ -5234,7 +5662,9 @@ class Battle:
             # Preserve the existing blocked-first rule: once an enemy is
             # blocked, the melee selector does not reapply ranged geometry.
             return True
-        if target.statuses.has(Status.CAMOUFLAGE):
+        if self._enemy_camouflaged(target):
+            return False
+        if not self._operator_can_see(op, target):
             return False
         if op.skill_runtime is not None and op.skill_runtime.is_wanted(target):
             return True
@@ -5514,6 +5944,9 @@ class Battle:
                 candidates.append(op)
         if not candidates:
             return None
+        if self.mansfield.enabled:
+            candidates = self.mansfield.sort_targets(enemy, candidates)
+            return candidates[0] if candidates else None
         return min(candidates, key=enemy_target_key)
 
     def _advance_enemy_operator_target_search(
@@ -5539,7 +5972,7 @@ class Battle:
             return None, search_cycle
         if enemy.blocked_by is target and not target.dead:
             return target, search_cycle
-        if target.dead or not target.statuses.targetable:
+        if target.dead or not target.statuses.targetable or not self.mansfield.valid_target(enemy, target):
             enemy.cached_operator_target = None
             return None, search_cycle
         if target.statuses.has(Status.CAMOUFLAGE):
@@ -5616,15 +6049,65 @@ class Battle:
 
     def _dispatch_buff_event(self, instance: BuffInstance, event: str) -> bool:
         """Run normalized Buff actions through the existing interpreter."""
-        if event == "ON_BUFF_START":
+        if event in {"ON_BUFF_START", "ON_BUFF_ENABLE"}:
             for flag in instance.definition.status_flags:
                 instance.owner.statuses.grant(flag, instance)
-        elif event == "ON_BUFF_FINISH":
+        elif event in {"ON_BUFF_FINISH", "ON_BUFF_DISABLE"}:
             for flag in instance.definition.status_flags:
                 instance.owner.statuses.revoke(flag, instance)
+        if (event in {"ON_BUFF_START", "ON_BUFF_ENABLE", "ON_BUFF_FINISH", "ON_BUFF_DISABLE"}
+                and set(instance.definition.status_flags) & {"LEVITATE", "GROUND_BOUND"}):
+            owner = instance.owner
+            if isinstance(owner, _Enemy):
+                if "GROUND_BOUND" in instance.definition.status_flags:
+                    self.mechanic_diagnostics["GROUND_BOUND_NAVIGATION_CANDIDATE"] = 1
+                if owner.statuses.levitate_active():
+                    self._end_unbalance(owner)
+                if self._is_airborne(owner) and owner.blocked_by is not None:
+                    self._release_enemy_block(owner)
+                if event in {"ON_BUFF_FINISH", "ON_BUFF_DISABLE"}:
+                    self.mechanic_diagnostics["MOTION_CONTROL_EXIT_PHASE_CANDIDATE"] = 1
+        listener = instance.component_listener
+        if listener is not None:
+            if event != "ON_BUFF_FINISH" and (instance.finished or (
+                    event not in {"ON_BUFF_START", "ON_BUFF_ENABLE", "ON_BUFF_DISABLE"}
+                    and (not instance.enabled or instance.owner.buffs._is_pending_finish(instance)))):
+                return False
+            if event == "ON_BUFF_START":
+                listener.started = True
+            valid = True
+            if (event in listener.events and listener.started
+                    and not (listener.ignore_dead and instance.owner.dead)):
+                valid = self.component_catalog.validate(self, listener, initializing=event == 'ON_BUFF_START')
+                if valid:
+                    context = self.execute_behavior_event(listener.template, event,
+                        source=instance.source, buff_owner=instance.owner,
+                        blackboard=instance.blackboard, buff_instance=instance,
+                        register_buffs=True)
+                    valid = context is not None
+                    if valid:
+                        # Only the live Buff owns event state. Immutable source
+                        # boards and other deployments keep their snapshots.
+                        instance.blackboard.clear()
+                        instance.blackboard.update(context.blackboard)
+                        listener.board = instance.blackboard
+                if not valid:
+                    listener.record.update(state="rejected", reason="event_binding")
+                    instance.owner.buffs.finish(instance)
+            if event == "ON_BUFF_FINISH":
+                listener.finished = True
+                if listener.record["state"] == "attached":
+                    listener.record["state"] = ("expired" if instance.remaining_lifetime is not None
+                        and instance.remaining_lifetime <= 1e-9 else "detached")
+                if listener in instance.owner.component_listeners:
+                    instance.owner.component_listeners.remove(listener)
+            return valid
         actions = instance.definition.actions_for(event)
         if not actions:
             return True
+        if instance.definition.registered_behavior:
+            if not self.behavior.validate_actions(list(actions), instance.definition.template_key + ":" + event):
+                return False
         owner = instance.owner
         context = BehaviorContext(
             source=instance.source,
@@ -5642,57 +6125,323 @@ class Battle:
             buff_container=getattr(owner, "buffs", None),
             buff_instance=instance,
         )
+        if instance.definition.registered_behavior and not self._validate_behavior_bindings(context, list(actions)):
+            return False
         return self.behavior.execute_actions(list(actions), context)
 
+    @staticmethod
+    def _registered_attribute_addition(actor: Any, attribute: str) -> float:
+        """Read live reviewed modifiers; legacy adapter effects stay separate."""
+        return sum(item.value for item in actor.buffs.modifiers(attribute, registered_only=True)
+                   if item.formula == "ADDITION")
+
+    def behavior_skill_progress(self, context: BehaviorContext, node: dict[str, Any]) -> bool:
+        actor = context.entity(node.get("_targetType"))
+        if actor is None:
+            return False
+        if not isinstance(actor, _Operator) or actor.skill is None:
+            return self.behavior._unsupported(node_name(node) + ":skill_progress_owner_binding")
+        if self.component_catalog.skill_progress_hooker(actor.skill_prefab_id) is None:
+            return self.behavior._unsupported(node_name(node) + ":skill_progress_hooker_binding")
+        if node_name(node) == "UnlockCharacterSkillProgress":
+            self.unlock_skill_progress(actor)
+            return True
+        if not actor.skill_active or actor.dead:
+            return False
+        if actor.skill_duration_type == "AMMO" or actor.active_until <= 0:
+            return self.behavior._unsupported(node_name(node) + ":skill_progress_kind_binding")
+        # Only finite active time progress has an established engine binding.
+        # Native cached progress is not a freeze of the actor's Buff collection.
+        return self.lock_skill_progress(actor)
+
+    def lock_skill_progress(self, op: _Operator) -> bool:
+        if not isinstance(op, _Operator) or op.dead or not op.skill_active:
+            return False
+        if not op.skill_progress_locked:
+            op.skill_progress_remaining = max(0.0, op.active_until - self.time) if op.active_until > 0 else None
+            op.skill_progress_locked = True
+        if op.skill_progress_remaining is not None:
+            op.active_until = self.time + op.skill_progress_remaining
+        return True
+
+    def unlock_skill_progress(self, op: _Operator) -> None:
+        if op.skill_progress_locked and op.skill_progress_remaining is not None and op.skill_active:
+            op.active_until = self.time + op.skill_progress_remaining
+        op.skill_progress_locked = False
+        op.skill_progress_remaining = None
+
+    def behavior_negative_hp_state(self, context: BehaviorContext, node: dict) -> bool:
+        actor = context.entity(node.get("_targetType"))
+        if actor is None:
+            return False
+        if not isinstance(actor, (_Operator, _Enemy)):
+            return self.behavior._unsupported(node_name(node) + ":hp_controller_binding")
+        if node_name(node) == "CheckIfAtMinusHpState":
+            return actor.max_minus_hp_ratio > 0 and actor.minus_hp > 0
+        ratio = float(node["_value"])
+        if not math.isfinite(ratio * actor.max_hp):
+            return self.behavior._unsupported("SetMaxMinusHpRatio:hp_capacity_overflow")
+        actor.max_minus_hp_ratio = ratio
+        actor.negative_hp_heal_free = ratio > 0 and actor.minus_hp > 0
+        if actor.minus_hp > 0:
+            self.mechanic_diagnostics["NEGATIVE_HP_CAPACITY_CHANGE_NOTIFICATION_CANDIDATE"] = 1
+        return True
+
+    def behavior_abnormal_condition(self, context: BehaviorContext, node: dict) -> bool:
+        actor = context.entity(node.get("_targetType"))
+        if actor is None:
+            return False
+        if not isinstance(actor, (_Operator, _Enemy)):
+            return self.behavior._unsupported(node_name(node) + ":status_controller_binding")
+        status = Status(ABNORMAL_READ_FLAGS[node["_abnormalFlag"]])
+        active = (status in actor.statuses.immunities if node_name(node) == "CheckAbnormalImmune"
+                  else actor.statuses.has(status))
+        return not active if node.get("_isUnset", False) else active
+
+    def behavior_entity_value(self, actor: Any, node: str, attribute: str | None, *, modifiers=None) -> float:
+        """Read the current model pool without syncing auras during preflight."""
+        if not isinstance(actor, (_Operator, _Enemy)):
+            raise ValueError("attribute_entity_binding")
+        if node == "AssignMaxSpToBlackboard":
+            if not isinstance(actor, _Operator) or actor.skill is None:
+                raise ValueError("sp_controller_binding")
+            return actor.sp_max
+        if node == "AssignHpRatioToBB":
+            try:
+                valid = all(type(value) in (int, float) and math.isfinite(float(value))
+                            for value in (actor.hp, actor.max_hp))
+            except OverflowError:
+                valid = False
+            if not valid:
+                raise ValueError("hp_ratio_value")
+            if actor.max_hp <= 0:
+                raise ValueError("hp_ratio_denominator")
+            if (isinstance(actor, _Operator) and actor.char_id == "char_1044_hsgma2"
+                    and actor.hp <= 0 and actor.negative_hp_heal_free):
+                # The old signed storage omits the regular one-HP bar.
+                return min(1.0, 1.0 / actor.max_hp)
+            # Ratio predicates read the regular bar, excluding negative/extra HP.
+            return max(0.0, min(1.0, actor.hp / actor.max_hp))
+        if attribute == "MAX_HP": return actor.max_hp
+        if attribute in {"ONE_MINUS_STATUS_RESISTANCE", "SLOW_DOWN", "EP_BREAK_RECOVER_SPEED"}:
+            return actor.buffs.clock_attribute(attribute, modifiers=modifiers)
+        if attribute == "MAGIC_RESISTANCE": return self._effective_resistance(actor, modifiers=modifiers)
+        if isinstance(actor, _Operator):
+            if attribute == "ATK": return self.operator_attack_power(actor, synchronize=False, modifiers=modifiers)
+            if attribute == "DEF": return self.operator_defense(actor, synchronize=False, modifiers=modifiers)
+        else:
+            if attribute == "ATK": return self._effective_enemy_atk(actor, modifiers=modifiers)
+            if attribute == "DEF": return self._effective_enemy_defense(actor, modifiers=modifiers)
+            if attribute == "MOVE_SPEED": return self._effective_enemy_move_speed(actor, modifiers=modifiers)
+        raise ValueError("attribute_controller_binding")
+
+    def _validated_buff_owner_values(self, definition: BuffDefinition, owner: Any,
+                                     owner_kind: type | None = None) -> bool:
+        """Validate the live pool again before birth without running actions."""
+        owner_kind = type(owner) if owner is not None else owner_kind
+        hp_modifiers = tuple(item for item in definition.modifiers if item.attribute == "MAX_HP")
+        if (set(definition.status_flags) & {"LEVITATE", "GROUND_BOUND", "FORCE_LEVITATE"}
+                and owner_kind is not None and owner_kind is not _Enemy):
+            self.behavior._unsupported("RegisterBuff:motion_control_owner_binding")
+            return False
+        projected = None
+        retained_projection = None
+        if definition.override_policy is not None and owner_kind is not None and owner_kind not in {_Operator, _Enemy}:
+            self.behavior._unsupported("RegisterBuff:override_owner_binding")
+            return False
+        if owner is not None and (issue := owner.buffs.override_issue(definition)):
+            self.behavior._unsupported("RegisterBuff:" + issue)
+            return False
+        if owner is not None and definition.override_policy is not None and not definition.disable_override:
+            if definition.override_policy == "DEFAULT":
+                group = [item for item in (*owner.buffs.active, *owner.buffs.pending_add)
+                    if not item.finished and not owner.buffs._is_pending_finish(item)
+                    and item.definition.override_policy == "DEFAULT" and not item.definition.disable_override
+                    and item.definition.override_key == definition.override_key]
+                strongest = max(group, key=lambda item: item.definition.override_priority) if group else None
+                winner = (strongest.definition if strongest is not None
+                    and strongest.definition.override_priority >= definition.override_priority else definition)
+                unrelated = tuple(replace(modifier, value=modifier.value * item.stack_count)
+                    for item in owner.buffs.active if item.enabled and not item.finished
+                    and not owner.buffs._is_pending_finish(item) and item.definition.registered_behavior
+                    and not any(old is item for old in group)
+                    for modifier in item.definition.modifiers if modifier.attribute == "MAX_HP")
+                projected = unrelated + tuple(modifier for modifier in winner.modifiers if modifier.attribute == "MAX_HP")
+                if winner is not definition and hp_modifiers:
+                    # A retained loser may become enabled after the winner expires.
+                    retained_projection = unrelated + hp_modifiers
+                hp_modifiers = ()
+            existing = next((item for item in (*owner.buffs.active, *owner.buffs.pending_add)
+                if item.enabled and not item.finished and not owner.buffs._is_pending_finish(item)
+                and not item.definition.disable_override and item.definition.override_key == definition.override_key), None)
+            if existing is not None:
+                hp_modifiers = (tuple(item for item in existing.definition.modifiers if item.attribute == "MAX_HP")
+                    if definition.override_policy == "STACK" and existing.stack_count < existing.definition.max_stack_count else ())
+        if hp_modifiers and owner_kind is not None and owner_kind not in {_Operator, _Enemy}:
+            self.behavior._unsupported("RegisterBuff:max_hp_owner_binding")
+            return False
+        if owner is not None and (hp_modifiers or projected is not None):
+            for pool in ((projected, retained_projection) if retained_projection is not None else (projected,)):
+                if isinstance(owner, _Operator):
+                    maximum = self._operator_maximum_hp(owner, extra=hp_modifiers, modifiers=pool)
+                else:
+                    current = owner.buffs.modifiers("MAX_HP", registered_only=True) if pool is None else pool
+                    modifiers = (*current, *hp_modifiers)
+                    base = owner.max_hp if owner.registered_max_hp_base is None else owner.registered_max_hp_base
+                    maximum = calculate_attribute(base, modifiers,
+                        final_addition=-self._enemy_attribute_stolen(owner, "MAX_HP"))
+                if not math.isfinite(maximum):
+                    self.behavior._unsupported("RegisterBuff:max_hp_overflow")
+                    return False
+        return True
+
     def _validated_buff_events(self, spec: dict[str, Any], seen: frozenset[str] = frozenset(),
-                               blackboard: dict[str, Any] | None = None) -> dict | None:
+                               blackboard: dict[str, Any] | None = None,
+                               allowed_events=frozenset({"ON_BUFF_START", "ON_BUFF_FINISH", "ON_BUFF_TRIGGER",
+                                                         "ON_BUFF_ENABLE", "ON_BUFF_DISABLE"}),
+                               owner: Any = None, source: Any = None,
+                               owner_kind: type | None = None, source_kind: type | None = None,
+                               immediate_children: bool = False, derived: bool = False) -> dict | None:
         """Preflight referenced child trees before registering any state."""
+        spec = self._resolve_buff_spec(spec)
+        if spec is None:
+            return None
         issue = registered_buff_spec_issue(spec)
         if issue:
             self.behavior._unsupported("RegisterBuff:" + issue)
             return None
-        if self._behavior_buff_definition(spec, blackboard or {}) is None:
+        definition = self._behavior_buff_definition(spec, blackboard or {})
+        if definition is None:
+            return None
+        if derived and definition.override_policy not in {None, "DEFAULT"} and not definition.disable_override:
+            self.behavior._unsupported("RegisterBuff:override_parent_binding")
             return None
         board = self._behavior_buff_blackboard(spec, blackboard or {})
+        owner_kind = type(owner) if owner is not None else owner_kind
+        source_kind = type(source) if source is not None else source_kind
+        if not self._validated_buff_owner_values(definition, owner, owner_kind):
+            return None
+        if owner_kind is not None and owner_kind is not _Operator and any(
+                item.get("attributeType") in {"HP_RECOVERY_PER_SEC", "HP_RECOVERY_PER_SEC_BY_MAX_HP_RATIO",
+                                             "SP_RECOVERY_PER_SEC"}
+                for item in (spec.get("attributes") or {}).get("attributeModifiers") or []):
+            self.behavior._unsupported("RegisterBuff:recovery_controller_binding")
+            return None
+        if owner_kind is not None and owner_kind is not _Enemy and any(
+                item.get("attributeType") == "MOVE_SPEED"
+                for item in (spec.get("attributes") or {}).get("attributeModifiers") or []):
+            self.behavior._unsupported("RegisterBuff:move_speed_owner_binding")
+            return None
+        if owner_kind is not None and owner_kind is not _Enemy and any(
+                item.get("attributeType") == "EP_BREAK_RECOVER_SPEED"
+                for item in (spec.get("attributes") or {}).get("attributeModifiers") or []):
+            self.behavior._unsupported("RegisterBuff:operator_ep_effect_clock_binding")
+            return None
+        roles = {"SOURCE": source, "BUFF_SOURCE": source, "TARGET": owner, "BUFF_OWNER": owner}
+        kinds = {"SOURCE": source_kind, "BUFF_SOURCE": source_kind,
+                 "TARGET": owner_kind, "BUFF_OWNER": owner_kind}
         key = str(spec.get("templateKey") or "")
         if key in seen:
             self.behavior._unsupported(f"RegisterBuff:{key}:recursive_template")
             return None
         events = {}
         if key and key != "empty":
-            template = self.behavior.templates.get(key)
+            template = self.behavior.resolve_template(key)
             if template is None:
                 self.behavior.validate_event(key, "ON_BUFF_START")
                 return None
             events = template.get("eventToActions", {})
-            if any(event not in {"ON_BUFF_START", "ON_BUFF_FINISH", "ON_BUFF_TRIGGER"}
+            if ((spec.get("attributes") or {}).get("attributeModifiers")
+                    and contains_entity_value_read(events)):
+                self.behavior._unsupported(f"RegisterBuff:{key}:own_attribute_snapshot_binding")
+                return None
+            if any(event not in allowed_events
                    for event in events):
                 self.behavior._unsupported(f"RegisterBuff:{key}:event")
                 return None
             valid = True
-            for event in events:
-                valid = self.behavior.validate_event(key, event) and valid
-            def children(value):
+            children = []
+            def capture(value, current_board):
                 nonlocal valid
-                if isinstance(value, dict):
-                    if node_name(value) in {"CreateBuffInRange", "EmitProjectileUseAbilitySelector", "AOEDamage"}:
-                        # These callbacks need actor selector/lifecycle
-                        # bindings that a passive child does not inherit.
-                        self.behavior._unsupported(f"RegisterBuff:{key}:nested_action_binding:{node_name(value)}")
+                if node_name(value) in {"LockCharacterSkillProgress", "UnlockCharacterSkillProgress"} and owner_kind is not None:
+                    if kinds.get(value.get("_targetType")) is not _Operator:
+                        self.behavior._unsupported(f"RegisterBuff:{key}:skill_progress_owner_binding")
                         valid = False
-                    if node_name(value) == "CreateBuff":
-                        if (((value.get("_buff") or {}).get("attributes") or {}).get("attributeModifiers")
-                                and not value.get("_isDerivedBuff")):
-                            self.behavior._unsupported(f"RegisterBuff:{key}:nested_attribute_binding")
-                            valid = False
-                        yield value.get("_buff") or {}
-                    for child in value.values():
-                        yield from children(child)
-                elif isinstance(value, list):
-                    for child in value:
-                        yield from children(child)
-            for child in children(events):
-                valid = (self._validated_buff_events(child, seen | {key}, board) is not None) and valid
+                    actor = roles.get(value.get("_targetType"))
+                    if isinstance(actor, _Operator) and self.component_catalog.skill_progress_hooker(actor.skill_prefab_id) is None:
+                        self.behavior._unsupported(f"RegisterBuff:{key}:skill_progress_hooker_binding")
+                        valid = False
+                if node_name(value) in {"SetMaxMinusHpRatio", "CheckIfAtMinusHpState", "CheckAbnormalFlag", "CheckAbnormalImmune",
+                                      "FinishAllBuffsWithCertainAbnormalFlag"} and owner_kind is not None:
+                    role = value.get("_targetType")
+                    actor = roles.get(role)
+                    if kinds.get(role) not in {_Enemy, _Operator} or (
+                            actor is not None and node_name(value) == "SetMaxMinusHpRatio"
+                            and not math.isfinite(actor.max_hp * value["_value"])):
+                        self.behavior._unsupported(f"RegisterBuff:{key}:hp_controller_binding")
+                        valid = False
+                if node_name(value) == "ModifySp" and owner_kind is not None:
+                    role = value.get("_targetType", "TARGET")
+                    if kinds.get(role) is not _Operator:
+                        self.behavior._unsupported(f"RegisterBuff:{key}:sp_controller_binding")
+                        valid = False
+                if node_name(value) == "CheckContainsBuff" and value.get("_checkBuffSource") and owner_kind is not None:
+                    if kinds.get(value.get("_buffSourceType", "TARGET")) not in {_Enemy, _Operator}:
+                        self.behavior._unsupported(f"RegisterBuff:{key}:buff_source_binding")
+                        valid = False
+                if node_name(value) in {"EmitProjectileUseAbilitySelector", "AOEDamage"}:
+                    self.behavior._unsupported(f"RegisterBuff:{key}:nested_action_binding:{node_name(value)}")
+                    valid = False
+                if node_name(value) in {"CreateBuff", "CreateBuffInRange"}:
+                    if (((value.get("_buff") or {}).get("attributes") or {}).get("attributeModifiers")
+                            and not value.get("_isDerivedBuff")):
+                        self.behavior._unsupported(f"RegisterBuff:{key}:nested_attribute_binding")
+                        valid = False
+                    children.append((value, dict(current_board)))
+                return None
+            started_boards = [board]
+            ordered_events = (["ON_BUFF_START"] if "ON_BUFF_START" in events else []) + [
+                event for event in events if event != "ON_BUFF_START"]
+            for event in ordered_events:
+                valid = self.behavior.validate_event(key, event) and valid
+                context = BehaviorContext(source=source, target=owner, buff_owner=owner, buff_source=source,
+                                          battle=self, register_buffs=immediate_children, event=event)
+                completed = []
+                for event_board in ([board] if event == "ON_BUFF_START" else started_boards):
+                    if issue := numeric_issue(events[event], event_board, node_validator=capture,
+                            blackboard_reader=lambda node, state: self._read_preflight_blackboard(node, context, state),
+                            actor_preview=self._behavior_attribute_preview(context, root_definition=definition, event=event),
+                            final_states=completed):
+                        self.behavior._unsupported(f"RegisterBuff:{key}:{issue}")
+                        valid = False
+                if event == "ON_BUFF_START" and completed:
+                    started_boards = completed
+            for child, child_board in children:
+                if node_name(child) == "CreateBuffInRange":
+                    emitter_kind = kinds.get(child.get("_sourceType"))
+                    center_kind = kinds.get(child.get("_targetType"))
+                    if owner_kind is not None:
+                        context = BehaviorContext(source=source, target=owner, buff_owner=owner, buff_source=source)
+                        valid = self._validate_behavior_range(context, child, f"RegisterBuff:{key}:range",
+                            source_kind=emitter_kind, center_kind=center_kind) and valid
+                    receiver_kind = (emitter_kind if (child.get("_targetOptions") or {}).get("targetSide") == "ALLY"
+                                     else {_Enemy: _Operator, _Operator: _Enemy}.get(emitter_kind))
+                    for child_spec in child.get("_buffs") or []:
+                        valid = (self._validated_buff_events(child_spec, seen | {key}, child_board,
+                            owner_kind=receiver_kind, source=roles.get(child.get("_sourceType")),
+                            source_kind=emitter_kind, derived=bool(child.get("_isDerivedBuff"))) is not None) and valid
+                    continue
+                child_owner = roles.get(child.get("_buffOwner", "TARGET"))
+                child_source = roles.get(child.get("_specialBuffSource")) if child.get("_useSpecialBuffSource") else source
+                child_owner_kind = kinds.get(child.get("_buffOwner", "TARGET"))
+                child_source_kind = kinds.get(child.get("_specialBuffSource")) if child.get("_useSpecialBuffSource") else source_kind
+                if owner_kind is not None and (child_owner_kind not in {_Enemy, _Operator}
+                        or child_source_kind not in {_Enemy, _Operator}):
+                    self.behavior._unsupported(f"RegisterBuff:{key}:child_entity_binding")
+                    valid = False
+                valid = (self._validated_buff_events(child.get("_buff") or {}, seen | {key}, child_board,
+                    owner=child_owner, source=child_source, owner_kind=child_owner_kind,
+                    source_kind=child_source_kind, derived=bool(child.get("_isDerivedBuff"))) is not None) and valid
             if not valid:
                 return None
         return events
@@ -5706,12 +6455,25 @@ class Battle:
         board.update(self._blackboard(spec))
         return board
 
+    def _resolve_buff_spec(self, spec: dict[str, Any]) -> dict | None:
+        try:
+            return self.buff_database.resolve_spec(spec)
+        except ValueError as exc:
+            self.behavior._unsupported("RegisterBuff:" + str(exc))
+            return None
+
     def _behavior_buff_definition(self, spec: dict[str, Any], blackboard: dict[str, Any],
                                   events: dict | None = None) -> BuffDefinition | None:
+        spec = self._resolve_buff_spec(spec)
+        if spec is None:
+            return None
         board = self._behavior_buff_blackboard(spec, blackboard)
+        if events is None:
+            events = (self.behavior.resolve_template(str(spec.get("templateKey") or "")) or {}).get("eventToActions", {})
         try:
-            return BuffDefinition.from_create_spec({**spec, "eventToActions": events or {},
+            definition = BuffDefinition.from_create_spec({**spec, "eventToActions": events or {},
                 "registered_behavior": True, "unique_by_key": False}, blackboard=board)
+            return replace(definition, element_break=True) if definition.key in self.element_break_buff_keys else definition
         except (ValueError, TypeError, OverflowError):
             self.behavior._unsupported("RegisterBuff:invalid_value/lifetime")
             return None
@@ -5723,17 +6485,27 @@ class Battle:
         refresh: bool = False,
         finish_with_parent: bool = False,
     ) -> BuffInstance | None:
-        """Register reviewed flags or ATK after an explicit actor adapter."""
+        """Register reviewed flags/attributes after whole child-tree preflight."""
         if owner is None or getattr(owner, "dead", False):
             return None
+        spec = self._resolve_buff_spec(spec)
+        if spec is None:
+            return None
         container = owner.buffs
-        if finish_with_parent and (parent is None or parent.owner is not owner
-                or parent.finished or not parent.enabled or container._is_pending_finish(parent)
+        if finish_with_parent and (not BuffContainer.live_parent(parent)
+                or parent.container is not getattr(parent.owner, "buffs", None)
+                or getattr(parent.owner, "dead", False)
                 or not parent.definition.registered_behavior
-                or not any(item is parent for item in (*container.active, *container.pending_add))):
+                or not isinstance(source, (_Enemy, _Operator))):
             self.behavior._unsupported("RegisterBuff:derived_parent_binding")
             return None
-        events = self._validated_buff_events(spec, blackboard=blackboard)
+        if ((spec.get("overrideType", "DEFAULT") != "DEFAULT" or spec.get("priority", -1) != -1 or spec.get("priorityBBKeys"))
+                and (parent is not None and spec.get("overrideType", "DEFAULT") != "DEFAULT"
+                     and not spec.get("disableOverride", False) or refresh)):
+            self.behavior._unsupported("RegisterBuff:override_parent/refresh_binding")
+            return None
+        events = self._validated_buff_events(spec, blackboard=blackboard, owner=owner, source=source,
+                                             derived=parent is not None)
         if events is None:
             return None
         board = self._behavior_buff_blackboard(spec, blackboard or {})
@@ -5742,6 +6514,7 @@ class Battle:
             return None
         container.owner = owner
         container.event_handler = self._dispatch_buff_event
+        container.change_handler = self._registered_attributes_changed
         instance = container.add(definition, source=source, parent=parent,
             blackboard=board, attached_step=self.frame_index, finish_with_parent=finish_with_parent)
         if refresh and definition.modifiers and definition.lifetime_type == "LIMITED":
@@ -5774,10 +6547,13 @@ class Battle:
             and container.contains(key)
         )
 
-    def _effective_enemy_atk(self, enemy: _Enemy) -> float:
+    def _effective_enemy_atk(self, enemy: _Enemy, *, modifiers=None) -> float:
+        if modifiers is not None:
+            return max(calculate_attribute(enemy.atk, modifiers,
+                final_addition=-self._enemy_attribute_stolen(enemy, "ATK")), 0.0)
         container = getattr(enemy, "buffs", None)
         if container is None or not hasattr(container, "attribute_value"):
-            return enemy.atk
+            return max(0.0, enemy.atk - self._enemy_attribute_stolen(enemy, "ATK"))
         has_herald_attribute = container.count(
             "enemy_9D0_talent_strength[attribute]"
         ) > 0
@@ -5787,10 +6563,13 @@ class Battle:
             if not self.assumptions.herald_auras_stack:
                 source_limit = 1
         return container.attribute_value(
-            "ATK", enemy.atk, source_limit=source_limit
+            "ATK", enemy.atk, source_limit=source_limit,
+            final_addition=-self._enemy_attribute_stolen(enemy, "ATK")
         )
 
-    def _effective_enemy_defense(self, enemy: _Enemy) -> float:
+    def _effective_enemy_defense(self, enemy: _Enemy, *, modifiers=None) -> float:
+        if modifiers is not None:
+            return max(calculate_attribute(enemy.defense, modifiers), 0.0)
         container = getattr(enemy, "buffs", None)
         if container is None or not hasattr(container, "attribute_value"):
             return enemy.defense
@@ -5947,18 +6726,21 @@ class Battle:
             return
         if enemy.palsy_stacks > 0:
             enemy.palsy_stacks -= 1
-            enemy.statuses.apply(
+            palsy_applied = enemy.statuses.apply(
                 Status.PALSY_TREMOR, 0.5, resistible=False
             )
-            enemy.pause_until = self.time + 0.5
-            return
+            if palsy_applied is not None or not (self.vecbreak.enabled and enemy.key == "enemy_8018_etouch_2"):
+                enemy.pause_until = self.time + 0.5
+                return
         enemy.attack_target = target
+        self.mansfield.before_attack(enemy, target)
+        self.cw.before_attack(enemy, target)
+        if self.vecbreak.enabled:
+            self.vecbreak.enemy_state[enemy.enemy_index]["attack_speed_snapshot"] = self._effective_enemy_move_speed(enemy)
         if enemy.graphic_profile is not None:
             enemy.attack_started_at = self.time
             self._request_enemy_facing(enemy, target.tile[1] - enemy.position_col)
-        enemy.attack_will_hit = self._attack_hits(
-            enemy, DamageType.PHYSICAL
-        )
+        enemy.attack_will_hit = self._attack_hits(enemy, self._enemy_normal_damage_type(enemy))
         animation_duration = enemy.attack_duration
         hit_delay = enemy.attack_hit_time
         if (enemy.apply_way == ApplyWay.MELEE.value
@@ -6056,6 +6838,8 @@ class Battle:
             + unit.statuses.attack_speed_delta
             + element_bonus
             + (sum(r.enemy_speed_delta(unit) for r in live_runtimes(self)) if isinstance(self, Battle) and isinstance(unit, _Enemy) else 0)
+            + (self.mansfield.speed_delta(unit) if isinstance(self, Battle) and isinstance(unit, _Enemy) else 0)
+            + (self.dublin.attack_speed(unit) if isinstance(self, Battle) and isinstance(unit, _Enemy) else 0)
         )
         container = getattr(unit, "buffs", None)
         if container is not None and hasattr(container, "attribute_value"):
@@ -6068,6 +6852,8 @@ class Battle:
             form = unit.form_runtime
             total = max(1.0, own_speed + unit.squad_bonus.attack_speed
                         + unit.statuses.attack_speed_delta + element_bonus
+                        + (self.vecbreak.char_addition(unit.char_id, "attack_speed") if isinstance(self, Battle) and getattr(self, "vecbreak", None) and self.vecbreak.enabled else 0)
+                        + (self.cw.attack_speed(unit) if isinstance(self, Battle) and getattr(self, "cw", None) else 0)
                         + (form.attack_speed if form else 0)
                         + (unit.skill_runtime.attack_speed() if unit.skill_runtime else 0)
                         + sum(m.value for m in unit.buffs.modifiers("ATTACK_SPEED", registered_only=True)
@@ -6078,17 +6864,20 @@ class Battle:
                     + (unit.skill_runtime.interval_delta * 100 if unit.skill_runtime else 0)) / total
         return unit.attack_interval * 100.0 / attack_speed
 
-    def _effective_enemy_move_speed(self, enemy: _Enemy) -> float:
+    def _effective_enemy_move_speed(self, enemy: _Enemy, *, modifiers=None) -> float:
         speed = enemy.move_speed * self.move_multiplier
         container = getattr(enemy, "buffs", None)
-        if container is not None and hasattr(container, "attribute_value"):
+        if modifiers is not None:
+            speed = max(calculate_attribute(speed, modifiers), 0.0)
+        elif container is not None and hasattr(container, "attribute_value"):
             speed = container.attribute_value("MOVE_SPEED", speed)
         if enemy.statuses.has(Status.SLUGGISH):
             speed *= 0.2
         for runtime in effect_runtimes(self):
             if not runtime.op.dead or runtime.op.char_id == "char_4087_ines":
                 speed *= runtime.move_factor(enemy)
-        return speed
+        speed = self.cw.speed(enemy, speed) if getattr(self, "cw", None) else speed
+        return self.vecbreak.move_speed(enemy, speed) if getattr(self, "vecbreak", None) else speed
 
     def _move_enemy(self, enemy: _Enemy) -> None:
         initial_wait_expiry = (
@@ -6096,7 +6885,7 @@ class Battle:
             and len(enemy.route) >= 2
             and enemy.route[0].kind.upper() == "START"
             and enemy.route[1].kind.upper()
-            in {"WAIT_FOR_SECONDS", "WAIT_CURRENT_WAVE_TIME"}
+            in {"WAIT_FOR_SECONDS", "WAIT_CURRENT_WAVE_TIME", "WAIT_CURRENT_FRAGMENT_TIME"}
             and enemy.wait_active_at_frame_start
             and enemy.wait_remaining <= 1e-12
             and not enemy.wait_hidden_at_frame_start
@@ -6173,6 +6962,7 @@ class Battle:
             if kind in {
                 "WAIT_FOR_SECONDS",
                 "WAIT_CURRENT_WAVE_TIME",
+                "WAIT_CURRENT_FRAGMENT_TIME",
                 "DISAPPEAR",
             }:
                 self._reach_route_point(enemy, target)
@@ -6236,7 +7026,7 @@ class Battle:
         if not enemy.dead and enemy.route_idx >= len(enemy.route) - 1:
             gate = next((op for op in self.operators if not op.dead
                 and op.char_id == "token_10058_sbell2_icetgt"
-                and op.statuses.can_block and len(op.blocked) < op.block_count
+                and op.statuses.can_block and self._free_block_capacity(op) >= (enemy.block_count if self.vecbreak.enabled else 1)
                 and not enemy.unblockable and not self._is_airborne(enemy)
                 and not enemy.statuses.has(Status.FEAR)
                 and math.dist(enemy.position(), op.tile) <= op.block_radius), None)
@@ -6253,6 +7043,7 @@ class Battle:
             if kind in {
                 "WAIT_FOR_SECONDS",
                 "WAIT_CURRENT_WAVE_TIME",
+                "WAIT_CURRENT_FRAGMENT_TIME",
                 "DISAPPEAR",
             }:
                 self._reach_route_point(enemy, target)
@@ -6271,7 +7062,7 @@ class Battle:
 
     def _coast_enemy_navigation(self, enemy: _Enemy) -> None:
         """Integrate one ground navigation coast step during a visible wait."""
-        if self._is_airborne(enemy):
+        if not self._uses_ground_navigation(enemy):
             return
         speed = self._effective_enemy_move_speed(enemy)
         if speed <= 0:
@@ -6391,10 +7182,10 @@ class Battle:
         if steering_enabled:
             steering_factor = (
                 20.0
-                if self._is_airborne(enemy)
+                if not self._uses_ground_navigation(enemy)
                 else GROUND_STEERING_FACTOR
             )
-            max_force = 100.0 if self._is_airborne(enemy) else 10.0
+            max_force = 10.0 if self._uses_ground_navigation(enemy) else 100.0
         else:
             steering_factor = 100.0
             max_force = 100.0
@@ -6447,7 +7238,7 @@ class Battle:
         direction: tuple[float, float],
     ) -> tuple[float, float]:
         if (
-            self._is_airborne(enemy)
+            not self._uses_ground_navigation(enemy)
             or not getattr(self, "steering_enabled", True)
             or not hasattr(self, "map_grid")
         ):
@@ -6539,7 +7330,12 @@ class Battle:
         enemy.route_idx += 1
         enemy.tile_idx = min(enemy.route_idx, max(len(enemy.path) - 1, 0))
         kind = point.kind.upper()
-        if kind == "WAIT_CURRENT_WAVE_TIME":
+        if kind in {"DISAPPEAR", "APPEAR_AT_POS", "TELEPORT"}:
+            enemy.position_jump_index += 1
+        if kind == "WAIT_CURRENT_FRAGMENT_TIME":
+            elapsed = self.time - getattr(enemy, "fragment_start_time", enemy.wave_start_time)
+            enemy.wait_remaining = max(0.0, point.wait_time - elapsed)
+        elif kind == "WAIT_CURRENT_WAVE_TIME":
             elapsed = self.time - enemy.wave_start_time
             enemy.wait_remaining = max(0.0, point.wait_time - elapsed)
         elif point.wait_time > 0:
@@ -6607,7 +7403,7 @@ class Battle:
             self.used_assumptions.add(
                 "OPERATOR_BLOCK_SCAN_DEPLOYMENT_PHASE"
             )
-        free_slots = op.block_count - len(op.blocked)
+        free_slots = self._free_block_capacity(op)
         if free_slots <= 0:
             # The scheduled cycle has already advanced while full.
             return
@@ -6637,11 +7433,21 @@ class Battle:
                 enemy.creation_index,
             )
         )
-        for enemy in candidates[:free_slots]:
-            self._start_blocking(op, enemy)
+        for enemy in candidates:
+            volume = enemy.block_count if self.vecbreak.enabled else 1
+            if volume <= free_slots:
+                self._start_blocking(op, enemy)
+                free_slots -= volume
+            if free_slots <= 0: break
+
+    def _free_block_capacity(self, op: _Operator) -> int:
+        occupied = sum(e.block_count for e in op.blocked) if getattr(self, "vecbreak", None) and self.vecbreak.enabled else len(op.blocked)
+        return max(0, op.block_count - occupied)
 
     def _start_blocking(self, op: _Operator, enemy: _Enemy) -> None:
         if enemy.unblockable:
+            return
+        if self.vecbreak.enabled and enemy.block_count > self._free_block_capacity(op):
             return
         enemy.blocked_by = op
         other_enemies = list(op.blocked)
@@ -6960,6 +7766,8 @@ class Battle:
             and enemy.unbalance_lock_remaining <= 1e-9
         ):
             self._end_unbalance(enemy)
+        if self.vecbreak.enabled:
+            self.vecbreak.after_force_motion(enemy)
         return True
 
     @staticmethod
@@ -6997,6 +7805,7 @@ class Battle:
         non_spatial = {
             "WAIT_FOR_SECONDS",
             "WAIT_CURRENT_WAVE_TIME",
+            "WAIT_CURRENT_FRAGMENT_TIME",
             "DISAPPEAR",
             "NAVIGATE_CELL",
             "NAVIGATE_STABLE",
@@ -7095,6 +7904,7 @@ class Battle:
     def _cleanup(self) -> None:
         for enemy in list(self.enemies):
             if enemy.dead or enemy.leaked:
+                if self.vecbreak.enabled: self.vecbreak.died_enemy(enemy)
                 self.wave_scheduler.departed(enemy, self.time)
             if enemy.leaked and not enemy.dead:
                 self.life_points -= enemy.life_reduce
@@ -7102,6 +7912,19 @@ class Battle:
                 enemy.dead = True
             elif enemy.dead and enemy.blocked_by:
                 self._release_enemy_block(enemy)
+            if enemy.dead and enemy.component_listeners:
+                self._dispatch_component_lifecycle(enemy, "ON_OWNER_FINISH")
+                self._dispatch_component_lifecycle(enemy, "ON_BUFF_FINISH")
+                self.component_catalog.detach(enemy)
+            if enemy.dead:
+                # Registered recipients and parents leave with this entity;
+                # legacy enemy aura definitions keep their existing path.
+                registered = [instance for instance in (*enemy.buffs.active, *enemy.buffs.pending_add)
+                    if instance.definition.registered_behavior]
+                for instance in registered:
+                    enemy.buffs.finish(instance)
+                if registered:
+                    enemy.buffs.commit()
         for op in self.operators:
             if op.dead:
                 self._process_operator_departure(op, retreated=op.retreated)
@@ -7124,14 +7947,22 @@ class Battle:
         source: StatusSource | str = StatusSource.FRIENDLY,
     ) -> Status | None:
         effect = Status(str(getattr(status, "value", status)).upper())
-        if effect is Status.LEVITATE:
+        if effect in {Status.LEVITATE, Status.GROUND_BOUND}:
             if isinstance(target, _Operator):
                 return None
-            if target.motion.upper() in {"FLY", "FLYING"}:
+            lifetime = None if duration is None else max(0.0, float(duration))
+            if lifetime is not None and (not math.isfinite(lifetime) or lifetime <= 0):
                 return None
-            if duration is not None and target.mass_level > 3:
-                duration *= 0.5
-            self._end_unbalance(target)
+            target.buffs.event_handler = self._dispatch_buff_event
+            definition = BuffDefinition("status:" + effect.value,
+                lifetime_type="INFINITY" if lifetime is None else "LIMITED", lifetime=lifetime or 0.0,
+                status_flags=(effect.value,), unique_by_key=False, disable_override=True,
+                status_resistable="YES" if resistible else "NO")
+            item = target.buffs.add(definition, attached_step=self.frame_index)
+            target.buffs.commit()
+            if effect is Status.GROUND_BOUND:
+                self.mechanic_diagnostics["GROUND_BOUND_NAVIGATION_CANDIDATE"] = 1
+            return effect if not item.finished and (effect, item) in target.statuses.grants else None
         return target.statuses.apply(
             effect,
             duration,
@@ -7157,16 +7988,25 @@ class Battle:
         source: _Enemy | _Operator | None = None,
     ) -> ElementResult:
         normalized = element if isinstance(element, ElementType) else ElementType(str(element).upper())
+        if normalized is ElementType.SANITY and isinstance(target, _Enemy):
+            target.sanity_bind_bonuses = {key: item for key, item in target.sanity_bind_bonuses.items()
+                                        if self.time < item[0]}
+            if target.statuses.has(Status.BIND):
+                amount *= max((scale for _, scale in target.sanity_bind_bonuses.values()), default=1.0)
         source_runtime = getattr(source, "skill_runtime", None)
         if source_runtime is not None and isinstance(target, _Enemy):
             amount *= source_runtime.element_output_scale(target)
         for runtime in live_runtimes(self):
             amount *= runtime.element_incoming_scale(target, normalized)
+        if getattr(self, "vecbreak", None) and self.vecbreak.enabled:
+            amount *= self.vecbreak.element_scale(target)
         result = target.elements.apply(
             element,
             amount,
             neutral=neutral,
             immune=target.statuses.has(Status.ELEMENT_IMMUNE),
+            burst_duration=self.element_break_durations.get(normalized.value, (None, None))[
+                isinstance(target, _Enemy)],
         )
         if result.burst:
             self._start_element_burst(target, result, source)
@@ -7214,7 +8054,14 @@ class Battle:
                 DamageType.ELEMENTAL if enemy_target else DamageType.ARTS,
                 source,
             )
-        elif element is ElementType.DARK and not enemy_target:
+        elif element is ElementType.DARK and enemy_target:
+            root = self.register_behavior_buff({'buffKey': 'ep_break_dark_enemy', 'loadFromDB': True},
+                owner=target, source=source if source is not None else target)
+            target.element_burst.template_root = root
+            target.element_burst.template_driven = root is not None
+            if root is None:
+                self.mechanic_diagnostics['DARK_BURST_LEGACY_FALLBACK'] = 1
+        elif element is ElementType.DARK:
             target.statuses.apply(
                 Status.SP_BLOCKED, result.burst_duration, resistible=False
             )
@@ -7227,18 +8074,38 @@ class Battle:
             for runtime in live_runtimes(self):
                 runtime.element_break_started(target)
 
-    def _tick_element_burst(self, target: _Enemy | _Operator) -> None:
+    def _finish_element_templates(self, target: Any) -> None:
+        runtime = getattr(target, 'element_burst', None)
+        if runtime is not None and runtime.template_root is not None:
+            root = runtime.template_root
+            runtime.template_root = None
+            root.container.finish(root)
+            root.container.commit()
+
+    def _finish_element_burst(self, target: _Enemy | _Operator) -> None:
+        self._finish_element_templates(target)
+        target.element_burst = None
+        for runtime in live_runtimes(self):
+            runtime.element_break_finished(target)
+
+    def _tick_element_burst(self, target: _Enemy | _Operator) -> float | None:
         runtime = target.element_burst
         if runtime is None or target.elements.cooldown_remaining <= 0:
             return
-        runtime.tick_elapsed += self.dt
+        speed = target.buffs.clock_attribute("EP_BREAK_RECOVER_SPEED") if isinstance(target, _Enemy) else 1.0
+        elapsed = min(self.dt * speed, target.elements.cooldown_remaining)
+        active_delta = min(self.dt, target.elements.cooldown_remaining / speed) if speed > 0 else self.dt
+        # The periodic damage belongs to an independent permanent child.
+        runtime.tick_elapsed += active_delta
+        runtime.effect_elapsed += active_delta
         while runtime.tick_elapsed + 1e-9 >= 1.0 and not target.dead:
             runtime.tick_elapsed -= 1.0
             if runtime.element is ElementType.DARK:
                 if isinstance(target, _Enemy):
-                    self._apply_element_burst_damage(
-                        target, 800.0, DamageType.ELEMENTAL, runtime.source
-                    )
+                    if not runtime.template_driven:
+                        self._apply_element_burst_damage(
+                            target, 800.0, DamageType.ELEMENTAL, runtime.source
+                        )
                 else:
                     target.sp = max(0.0, target.sp - 1.0)
                     self._apply_element_burst_damage(
@@ -7250,6 +8117,7 @@ class Battle:
                 self._apply_element_burst_damage(
                     target, runtime.anger_damage, DamageType.TRUE, runtime.source
                 )
+        return elapsed
 
     def _apply_element_burst_damage(
         self,
@@ -7273,7 +8141,7 @@ class Battle:
             self.enemies_killed += 1
 
     @staticmethod
-    def _effective_resistance(target: _Enemy | _Operator) -> float:
+    def _effective_resistance(target: _Enemy | _Operator, *, modifiers=None) -> float:
         runtime = getattr(target, "element_burst", None)
         statuses = getattr(target, "statuses", None)
         reduction = (
@@ -7287,7 +8155,13 @@ class Battle:
             else 0.0
         )
         own = getattr(target, "skill_runtime", None)
+        container = getattr(target, "buffs", None)
+        if modifiers is None:
+            modifiers = (container.modifiers("MAGIC_RESISTANCE", registered_only=True)
+                         if container is not None else ())
+        addition = sum(m.value for m in modifiers if m.formula == "ADDITION")
         return (float(getattr(target, "res", 0.0)) - reduction
+                + addition
                 + float(getattr(target, "roster_res_delta", 0))
                 + (own.res_bonus() if own else 0))
 
@@ -7297,12 +8171,13 @@ class Battle:
         if (
             runtime is None
             or runtime.element is not ElementType.DARK
+            or runtime.template_driven
             or not getattr(getattr(source, "elements", None), "enemy_unit", False)
         ):
             return 1.0
         remaining_ratio = max(
             0.0,
-            min(source.elements.cooldown_remaining / runtime.duration, 1.0),
+            min(1.0 - runtime.effect_elapsed / runtime.duration, 1.0),
         )
         return 1.0 - 0.5 * remaining_ratio
 
@@ -7503,6 +8378,28 @@ class Battle:
             owner.buff_blackboards.pop(key, None)
         return True
 
+    @staticmethod
+    def _flag_finish_binding_issue(owner: Any, flag: str) -> str | None:
+        if owner is None:
+            return None
+        if not isinstance(owner, (_Enemy, _Operator)):
+            return "flag_finish_owner_binding"
+        if owner.buffs.flagged_instances(ABNORMAL_READ_FLAGS.get(flag, flag), pending=True):
+            return "flag_finish_pending_birth_binding"
+        return None
+
+    def behavior_finish_flag_buffs(self, context: BehaviorContext, node: dict[str, Any]) -> bool:
+        owner = context.entity(node.get("_targetType"))
+        flag = ABNORMAL_READ_FLAGS[node["_abnormalFlag"]]
+        if issue := self._flag_finish_binding_issue(owner, flag):
+            return self.behavior._unsupported(node_name(node) + ":" + issue)
+        if owner is not None:
+            for item in owner.buffs.flagged_instances(flag):
+                owner.buffs.finish(item)
+        # Native Execute returns success, including an empty/no-target cleanup.
+        # MarkFinish is queued; the existing container owns the finish phase.
+        return True
+
     def behavior_finish_buff(
         self, owner: _Enemy | _Operator | None, key: str
     ) -> bool:
@@ -7566,7 +8463,7 @@ class Battle:
 
     def _active_operator(self, char_id: str) -> _Operator | None:
         for op in reversed(self.operators):
-            if op.char_id == char_id and not op.dead:
+            if (op.char_id == char_id or getattr(op, "stage_alias", None) == char_id) and not op.dead:
                 return op
         return None
 
@@ -7657,12 +8554,15 @@ class Battle:
     ) -> None:
         if op.departure_processed:
             return
+        self.unlock_skill_progress(op)
         op.departure_processed = True
+        if self.vecbreak.enabled: self.vecbreak.depart(op)
         self._dispatch_component_lifecycle(op, "ON_OWNER_FINISH")
         self._dispatch_component_lifecycle(op, "ON_BUFF_FINISH")
         self.component_catalog.detach(op)
         respawn_scale = min([1.0] + [r.departure_respawn_scale(op) for r in effect_runtimes(self)
                                     if not r.op.dead or r.op is op])
+        if self.vecbreak.enabled: respawn_scale *= self.vecbreak.respawn(op)
         if op.form_runtime is not None:
             op.form_runtime.depart()
         if op.healing_runtime is not None:
@@ -7682,10 +8582,12 @@ class Battle:
             op.target_selector.dispose()
         if not preserve_redeploy_state:
             penalty = min(self.redeploy_penalty.get(op.char_id, 0) + 1, 2)
-            self.redeploy_penalty[op.char_id] = penalty
+            self.redeploy_penalty[op.char_id] = 0 if self.vecbreak.enabled and op.char_id == VEC_TRAP else penalty
             self.redeploy_ready_at[op.char_id] = self.time + op.respawn_time * respawn_scale
 
     def _try_deploy(self, plan: OperatorPlan) -> OperationAttempt:
+        if plan.char_id.startswith("trap_") and plan.char_id not in predefined_builds(self.level):
+            return OperationAttempt("skip", "stage_card_unavailable")
         if plan.char_id == SOUL_WARD:
             return OperationAttempt("skip", "token_automatic_spawn_only")
         if plan.char_id == "token_10057_svash2_eagle1":
@@ -7717,7 +8619,7 @@ class Battle:
         base_cost = int(attrs.get("cost", 0))
         cost = self.deployment_cost(plan.char_id, base_cost)
         row, col = plan.tile
-        profession = deployment_position(self.characters[plan.char_id])
+        profession = deployment_position(self.characters[plan.char_id], plan.char_id)
         details = {"tile": list(plan.tile), "cost": cost, "available_cost": self.dp,
                    "cost_lower_bound": self.cost_lower_bound,
                    "occupied_slots": sum(1 for op in self.operators if not op.dead and getattr(op, "uses_deployment_slot", True)),
@@ -7732,7 +8634,7 @@ class Battle:
         blockers = []
         if self.time + 1e-9 < details["redeploy_ready_at"]:
             blockers.append("redeploy_cooldown")
-        if details["occupied_slots"] >= self.character_limit:
+        if details["occupied_slots"] >= self.character_limit and plan.char_id != VEC_TRAP:
             blockers.append("deployment_limit")
         if self.dp - cost < self.cost_lower_bound:
             blockers.append("insufficient_cost")
@@ -7762,3 +8664,4 @@ class Battle:
                 runtime.deck_discount = None
         self.squad_effects.deployed(deployed.char_id)
         self._sync_squad_effects()
+        if self.vecbreak.enabled: self.vecbreak.born_operator(deployed)

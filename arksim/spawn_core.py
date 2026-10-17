@@ -308,7 +308,7 @@ def build_spawn_frame_schedule(
                           if drained else process_start)
             if fragment_timings is not None:
                 fragment_timings.append({"wave": wave_index, "fragment": fragment_index,
-                                         "wave_start": wave_start, "completion": completion})
+                                         "wave_start": wave_start, "fragment_start": process_start, "completion": completion})
             max_wait = _number(wave.get("maxTimeWaitingForNextWave"), -1.0)
             if truncate_on_timeout and max_wait > 0 and completion - wave_start > _frames(max_wait):
                 break

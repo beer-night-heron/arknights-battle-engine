@@ -77,7 +77,7 @@ async function checkDraft() {
 }
 async function loadProject(project) {
   await Promise.all(project.squad.map(b=>loadDetail(b.char_id)));
-  const stage=project.stage?await api(stageUrl(project.stage,project.options?.optional_runes)):null;
+  const stage=project.stage?await api(stageUrl(project.stage,project.options?.optional_runes,project.options?.battle_buffs)):null;
   stageRequest++;buildRequest++;
   state.project=project;state.stage=stage;state.selectedBuild=null;state.draftDirty=false;state.tile=null;state.preview=0;
   state.operationDirty=false;cancelEdit();$('buildForm').hidden=true;$('buildName').textContent='选择一名干员';
@@ -129,10 +129,15 @@ function markDirty() {
 function operatorName(id) {return state.catalog?.operators.find(o=>o.id===id)?.name || detailFor(id)?.name || id;}
 function frameText(time) {const frame=Math.round(time*30);return `${Math.abs(time*30-frame)>1e-6?'约 ':''}f${frame}`;}
 function operationMembers() {
-  return state.project.squad.flatMap(b=>[b,...(detailFor(b.char_id)?.tokens||[]).filter(t=>t.skill===b.skill_id).map(t=>{
+  const members=state.project.squad.flatMap(b=>[b,...(detailFor(b.char_id)?.tokens||[]).filter(t=>t.skill===b.skill_id).map(t=>{
     state.details.set(t.id,{id:t.id,name:t.name,position:t.position,skills:[],modules:[],tokens:[]});
     return {char_id:t.id,owner:b.char_id,token:true};
   })]);
+  for(const card of state.stage?.predefinedCards||[]) {
+    state.details.set(card.detail.id,card.detail);
+    members.push({...card.build,predefined:true});
+  }
+  return members;
 }
 function selectedMember() {return operationMembers().find(b=>b.char_id===$('opChar').value);}
 function detailFor(id) {return state.details.get(id);}
@@ -157,8 +162,9 @@ function updateStageOptions() {
   const stages=state.catalog.stages.filter(s=>`${s.id} ${s.code} ${s.name}`.toLowerCase().includes(term)||s.id===state.project.stage);
   setOptions($('stageSelect'),[{value:'',label:'请选择关卡'},...stages.map(s=>({value:s.id,label:`${s.code} · ${s.name}${state.catalog.stages.filter(other=>other.code===s.code&&other.name===s.name).length>1?` · ${s.id}`:''}`}))],state.project.stage);
 }
-function stageUrl(id,runes=[]) {
+function stageUrl(id,runes=[],buffs=[]) {
   const query=new URLSearchParams({id});for(const rune of runes||[])query.append('rune',rune);
+  for(const buff of buffs||[])query.append('buff',buff);
   return `/api/stage?${query}`;
 }
 async function selectStage(id, dirty=true) {
@@ -167,8 +173,9 @@ async function selectStage(id, dirty=true) {
   if (request!==stageRequest) return;
   state.project.stage=id; state.stage=stage; state.tile=null;
   state.project.options.optional_runes=[];
+  state.project.options.battle_buffs=[];
   if (dirty) markDirty();
-  updateStageView();renderMaps(); renderOperationForm();
+  updateStageView();renderSquad();renderMaps(); renderOperationForm();
 }
 function updateStageView() {
   const meta=state.catalog.stages.find(s=>s.id===state.project.stage),stage=state.stage;
@@ -178,6 +185,9 @@ function updateStageView() {
   const groups=stage?.runeGroups||[];
   $('runeOptions').hidden=!groups.some(g=>g.length);
   $('runeOptions').innerHTML=groups.map((group,index)=>group.length?`<label>沙盘 ${index+1} 级条件<select data-rune-group="${index}"><option value="">不选择</option>${group.map(r=>`<option value="${escapeText(r.id)}" ${(state.project.options.optional_runes||[]).includes(r.id)?'selected':''}>${escapeText(r.description)}</option>`).join('')}</select></label>`:'').join('');
+  const buffs=stage?.battleBuffs,selected=state.project.options.battle_buffs||[];
+  $('buffOptions').hidden=!buffs?.items?.length;
+  $('buffOptions').innerHTML=buffs?.items?.length?`<p>战备补给：已选 ${selected.length} / ${buffs.limit}</p>${buffs.items.map(b=>`<label style="display:block;margin:8px 0"><input type="checkbox" data-buff="${escapeText(b.id)}" ${selected.includes(b.id)?'checked':''} ${state.branch?'disabled':''}> ${escapeText(b.name)}：${escapeText(b.description)}</label>`).join('')}`:'';
 }
 function renderSearch() {
   const term=$('operatorSearch').value.trim().toLowerCase();
@@ -298,8 +308,8 @@ function tileClass(tile,allowed=false) {
 }
 function renderMaps() {
   if(state.branch){
-    const position=detailFor($('opChar').value)?.position,allowed=[];
-    state.stage?.map.cells.forEach((row,r)=>row.forEach((cell,c)=>{if(cell.build===position)allowed.push([r,c]);}));
+    const detail=detailFor($('opChar').value),position=detail?.buildablePosition??detail?.position,allowed=[];
+    state.stage?.map.cells.forEach((row,r)=>row.forEach((cell,c)=>{if(deploymentTileMatches(position,cell.build))allowed.push([r,c]);}));
     sendWorkspace('selection',{selection:{tile:state.tile,facing:state.facing,char:$('opChar').value,action:$('opAction').value,allowed}});return;
   }
   const map=state.stage?.map;
@@ -453,9 +463,18 @@ $('stageSelect').addEventListener('change',guard(event=>selectStage(event.target
 $('runeOptions').addEventListener('change',guard(async()=>{
   const runes=[...$('runeOptions').querySelectorAll('select')].map(s=>s.value).filter(Boolean);
   const request=++stageRequest,id=state.project.stage;
-  const stage=await api(stageUrl(id,runes));if(request!==stageRequest)return;
+  const stage=await api(stageUrl(id,runes,state.project.options.battle_buffs));if(request!==stageRequest)return;
   state.project.options.optional_runes=runes;state.stage=stage;state.tile=null;
   markDirty();updateStageView();renderMaps();renderOperationForm();
+}));
+$('buffOptions').addEventListener('change',guard(async event=>{
+  const id=event.target.dataset.buff;if(!id||state.branch)return;
+  const previous=state.project.options.battle_buffs||[];
+  const buffs=event.target.checked?[...previous,id]:previous.filter(b=>b!==id);
+  try {
+    const stage=await api(stageUrl(state.project.stage,state.project.options.optional_runes,buffs));
+    state.project.options.battle_buffs=buffs;state.stage=stage;markDirty();
+  } finally {updateStageView();}
 }));
 $('operatorSearch').addEventListener('input',()=>state.catalog&&renderSearch());
 $('searchResults').addEventListener('click',guard(event=>{const button=event.target.closest('[data-id]');if(button)return openBuild(button.dataset.id);}));
@@ -482,7 +501,7 @@ $('mapBoard').addEventListener('click',guard(event=>{
   const button=event.target.closest('[data-r]');if(!button)return;
   if($('opAction').value!=='DEPLOY')return;
   const tile=[Number(button.dataset.r),Number(button.dataset.c)],cell=state.stage.map.cells[tile[0]][tile[1]];
-  if(cell.build!==detailFor($('opChar').value)?.position)throw new Error('此干员不能部署在该格子，请选择高亮的可部署格');
+  if(!deploymentTileMatches(detailFor($('opChar').value)?.buildablePosition??detailFor($('opChar').value)?.position,cell.build))throw new Error('此干员不能部署在该格子，请选择高亮的可部署格');
   state.tile=tile;renderOperationForm();renderMaps();
 }));
 $('operationForm').addEventListener('submit',guard(event=>{event.preventDefault();addOperation();}));
@@ -551,7 +570,7 @@ window.addEventListener('message',guard(async event=>{
   }
   if(message.type==='tile'&&state.branch&&$('opAction').value==='DEPLOY'){
     const [r,c]=message.tile,cell=state.stage?.map.cells[r]?.[c];
-    if(cell?.build!==detailFor($('opChar').value)?.position)return;
+    if(!deploymentTileMatches(detailFor($('opChar').value)?.buildablePosition??detailFor($('opChar').value)?.position,cell?.build))return;
     state.tile=[r,c];renderOperationForm();renderMaps();markOperationDraft();
   }
 }));

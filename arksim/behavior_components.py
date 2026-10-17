@@ -1,24 +1,28 @@
 """Resource-driven passive attachment, independent of character identifiers.
 
-Only reviewed stateless listeners are enabled here. Other component
-classes and lifecycle events remain discoverable, with an explicit reason.
+Reviewed passive listeners reuse owner-local Buff clocks and attributes.
+Other component classes and lifecycle events retain an explicit gap reason.
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
-from .behavior import BehaviorInterpreter, node_name
-from .loadout import select_candidate
+from .behavior import (BehaviorInterpreter, BehaviorContext, node_name, registered_buff_spec_issue,
+                       calculated_blackboard_value, assigned_blackboard_value, BLACKBOARD_READ_NODES, read_blackboard_value,
+                       BLACKBOARD_CONDITION_FIELDS, blackboard_condition_value, default_blackboard_values,
+                       ENTITY_VALUE_READ_FIELDS, FINISH_BUFF_FIELDS, no_source_damage_value)
+from .loadout import select_candidate, select_abilities, module_phase
 
 
 PASSIVE_BUFF_SCRIPT = 3800760148018415462
 FORMAT = "arksim-behavior-components"
 CALCULATE = "ON_CALCULATE_DAMAGE"
 CACHED_CALCULATE = "ON_CALCULATE_CACHED_PROJECTILE_DAMAGE"
-LIFECYCLE_EVENTS = {"ON_BUFF_START", "ON_OWNER_FINISH", "ON_BUFF_FINISH"}
+LIFECYCLE_EVENTS = {"ON_BUFF_START", "ON_OWNER_FINISH", "ON_BUFF_FINISH", "ON_BUFF_ENABLE", "ON_BUFF_DISABLE"}
 PASSIVE_SKILL_SCRIPT = -2816356044270894278
+SKILL_PROGRESS_HOOKER_SCRIPT = -8650025640945540263
 TOGGLE_SKILL_SCRIPT = -2080331894047689788
 TALENT_SCRIPT = -2726233351382997147
 OUTPUT = "ON_OUTPUT_MODIFIER"
@@ -268,6 +272,16 @@ _BUFF_DEFAULTS = {
     "priorityBBKeys": [], "enableInitDirectionFromSource": 0,
 }
 _NODE_FIELDS = {
+    "SetMaxMinusHpRatio": {"_targetType", "_value"},
+    "CheckIfAtMinusHpState": {"_targetType"},
+    "LockCharacterSkillProgress": {"_targetType"},
+    "UnlockCharacterSkillProgress": {"_targetType"},
+    "FinishAllBuffsWithCertainAbnormalFlag": {"_targetType", "_abnormalFlag"},
+    "CheckAbnormalFlag": {"_abnormalFlag", "_targetType", "_isUnset", "_abnormalFlagKey"},
+    "CheckAbnormalImmune": {"_abnormalFlag", "_targetType", "_isUnset"},
+    **ENTITY_VALUE_READ_FIELDS,
+    **BLACKBOARD_CONDITION_FIELDS,
+    "EnsureBlackboardDefaultValue": {"_defaultSettings"},
     "IfElse": {"_conditionNode", "_succeedNodes", "_failNodes"},
     "AlwaysNext": set(), "IfNot": set(), "Not": set(),
     "IfTarget": {"_targetType", "_motionMask", "_checkTargetAlive", "_checkApplyWay",
@@ -280,10 +294,116 @@ _NODE_FIELDS = {
     "ModifySp": {"_targetType", "_modifyByRatio", "_modifyRatio", "_modifyByRatioBasedOnCurSP",
         "_modifyBySpCost", "_dontCheckSpType", "_spMask", "_forceFlag", "_dontShowSpUI",
         "_modifyValue", "_spString", "_isMinis", "_customModifierKey"},
+    "CreateBuff": {"_buff", "_buffOwner", "_useSpecialBuffSource", "_specialBuffSource",
+        "_isDerivedBuff", "_finishDerivedBuffIfParentFinish", "_inherateSourceProjectileFromParentBuff",
+        "_hookEffectKeyFromSourceProjectile"},
+    "CreateBuffInRange": {"_sourceType", "_targetType", "_targetOptions", "_useCentainSide",
+        "_side", "_useHostAsSource", "_excludeTarget", "_excludeCurAtkTarget", "_alwaysIncudeCurAtkTarget",
+        "_alwaysIncludeSourceBlocker", "_randomTarget", "_limitMaxTarget", "_useAttackRange",
+        "_useCurrentModeRange", "_useRangeToShow", "_rangeTargetSideType", "_rangeModeIndex",
+        "_useTargetRangeInsteadOfSource", "_rangeId", "_useRadius", "_useGlobalRange", "_radius",
+        "_filterByBuildableType", "_allowedBuildableType", "_filterByTags", "_allowFilterTags",
+        "_checkGiantTrapAllLocateTiles", "_buffs", "_isDerivedBuff", "_finishDerivedBuffIfParentFinish",
+        "_removeExcludeTargetBeforeShrink", "_filterTargets", "_filterType", "_maxTargetKey"},
+    "FinishBuff": {"_decCntIfStack", "_updateOverrideMap"},
+    "FinishDerivedBuff": {"_updateOverrideMap"},
+    "FinishBuffsById": FINISH_BUFF_FIELDS,
+    "CheckContainsBuff": {"_targetType", "_buffKeys", "isAND", "_loadFromBlackboard",
+        "_checkBuffSource", "_buffSourceType", "_checkSourceHost"},
+    "CheckContainsDerviedBuff": {"_derviedBuffKey"},
+    "AssignValueToBB": {"_blackboardKey", "_value", "_copyFromKey", "_assignString", "_stringValue", "_valueStr"},
+    "BlackboardAdd": {"_blackboardKey", "_blackboardKeyFromBb", "_addition", "_additionKey",
+                      "_isFloat", "_outputKey", "_maxKey"},
+    "IsBlackboardZero": {"_var", "_noVarShowWarning"},
+    "CalculateBlackboardValueViaParams": {"_inputKey", "_outputKey", "_multiplyParamKey", "_dividedParamKey",
+        "_addParamKey", "_minusParamKey", "_maxValueKey", "_minValueKey", "_useRemainder",
+        "_finalAbs", "_finalCeil", "_finalFloor", "_finalRound", "_useAbilityBlackboard", "_abilityName"},
+    "AssignCharacterSkillBlackboardToBB": {"_targetType", "_sourceBlackboardKey", "_targetBlackboardKey"},
+    "AssignBuffBlackboardFromOthers": {"_targetType", "_blackboardKey", "_buffKey", "_valueKey",
+                                     "_filterBuffSource", "_sourceType"},
 }
+BLACKBOARD_NODES = {"AssignValueToBB", "BlackboardAdd", "IsBlackboardZero", "CalculateBlackboardValueViaParams",
+                   "EnsureBlackboardDefaultValue"} | BLACKBOARD_READ_NODES | BLACKBOARD_CONDITION_FIELDS.keys()
+OWNER_STATE_NODES = {"SetMaxMinusHpRatio", "CheckIfAtMinusHpState", "CheckAbnormalFlag", "CheckAbnormalImmune",
+                     "LockCharacterSkillProgress", "UnlockCharacterSkillProgress", "FinishAllBuffsWithCertainAbnormalFlag",
+                     "FinishDerivedBuff"}
 
 
-def passive_issue(component: dict, spec: dict, *, idle_timer=False) -> str | None:
+_BUFF_ENUMS = {"lifeTimeType": {0: "IMMEDIATELY", 1: "LIMITED", 2: "INFINITY"},
+        "triggerLifeType": {0: "IMMEDIATELY", 1: "LIMITED", 2: "INFINITY"},
+        "statusResistable": {0: "NO", 1: "YES", 2: "AUTOMATIC"},
+        "overrideType": {0: "DEFAULT", 1: "STACK", 2: "UNIQUE", 3: "EXTEND", 4: "EXTEND_TIME"}, "onEventPriority": {0: "DEFAULT"}}
+
+
+def database_passive_spec(spec: dict) -> dict:
+    """Adapt a resolved DB row to the existing serialized-component validator."""
+    result = dict(spec)
+    for key, default in _BUFF_DEFAULTS.items():
+        if result.get(key) is None:
+            result[key] = default
+    for key, mapping in _BUFF_ENUMS.items():
+        inverse = {value: number for number, value in mapping.items()}
+        value = result.get(key)
+        if isinstance(value, str) and value in inverse:
+            result[key] = inverse[value]
+    result["blackboard"] = spec.get("blackboard") or []
+    return result
+
+
+def normalized_passive_spec(spec: dict, *, periodic: bool = False) -> dict:
+    """Convert reviewed serialized enums, never interpret unknown ordinals."""
+    result = dict(spec)
+    mappings = _BUFF_ENUMS
+    for key, mapping in mappings.items():
+        value = spec.get(key, _BUFF_DEFAULTS[key])
+        if type(value) is int and value in mapping:
+            result[key] = mapping[value]
+        elif isinstance(value, str) and value in mapping.values():
+            result[key] = value
+        else:
+            raise ValueError("enum:" + key)
+    attributes = dict(spec.get("attributes") or {})
+    flag_names = {0: "STUNNED", 5: "INVINCIBLE", 6: "UNDEADABLE", 7: "HEAL_FREE", 9: "INVISIBLE",
+                  16: "FROZEN", 17: "CAMOUFLAGE", 25: "LEVITATE", 36: "FORCE_LEVITATE", 45: "GROUND_BOUND"}
+    flags = []
+    for flag in attributes.get("abnormalFlags") or []:
+        if type(flag) is int and flag in flag_names:
+            flags.append(flag_names[flag])
+        elif isinstance(flag, str):
+            flags.append(flag)
+        else:
+            raise ValueError("enum:abnormalFlag")
+    attributes["abnormalFlags"] = flags
+    modifiers = []
+    for modifier in attributes.get("attributeModifiers") or []:
+        item = dict(modifier)
+        for key, mapping in (("attributeType", {0: "MAX_HP", 1: "ATK", 2: "DEF", 3: "MAGIC_RESISTANCE", 6: "MOVE_SPEED", 7: "ATTACK_SPEED",
+                13: "HP_RECOVERY_PER_SEC", 14: "SP_RECOVERY_PER_SEC", 19: "HP_RECOVERY_PER_SEC_BY_MAX_HP_RATIO",
+                26: "ONE_MINUS_STATUS_RESISTANCE", 35: "EP_BREAK_RECOVER_SPEED", 36: "SLOW_DOWN"}),
+                             ("formulaItem", {0: "ADDITION", 1: "MULTIPLIER", 2: "FINAL_ADDITION", 3: "FINAL_SCALER"})):
+            value = item.get(key)
+            if type(value) is int and value in mapping:
+                item[key] = mapping[value]
+            elif not isinstance(value, str) or value not in mapping.values():
+                raise ValueError("enum:" + key)
+        modifiers.append(item)
+    attributes["attributeModifiers"] = modifiers
+    result["attributes"] = attributes
+    # BuffContainer owns the interval. An idle serialized clock needs no tick.
+    if not periodic:
+        result["triggerLifeType"] = "IMMEDIATELY"
+    if not periodic:
+        result["triggerInterval"] = -1
+    if result["lifeTimeType"] == "INFINITY":
+        result["durationKey"] = None
+    return result
+
+
+def passive_issue(component: dict, spec: dict, *, idle_timer=False, periodic=False) -> str | None:
+    if periodic and not (spec.get("triggerLifeType") in (1, 2) and type(spec.get("triggerInterval")) in (int, float)
+                         and math.isfinite(spec["triggerInterval"])
+                         and (spec["triggerInterval"] > 0 or spec["triggerInterval"] == -1)):
+        return "trigger_clock"
     if set(component) - _COMPONENT_FIELDS:
         return "component_fields"
     if not component.get("m_Enabled", 1):
@@ -304,23 +424,89 @@ def passive_issue(component: dict, spec: dict, *, idle_timer=False) -> str | Non
     if set(spec) - allowed:
         return "buff_fields"
     for key, default in _BUFF_DEFAULTS.items():
+        if key in {"isSilenceable", "isStunnable", "isDamageMissable"} and spec.get(key, 0) in (0, 1):
+            continue
+        if key == "statusResistable" and spec.get(key, 2) in (0, 1, 2, "NO", "YES", "AUTOMATIC"):
+            continue
+        if key == "overrideType" and spec.get(key, 0) in (1, 2, 3, 4):
+            continue
+        if key == "overrideKey" and (spec.get("overrideType") in (1, 2, 3, 4) or
+                type(spec.get("priority")) is int and spec["priority"] >= 0 or
+                spec.get("overrideType", 0) == 0 and bool(spec.get("priorityBBKeys"))) and isinstance(spec.get(key, ""), str):
+            continue
+        if key == "priorityBBKeys" and spec.get("overrideType", 0) == 0 and isinstance(spec.get(key), list):
+            continue
+        if key == "priority" and spec.get("overrideType", 0) == 0 and type(spec.get(key)) is int and 0 <= spec[key] <= 2147483647:
+            continue
+        if key == "maxStackCnt" and spec.get("overrideType") == 1 and type(spec.get(key, 1)) is int and 1 <= spec.get(key, 1) <= 2147483647:
+            continue
+        if key == "clearAllStackCntWhenTimeUp" and spec.get("overrideType") == 1 and spec.get(key, 0) in (0, 1):
+            continue
+        if periodic and key in {"triggerLifeType", "triggerCnt"} and spec.get("triggerLifeType") == 1:
+            if type(spec.get("triggerCnt")) is int and 0 <= spec["triggerCnt"] <= 2147483647:
+                continue
+            return "trigger_count"
         if key == "disableOverride" and spec.get(key, 0) in (0, 1):
             continue  # Duplicate bindings are still rejected as a whole.
-        if idle_timer and key in {"triggerLifeType", "triggerInterval"}:
-            if spec.get("triggerLifeType") == 2 and type(spec.get("triggerInterval")) in (int, float) and math.isfinite(spec["triggerInterval"]) and spec["triggerInterval"] > 0:
+        if key == "waitFirstTriggerInterval" and (periodic or idle_timer) and spec.get(key, 1) in (0, 1):
+            continue
+        if key == "firstTriggerInterval" and periodic and type(spec.get(key, -1)) in (int, float) and math.isfinite(spec.get(key, -1)) and spec.get(key, -1) >= 0:
+            continue
+        if key in {"lifeTimeType", "lifeTime"}:
+            if spec.get("lifeTimeType", 2) in (1, 2) and type(spec.get("lifeTime", 0)) in (int, float) and math.isfinite(spec.get("lifeTime", 0)) and spec.get("lifeTime", 0) >= 0:
+                continue
+        if (idle_timer or periodic) and key in {"triggerLifeType", "triggerInterval"}:
+            if spec.get("triggerLifeType") in (1, 2) and type(spec.get("triggerInterval")) in (int, float) and math.isfinite(spec["triggerInterval"]) and (spec["triggerInterval"] > 0 or spec["triggerInterval"] == -1):
                 continue
         if spec.get(key, default) != default:
             return "buff:" + key
-    if any((spec.get("attributes") or {}).values()):
-        return "attributes"
+    try:
+        normalized = normalized_passive_spec(spec, periodic=periodic)
+    except (ValueError, TypeError):
+        return "attributes/enums"
+    # Duplicate component bindings still have their own conservative gate.
+    checked = {**normalized, "durationKey": None,
+               "stripBlackboardParamsWithBuffKey": False}
+    if issue := registered_buff_spec_issue(checked):
+        return issue
     if not spec.get("buffKey") or not spec.get("templateKey"):
         return "buff_template_key"
-    # durationKey is unused for an infinite passive; no periodic timer exists.
+    # Infinite duration keys are inert; active clocks belong to BuffContainer.
     return None
 
 
 def event_phase(template: dict) -> tuple[str | None, str | None]:
     events = template.get("eventToActions") or {}
+    if not events and template.get("templateKey") == "empty":
+        return "buff-events", None
+    owner_events = LIFECYCLE_EVENTS | {AFTER_ATTACK, "ON_BUFF_TRIGGER"}
+    if events and set(events) <= owner_events and any(
+            node_name(node) in {"CreateBuff", "CreateBuffInRange", "FinishBuff", "FinishBuffsById", "CheckContainsBuff", "CheckContainsDerviedBuff"} | BLACKBOARD_NODES | OWNER_STATE_NODES
+            for node in _action_nodes(events)):
+        allowed = {"IfElse", "AlwaysNext", "IfNot", "Not", "ModifySp", "CreateBuff", "CreateBuffInRange",
+                   "FinishBuff", "FinishBuffsById", "CheckContainsBuff", "CheckContainsDerviedBuff"} | BLACKBOARD_NODES | OWNER_STATE_NODES
+        for node in _action_nodes(events):
+            name = node_name(node)
+            if name not in allowed:
+                return None, "owned_buff_node:" + name
+            if set(node) - (_NODE_FIELDS[name] | {"$type"}):
+                return None, "owned_buff_fields:" + name
+            if name == "CheckContainsBuff" and node.get("_checkSourceHost"):
+                return None, "owned_buff_source_host"
+            if name in BLACKBOARD_NODES | OWNER_STATE_NODES and (issue := BehaviorInterpreter._unsupported_variant(node)):
+                return None, issue
+            if name == "CreateBuff" and node.get("_useSpecialBuffSource") and node.get("_specialBuffSource") not in {"SOURCE", "BUFF_OWNER", "BUFF_SOURCE"}:
+                return None, "owned_buff_role"
+            for role in ("_targetType", "_buffOwner", "_sourceType", "_buffSourceType"):
+                if name == "AssignBuffBlackboardFromOthers" and role == "_sourceType" and not node.get("_filterBuffSource"):
+                    continue
+                if name == "FinishBuffsById" and role == "_sourceType" and not node.get("_checkBuffSource"):
+                    continue
+                if role in node and node[role] not in {"SOURCE", "BUFF_OWNER", "BUFF_SOURCE"}:
+                    return None, "owned_buff_role"
+        if template.get("onEventPriority", "DEFAULT") != "DEFAULT":
+            return None, "event_priority"
+        return "buff-events", None
     if set(events) == {OUTPUT}:
         actions = events[OUTPUT]
         if (not isinstance(actions, list) or not actions or not isinstance(actions[0], dict)
@@ -330,7 +516,7 @@ def event_phase(template: dict) -> tuple[str | None, str | None]:
         if issue or phase != "notify":
             return None, issue or "heal_output_nodes"
         return "heal-output", None
-    if events and set(events) <= LIFECYCLE_EVENTS | {AFTER_ATTACK}:
+    if events and set(events) <= owner_events:
         # Lifecycle events have no damage target/modifier. Only an owner's
         # stateless SP action and ordinary sequence control are bound here.
         allowed = {"ModifySp", "AlwaysNext", "IfNot", "Not"}
@@ -410,13 +596,211 @@ def event_phase(template: dict) -> tuple[str | None, str | None]:
     return None, "node_phase:" + ",".join(sorted(kinds - flow))
 
 
-def numeric_issue(actions: Any, board: dict) -> str | None:
+class _PreviewBoard(dict):
+    """Keep abstract actor state outside user blackboard keys."""
+
+    def __init__(self, board, preview):
+        super().__init__(board)
+        self.actor_preview = preview
+
+
+def numeric_issue(actions: Any, board: dict, *, node_validator=None, blackboard_reader=None,
+                  actor_preview=None, final_states: list[dict] | None = None) -> str | None:
+    """Preflight possible ordered states without executing side effects."""
+    watched_reads = set(ENTITY_VALUE_READ_FIELDS)
+    def read_order(value, dirty=False):
+        if isinstance(value, list):
+            for item in value:
+                issue, dirty = read_order(item, dirty)
+                if issue: return issue, dirty
+            return None, dirty
+        if not isinstance(value, dict): return None, dirty
+        name = node_name(value)
+        if name in watched_reads and dirty:
+            return name + ":after_actor_mutation_binding", dirty
+        if name == "IfElse":
+            issue, current = read_order(value.get("_conditionNode"), dirty)
+            if issue: return issue, current
+            issue, yes = read_order(value.get("_succeedNodes") or [], current)
+            if issue: return issue, yes
+            issue, no = read_order(value.get("_failNodes") or [], current)
+            return issue, yes or no
+        if name in {"CreateBuff", "CreateBuffInRange", "FinishBuff", "FinishBuffsById", "SwitchMode",
+                    "FinishAllBuffsWithCertainAbnormalFlag", "FinishDerivedBuff", "AdvancedApplyDamage", "NoSourceDamage", "AOEDamage", "DamageViaAttr", "DamageViaMaxHpRatio"}:
+            dirty = True
+        return None, dirty
+    if actor_preview is None:
+        if issue := read_order(actions)[0]:
+            return issue
+    else:
+        watched_reads |= {"AssignBuffBlackboardFromOthers", "AssignCharacterSkillBlackboardToBB"}
+        # Keep existing abstract gates for events that need no actor overlay.
+        # Their different final Buff states cannot affect an earlier read.
+        override_actions = any(node_name(node) in {"CreateBuff", "CreateBuffInRange"}
+            and any(not spec.get("disableOverride", False) and (
+                spec.get("priority", -1) != -1 or spec.get("priorityBBKeys") or
+                (spec.get("attributes") or {}).get("attributeModifiers"))
+                for spec in ([node.get("_buff") or {}] if node_name(node) == "CreateBuff"
+                             else node.get("_buffs") or [])) for node in _action_nodes(actions))
+        if read_order(actions)[0] is None and not override_actions:
+            actor_preview = None
+    if final_states is None and actor_preview is None and node_validator is None and not any(node_name(node) in BLACKBOARD_NODES for node in _action_nodes(actions)):
+        return _numeric_issue(actions, board)
+
+    def clone(state):
+        return (_PreviewBoard(state, state.actor_preview.clone()) if isinstance(state, _PreviewBoard)
+                else dict(state))
+
+    def equal(left, right):
+        return left == right and (not isinstance(left, _PreviewBoard)
+            or isinstance(right, _PreviewBoard) and left.actor_preview.same_state(right.actor_preview))
+
+    def unique(states):
+        result = []
+        for state, gate in states:
+            if not any(equal(state, old) and gate is old_gate for old, old_gate in result):
+                result.append((state, gate))
+        return result
+
+    def walk(value, state):
+        if isinstance(value, list):
+            states = [(clone(state), True)]
+            for child in value:
+                name = node_name(child) if isinstance(child, dict) else ""
+                next_states = []
+                for current, gate in states:
+                    if name == "AlwaysNext":
+                        next_states.append((current, True)); continue
+                    if name in {"IfNot", "Not"}:
+                        next_states.append((current, not gate if gate is not None else None)); continue
+                    problem, outcomes = walk(child, clone(current))
+                    if problem:
+                        return problem, []
+                    if gate is not False:
+                        next_states.extend(outcomes)
+                    if gate is not True:
+                        next_states.append((current, False))
+                states = unique(next_states)
+                if len(states) > 32:
+                    return "Blackboard:state_limit", []
+            return None, states
+        if not isinstance(value, dict):
+            return None, [(state, None)]
+        name = node_name(value)
+        if name in BLACKBOARD_CONDITION_FIELDS:
+            try:
+                passed = blackboard_condition_value(value, state)
+            except ValueError as exc:
+                return name + ":" + str(exc), []
+            return None, [(state, passed)]
+        if name == "EnsureBlackboardDefaultValue":
+            try:
+                values = default_blackboard_values(value, state)
+            except ValueError as exc:
+                return name + ":" + str(exc), []
+            state.update(values)
+            return None, [(state, True)]
+        if name == "IfElse":
+            condition = value.get("_conditionNode") or {}
+            problem, conditions = walk(condition, clone(state))
+            if problem:
+                return problem, []
+            outcomes = []
+            for current, passed in conditions:
+                problem, yes = walk(value.get("_succeedNodes") or [], clone(current))
+                if problem:
+                    return problem, []
+                problem, no = walk(value.get("_failNodes") or [], clone(current))
+                if problem:
+                    return problem, []
+                if passed is None:
+                    yes_boards = unique([(b, True) for b, _ in yes])
+                    no_boards = unique([(b, True) for b, _ in no])
+                    if any(not any(equal(b, other) for other, _ in no_boards) for b, _ in yes_boards) or any(
+                            not any(equal(b, other) for other, _ in yes_boards) for b, _ in no_boards):
+                        return "Blackboard:conditional_state_binding", []
+                    outcomes.extend(yes + no)
+                else:
+                    outcomes.extend(yes if passed else no)
+            return None, unique(outcomes)
+        if name == "AssignValueToBB":
+            try:
+                key, assigned = assigned_blackboard_value(value, state)
+            except ValueError as exc:
+                return name + ":" + str(exc), []
+            state[key] = assigned
+            return None, [(state, True)]
+        if name == "BlackboardAdd":
+            key = value.get("_blackboardKey")
+            if not isinstance(key, str) or not key:
+                return name + ":key", []
+            base = state.get(key, 0)
+            addition = state.get(value["_additionKey"], 0) if value.get("_additionKey") else value.get("_addition", 0)
+            if any(type(x) not in (int, float) or not math.isfinite(x) for x in (base, addition)):
+                return name + ":value", []
+            total = base + addition
+            if not math.isfinite(total):
+                return name + ":overflow", []
+            state[key] = total if value.get("_isFloat") else int(total)
+            return None, [(state, True)]
+        if name == "IsBlackboardZero":
+            key = value.get("_var")
+            if not isinstance(key, str) or not key:
+                return name + ":key", []
+            if key in state and (type(state[key]) not in (int, float) or not math.isfinite(state[key])):
+                return name + ":value", []
+            return None, [(state, key in state and abs(state[key]) <= 1e-9)]
+        if name == "CalculateBlackboardValueViaParams":
+            try:
+                passed, key, value = calculated_blackboard_value(value, state)
+            except ValueError as exc:
+                return name + ":" + str(exc), []
+            if passed:
+                state[key] = value
+            return None, [(state, passed)]
+        if name in BLACKBOARD_READ_NODES:
+            if blackboard_reader is None:
+                return name + ":reader_binding", []
+            try:
+                passed, key, read_value = blackboard_reader(value, state)
+            except ValueError as exc:
+                return name + ":" + str(exc), []
+            if passed:
+                state[key] = read_value
+            return None, [(state, passed)]
+        if problem := _numeric_issue(value, state):
+            return problem, []
+        if node_validator is not None and (problem := node_validator(value, state)):
+            return problem, []
+        if isinstance(state, _PreviewBoard):
+            try:
+                gate = state.actor_preview.apply(value, state)
+            except ValueError as exc:
+                return name + ":" + str(exc), []
+            return None, [(state, gate)]
+        return None, [(state, None)]
+
+    problem, outcomes = walk(actions, _PreviewBoard(board, actor_preview) if actor_preview is not None else dict(board))
+    if problem is None and final_states is not None:
+        for state, _ in outcomes:
+            snapshot = dict(state)
+            if snapshot not in final_states:
+                final_states.append(snapshot)
+    return problem
+
+
+def _numeric_issue(actions: Any, board: dict) -> str | None:
     """Validate supported numeric inputs before any event changes state."""
     if isinstance(actions, list):
-        return next((issue for item in actions if (issue := numeric_issue(item, board))), None)
+        return next((issue for item in actions if (issue := _numeric_issue(item, board))), None)
     if not isinstance(actions, dict):
         return None
     name = node_name(actions)
+    if name == 'NoSourceDamage':
+        try:
+            no_source_damage_value(actions, board)
+        except (ValueError, OverflowError) as exc:
+            return name + ':' + str(exc)
     fields = {"AtkScaleUp": (("_atkScaleKey", "_defaultValue", 1),),
               "ModifySp": (("_spString", "_modifyValue", 0),)}.get(name, ())
     for key, default_key, default in fields:
@@ -426,13 +810,65 @@ def numeric_issue(actions: Any, board: dict) -> str | None:
             value = board.get(actions.get(key), actions.get("_modifyRatio", 0))
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             return name + ":numeric_value"
-    return next((issue for value in actions.values() if (issue := numeric_issue(value, board))), None)
+    return next((issue for value in actions.values() if (issue := _numeric_issue(value, board))), None)
 
 
 def contains_sp_action(value: Any) -> bool:
     if isinstance(value, dict):
         return node_name(value) == "ModifySp" or any(contains_sp_action(child) for child in value.values())
     return isinstance(value, list) and any(contains_sp_action(child) for child in value)
+
+
+def _action_nodes(value):
+    if isinstance(value, dict):
+        if "$type" in value:
+            yield value
+        for child in value.values():
+            yield from _action_nodes(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _action_nodes(child)
+
+
+def talent_blackboard(marker: dict, board: dict, skill_board: dict, mode: int) -> tuple[dict, str | None]:
+    """Snapshot the reviewed talent@ overlay and explicit scale conditions.
+
+    Serialized fields and current skill data support this mapping; exact
+    native merge/initialization order remains a blackboard candidate.
+    """
+    result = dict(board)
+    scale_modes = marker.get("_scaleModeIndices") or []
+    if not isinstance(scale_modes, list) or any(type(index) is not int or index < 0 for index in scale_modes):
+        return result, "talent_scale_modes"
+    keys = marker.get("_scaleCertainKeyList") or []
+    if not isinstance(keys, list) or any(not isinstance(key, str) or not key for key in keys):
+        return result, "talent_scale_keys"
+    if marker.get("_applyTalentScale") and (not marker.get("_scaleCertainMode") or mode in scale_modes):
+        scale = skill_board.get("talent_scale", 1)
+        if type(scale) not in (int, float) or not math.isfinite(scale) or scale < 0:
+            return result, "talent_scale_value"
+        for key, value in tuple(result.items()):
+            if marker.get("_scaleCertainKeyFlag") and key not in keys:
+                continue
+            if type(value) in (int, float):
+                if not math.isfinite(value) or not math.isfinite(value * scale):
+                    return result, "talent_scale_numeric"
+                result[key] = value * scale
+    if marker.get("_applyStrBlackboardBySkill") and not marker.get("_applyBlackboardBySkill"):
+        return result, "talent_string_overlay_binding"
+    if marker.get("_applyBlackboardBySkill"):
+        for key, value in skill_board.items():
+            if not isinstance(key, str) or not key.startswith("talent@"):
+                continue  # Attack and skill namespaces are separate.
+            if isinstance(value, str) and marker.get("_applyStrBlackboardBySkill"):
+                result[key[len("talent@"):]] = value
+            elif type(value) in (int, float):
+                if not math.isfinite(value):
+                    return result, "talent_overlay_numeric"
+                result[key[len("talent@"):]] = value
+            elif not isinstance(value, str):
+                return result, "talent_overlay_value"
+    return result, None
 
 
 @dataclass
@@ -445,6 +881,10 @@ class ComponentListener:
     record: dict
     events: tuple[str, ...] = (CALCULATE,)
     started: bool = False
+    runtime_spec: dict | None = None
+    instance: Any = None
+    finished: bool = False
+    actor: Any = field(default=None, repr=False, compare=False)
 
 
 class ComponentCatalog:
@@ -462,6 +902,21 @@ class ComponentCatalog:
         self.resources = data.get("resources", {})
         if not isinstance(self.resources, dict):
             raise ValueError("behavior component resources must be a mapping")
+
+    def skill_progress_hooker(self, resource: str) -> dict | None:
+        """Resolve the exact serialized Hooker; do not assume every skill owns one."""
+        entry = self.resources.get(resource)
+        if not entry or not entry.get("active", True):
+            return None
+        candidates = [component.get("data") or {} for component in entry.get("components", [])
+            if ((component.get("data") or {}).get("m_Script") or {}).get("m_PathID") == SKILL_PROGRESS_HOOKER_SCRIPT
+            and (component.get("data") or {}).get("m_Enabled", 1)]
+        if len(candidates) != 1:
+            return None
+        data = candidates[0]
+        if not {"_restoreSkillBuff", "_endSkillBuff", "_skillDurationBBKey"} <= data.keys():
+            return None
+        return data
 
     def bind(self, battle, actor, resource: str, board: dict, *, reason=None, binding=None):
         """Attach whole supported passive listeners; never execute a partial tree."""
@@ -490,6 +945,12 @@ class ComponentCatalog:
             if not data.get("_buffs"):
                 record("pending", "empty_passive_buffs", component=component.get("id"))
             for spec in data.get("_buffs") or []:
+                if spec.get("loadFromDB"):
+                    try:
+                        spec = database_passive_spec(battle.buff_database.resolve_spec(spec))
+                    except ValueError as exc:
+                        record("pending", str(exc), component=component.get("id"), buff=spec.get("buffKey"))
+                        continue
                 key = spec.get("templateKey", "")
                 fields = {"component": component.get("id"), "buff": spec.get("buffKey"), "template": key}
                 if (binding or {}).get("mode") is not None and any(
@@ -497,9 +958,10 @@ class ComponentCatalog:
                         for old in actor.component_listeners):
                     record("pending", "mode_buff_collision", **fields)
                     continue  # Do not detach or claim an unrelated root buff.
-                template = battle.behavior.templates.get(key)
-                issue = passive_issue(data, spec, idle_timer=template is not None and
-                                      "ON_BUFF_TRIGGER" not in (template.get("eventToActions") or {}))
+                template = battle.behavior.resolve_template(key)
+                periodic = template is not None and "ON_BUFF_TRIGGER" in (template.get("eventToActions") or {})
+                issue = passive_issue(data, spec, idle_timer=template is not None and not periodic,
+                                      periodic=periodic)
                 if issue:
                     record("pending", issue, **fields)
                     continue
@@ -532,28 +994,60 @@ class ComponentCatalog:
                 if spec.get("stripBlackboardParamsWithBuffKey"):
                     prefix = spec["buffKey"] + "."
                     bound_board = {k[len(prefix):]: v for k, v in bound_board.items() if k.startswith(prefix)}
-                bound_board.update(battle._blackboard(spec))
-                attached_events = tuple(events) if phase in {"lifecycle", "owner-events", "heal-output"} else (CALCULATE,)
+                bound_board.update({str(item["key"]): item.get("valueStr") or item.get("value")
+                                   for item in spec.get("blackboard", []) if item.get("key") is not None})
+                attached_events = tuple(events) if phase in {"lifecycle", "owner-events", "heal-output", "buff-events"} else (CALCULATE,)
                 item = record("attached", phase=phase, events=list(attached_events),
                     deferred_events=[event for event in events if event not in attached_events], **fields)
                 battle.mechanic_diagnostics[{"lifecycle": "COMPONENT_LIFECYCLE_PHASE_CANDIDATE",
                     "owner-events": "COMPONENT_AFTER_ATTACK_PHASE_CANDIDATE",
-                    "heal-output": "COMPONENT_OUTPUT_PHASE_CANDIDATE"}.get(phase, "COMPONENT_CALCULATE_PHASE_CANDIDATE")] = 1
+                    "heal-output": "COMPONENT_OUTPUT_PHASE_CANDIDATE",
+                    "buff-events": "COMPONENT_BUFF_LIFECYCLE_PHASE_CANDIDATE"}.get(phase, "COMPONENT_CALCULATE_PHASE_CANDIDATE")] = 1
                 listener = ComponentListener(key, spec["buffKey"], phase, bound_board,
-                    bool(data.get("_ignoreIfOwnerDead")), item, attached_events)
+                    bool(data.get("_ignoreIfOwnerDead")), item, attached_events, actor=actor)
+                if (spec.get("lifeTimeType") == 1 or periodic or phase == "buff-events"
+                        or set(events) & {"ON_BUFF_ENABLE", "ON_BUFF_DISABLE"}
+                        or any((spec.get("attributes") or {}).values())):
+                    listener.runtime_spec = normalized_passive_spec(spec, periodic=periodic)
+                    # The listener's board has already applied prefix/explicit
+                    # parameters. Do not strip it for a second time.
+                    listener.runtime_spec["stripBlackboardParamsWithBuffKey"] = False
+                    listener.runtime_spec["blackboard"] = []
+                    battle.mechanic_diagnostics["COMPONENT_BUFF_CLOCK_PHASE_CANDIDATE"] = 1
+                    if phase in {"lifecycle", "owner-events", "buff-events"}:
+                        if battle._validated_buff_events(listener.runtime_spec, blackboard=bound_board,
+                                allowed_events=LIFECYCLE_EVENTS | {AFTER_ATTACK, "ON_BUFF_TRIGGER"},
+                                owner=actor, source=actor, immediate_children=True) is None:
+                            item.update(state="rejected", reason="buff_preflight")
+                            continue
+                    elif battle._behavior_buff_definition(listener.runtime_spec, bound_board) is None:
+                        item.update(state="rejected", reason="buff_preflight")
+                        continue
                 duplicates = [old for old in actor.component_listeners if old.buff_key == listener.buff_key]
                 if duplicates or listener.buff_key in actor.component_rejected_buffs:
                     actor.component_rejected_buffs.add(listener.buff_key)
                     for old in duplicates:
                         old.record.update(state="rejected", reason="duplicate_buff_binding")
+                        if old.instance is not None:
+                            actor.buffs.finish(old.instance)
                         actor.component_listeners.remove(old)
                     item.update(state="rejected", reason="duplicate_buff_binding")
                     battle.behavior._unsupported(key + ":component:duplicate_buff_binding")
                     continue
+                if listener.runtime_spec is not None and any(
+                        old.definition.key == listener.buff_key and not old.finished
+                        for old in (*actor.buffs.active, *actor.buffs.pending_add)):
+                    item.update(state="rejected", reason="buff_instance_collision")
+                    continue
+                if (listener.runtime_spec is not None and phase != "buff-events"
+                        and contains_sp_action(events) and not hasattr(actor, "sp_type")):
+                    item.update(state="rejected", reason="sp_controller_binding")
+                    battle.behavior._unsupported(key + ":component:sp_controller_binding")
+                    continue
                 if not self.validate(battle, listener):
                     item.update(state="rejected", reason="preflight")
                     continue
-                if phase in {"lifecycle", "owner-events"} and any(battle.execute_behavior_event(key, event,
+                if listener.runtime_spec is None and phase in {"lifecycle", "owner-events"} and any(battle.execute_behavior_event(key, event,
                         source=actor, buff_owner=actor, blackboard=bound_board, validate_only=True) is None
                         for event in attached_events):
                     item.update(state="rejected", reason="event_binding")
@@ -561,21 +1055,38 @@ class ComponentCatalog:
                 actor.component_listeners.append(listener)
 
     @staticmethod
-    def validate(battle, listener: ComponentListener) -> bool:
+    def validate(battle, listener: ComponentListener, *, initializing: bool = False) -> bool:
         key = listener.template
-        template = battle.behavior.templates.get(key)
+        template = battle.behavior.resolve_template(key)
         if template is None:
             return battle.behavior.validate_event(key, CALCULATE)
         phase, issue = event_phase(template)
         if issue or phase != listener.phase:
             return battle.behavior._unsupported(key + ":component:" + (issue or "phase_changed"))
-        events = tuple(template["eventToActions"]) if phase in {"lifecycle", "owner-events", "heal-output"} else (CALCULATE,)
+        events = tuple(template["eventToActions"]) if phase in {"lifecycle", "owner-events", "heal-output", "buff-events"} else (CALCULATE,)
         if events != listener.events:
             return battle.behavior._unsupported(key + ":component:events_changed")
-        for event in events:
-            issue = numeric_issue(template["eventToActions"][event], listener.board)
-            if issue:
-                return battle.behavior._unsupported(key + ":component:" + issue)
+        started_boards = [listener.board]
+        ordered_events = (["ON_BUFF_START"] if "ON_BUFF_START" in events else []) + [
+            event for event in events if event != "ON_BUFF_START"]
+        for event in ordered_events:
+            source = listener.instance.source if listener.instance is not None else listener.actor
+            context = BehaviorContext(source=source, target=listener.actor, buff_owner=listener.actor,
+                buff_source=source, buff_instance=listener.instance, battle=battle,
+                register_buffs=listener.runtime_spec is not None, event=event)
+            definition = (listener.instance.definition if listener.instance is not None else
+                battle._behavior_buff_definition(listener.runtime_spec, listener.board)
+                if listener.runtime_spec is not None else None)
+            completed = []
+            for event_board in ([listener.board] if event == "ON_BUFF_START" or listener.started and not initializing else started_boards):
+                issue = numeric_issue(template["eventToActions"][event], event_board,
+                    blackboard_reader=lambda node, board: battle._read_preflight_blackboard(node, context, board),
+                    actor_preview=battle._behavior_attribute_preview(context, root_definition=definition, event=event),
+                    final_states=completed)
+                if issue:
+                    return battle.behavior._unsupported(key + ":component:" + issue)
+            if event == "ON_BUFF_START" and completed and (not listener.started or initializing):
+                started_boards = completed
             if not battle.behavior.validate_event(key, event):
                 return False
         return True
@@ -590,15 +1101,42 @@ class ComponentCatalog:
         if mode is None:
             actor.component_talent_selection = (tuple(module_bindings), selected_talents)
         overrides = {key for _, key, _ in module_bindings if key and key != "trait"}
-        selected = {str(c["prefabKey"]): c for c in (selected_talents or {}).values() if c.get("prefabKey")}
+        actual_mode = mode if mode is not None else (actor.component_mode_index or 0)
+        plan = actor.build_plan
+        char = battle.characters[actor.char_id]
+        phase = module_phase(battle.battle_equips[plan.module_id], plan.module_level) if plan.module_id else None
+        candidates = [c for bundle in char.get("talents", []) if bundle
+                      for c in bundle.get("candidates") or []]
+        candidates += [c for part in (phase or {}).get("parts", [])
+                       for c in (part.get("addOrOverrideTalentDataBundle") or {}).get("candidates") or []]
+        for part in (phase or {}).get("parts", []):
+            tags = battle._module_ability_tags(plan.module_id)
+            if (not part.get("resKey") or part.get("isToken")
+                    or part.get("validInGameTag") is not None and part["validInGameTag"] not in tags.get("game_tags", ())
+                    or part.get("validInMapTag") is not None and part["validInMapTag"] not in tags.get("map_tags", ())):
+                continue
+            for candidate in (part.get("addOrOverrideTalentDataBundle") or {}).get("candidates") or []:
+                if ((candidate.get("validModeIndices") is None or actual_mode in candidate["validModeIndices"])
+                        and select_candidate([candidate], plan.elite, plan.level, plan.potential_rank) is not None):
+                    overrides.add(str(candidate.get("prefabKey")))
+        mode_keys = {str(c.get("prefabKey")) for c in candidates if c.get("validModeIndices") is not None}
+        chosen = selected_talents
+        if mode_keys:
+            _, chosen, _ = select_abilities(char, plan.elite, plan.level, plan.potential_rank, phase,
+                mode=actual_mode, **battle._module_ability_tags(plan.module_id))
+        selected = {str(c["prefabKey"]): c for c in (chosen or {}).values() if c.get("prefabKey")
+                    and (c.get("validModeIndices") is None or actual_mode in c["validModeIndices"])}
         bindings = []
         for item in entry.get("talents", []):
-            if mode is not None and item.get("mode") != mode:
-                continue
             key = item.get("key")
-            if key not in actor.talent_blackboards or (selected_talents is not None and key not in selected):
-                continue  # Locked/unselected talents are not missing support.
             marker = item.get("marker") or {}
+            mode_dependent = key in mode_keys or bool(marker.get("_scaleCertainMode"))
+            if mode is not None and item.get("mode") != mode and not (item.get("mode") is None and mode_dependent):
+                continue
+            skill_only = marker.get("_applyBlackboardBySkill") and not any(str(c.get("prefabKey")) == key for c in candidates)
+            if not skill_only and (key not in actor.talent_blackboards and key not in selected
+                                   or chosen is not None and key not in selected):
+                continue  # Locked/unselected talents are not missing support.
             issue = item.get("issue")
             if not marker.get("m_Enabled", 1):
                 continue
@@ -606,34 +1144,46 @@ class ComponentCatalog:
                 issue = issue or "talent_component_class"
             if item.get("mode") is not None and mode is None:
                 issue = issue or "talent_mode_handoff"
-            if marker.get("_checkValidBySkillIndex"):
+            skill_indices = marker.get("_checkValidBySkillIndex") or []
+            if (not isinstance(skill_indices, list) or any(type(index) is not int or index < 0 for index in skill_indices)
+                    or skill_indices and actor.skill_index is None):
                 issue = issue or "talent_skill_index_binding"
-            if selected.get(key, {}).get("validModeIndices") is not None:
-                issue = issue or "talent_data_mode_binding"
+            elif skill_indices and actor.skill_index not in skill_indices:
+                continue
             if set(marker) - _TALENT_FIELDS:
                 issue = issue or "talent_fields"
-            if (any(marker.get(k) for k in _TALENT_FLAGS) or marker.get("_defaultModeIndex", -1) != -1
+            supported = {"_applyBlackboardBySkill", "_applyStrBlackboardBySkill", "_applyTalentScale",
+                         "_scaleCertainKeyFlag", "_scaleCertainKeyList", "_scaleCertainMode", "_scaleModeIndices"}
+            if (any(marker.get(k) for k in _TALENT_FLAGS - supported) or marker.get("_defaultModeIndex", -1) != -1
                     or marker.get("_attackBlackboardModeIndex", -1) != -1):
                 issue = issue or "talent_blackboard_binding"
             if key in overrides:
                 issue = issue or "module_ability_override"
-            bindings.append((item, key, issue))
-        for item, key, issue in bindings:
-            if mode is not None and any(x.get("mode") is None and x.get("key") == key
+            board = battle._blackboard(selected[key]) if key in mode_keys and key in selected else actor.talent_blackboards.get(key, {})
+            board, board_issue = talent_blackboard(marker, board, actor.skill_blackboard, actual_mode)
+            issue = issue or board_issue
+            bindings.append((item, key, issue, board, mode_dependent))
+        for item, key, issue, board, mode_dependent in bindings:
+            if item.get("mode") is not None and mode is not None and any(x.get("mode") is None and x.get("key") == key
                                         for x in entry.get("talents", [])):
                 issue = issue or "mode_root_talent_collision"
-            if issue is None and sum(k == key and problem is None for _, k, problem in bindings) > 1:
+            if issue is None and sum(k == key and problem is None for _, k, problem, _, _ in bindings) > 1:
                 issue = "duplicate_root_talent_binding"
-            self.bind(battle, actor, item["resource"], actor.talent_blackboards[key], reason=issue,
+            self.bind(battle, actor, item["resource"], board, reason=issue,
                 binding={"kind": "talent", "prefab_key": key, "mode": item.get("mode"),
-                         "key_evidence": item.get("key_evidence")})
+                         "mode_dependent": mode_dependent, "key_evidence": item.get("key_evidence"),
+                         "blackboard_evidence": "talent_skill_mode_candidate"})
             if issue is None:
                 battle.mechanic_diagnostics["COMPONENT_TALENT_KEY_CANDIDATE"] = 1
+                if mode_dependent or any(item["marker"].get(k) for k in supported):
+                    battle.mechanic_diagnostics["COMPONENT_TALENT_BLACKBOARD_CANDIDATE"] = 1
 
     @staticmethod
     def detach(actor):
         for listener in actor.component_listeners:
             listener.record["state"] = "detached"
+            if listener.instance is not None:
+                actor.buffs.finish(listener.instance)
         actor.component_listeners.clear()
         # Claims remain on the departed instance, preventing legacy fallback
         # for its already emitted packets after owned listeners are detached.
@@ -657,14 +1207,16 @@ class ComponentCatalog:
         if actor.component_mode_index == mode:
             return True
         outgoing = [x for x in actor.component_listeners
-                    if (x.record.get("binding") or {}).get("mode") is not None]
+                    if (x.record.get("binding") or {}).get("mode") is not None
+                    or (x.record.get("binding") or {}).get("mode_dependent")]
         battle._dispatch_component_lifecycle(actor, "ON_BUFF_FINISH", listeners=outgoing)
         for listener in outgoing:
             listener.record["state"] = "detached"
-            actor.component_listeners.remove(listener)
+            if listener in actor.component_listeners:
+                actor.component_listeners.remove(listener)
         # Claims owned solely by this mode cease to suppress its old adapter.
         # Root/module/skill claims, including rejected listeners, stay intact.
-        actor.component_claims.difference_update(actor.component_mode_claims)
+        actor.component_claims.difference_update(actor.component_mode_claims | {x.template for x in outgoing})
         actor.component_claims.update(x.template for x in actor.component_listeners)
         actor.component_rejected_buffs.difference_update(actor.component_mode_rejections)
         actor.component_mode_claims.clear()

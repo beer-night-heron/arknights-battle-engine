@@ -13,6 +13,7 @@ import struct
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable, Iterable
+from .health import gain_hp, lose_hp, extra_hp_limit
 
 
 class DamageType(str, Enum):
@@ -94,6 +95,9 @@ class DamagePacket:
     ability_owner: Any = None
     damage_resistance: float = 0.0
     notify_calculate: bool = True
+    ignore_block: bool = False
+    block_damage: bool = False
+    heal_can_general_shield: bool = False
 
     def normalized_damage_type(self) -> DamageType:
         value = str(getattr(self.damage_type, "value", self.damage_type)).upper()
@@ -163,6 +167,8 @@ class Status(str, Enum):
     FROZEN_ENEMY = "FROZEN_ENEMY"
     SLEEP = "SLEEP"
     LEVITATE = "LEVITATE"
+    GROUND_BOUND = "GROUND_BOUND"
+    FORCE_LEVITATE = "FORCE_LEVITATE"
     SILENCE = "SILENCE"
     SKILL_NOT_ACTIVATABLE = "SKILL_NOT_ACTIVATABLE"
     DISARMED = "DISARMED"
@@ -170,6 +176,7 @@ class Status(str, Enum):
     PALSY_TREMOR = "PALSY_TREMOR"
     SP_BLOCKED = "SP_BLOCKED"
     INVINCIBLE = "INVINCIBLE"
+    UNDEADABLE = "UNDEADABLE"
     UNTARGETABLE = "UNTARGETABLE"
     INVISIBLE = "INVISIBLE"
     CAMOUFLAGE = "CAMOUFLAGE"
@@ -192,6 +199,8 @@ class StatusController:
     resistance: float = 0.0
     resistances: dict[Status, float] = field(default_factory=dict)
     grants: set[tuple[Status, Any]] = field(default_factory=set)
+    abnormal_resistances: dict[Status, float] = field(default_factory=dict)
+    base_motion_flying: bool = False
 
     def grant(self, status: Status | str, owner: Any) -> bool:
         """Keep a source-owned flag separate from ordinary timed applications."""
@@ -217,7 +226,7 @@ class StatusController:
         if effect is Status.FROZEN:
             return any(
                 item in self.active_statuses()
-                for item in (Status.FROZEN_FRIENDLY, Status.FROZEN_ENEMY)
+                for item in (Status.FROZEN, Status.FROZEN_FRIENDLY, Status.FROZEN_ENEMY)
             )
         return effect in self.durations or any(item is effect for item, _ in self.grants)
 
@@ -364,7 +373,17 @@ class StatusController:
         return -30.0 * cold_count
 
     def _has_any(self, *statuses: Status) -> bool:
-        return any(self.has(status) for status in statuses)
+        return any(self.has(status) and (status is not Status.LEVITATE or self.levitate_active())
+                   for status in statuses)
+
+    def motion_counts(self) -> tuple[int, int]:
+        def count(status):
+            return int(status in self.durations) + sum(flag is status for flag, _ in self.grants)
+        return count(Status.LEVITATE), count(Status.GROUND_BOUND)
+
+    def levitate_active(self) -> bool:
+        lifted, grounded = self.motion_counts()
+        return lifted > grounded or lifted > 0 and lifted == grounded and self.base_motion_flying
 
 
 @dataclass(frozen=True)
@@ -387,6 +406,9 @@ class ElementBurstRuntime:
     source: Any = None
     tick_elapsed: float = 0.0
     anger_damage: float = 100.0
+    effect_elapsed: float = 0.0
+    template_root: Any = None
+    template_driven: bool = False
 
 
 @dataclass
@@ -411,8 +433,12 @@ class ElementController:
         *,
         neutral: bool = False,
         immune: bool = False,
+        burst_duration: float | None = None,
     ) -> ElementResult:
         kind = _element(element)
+        if burst_duration is not None and (type(burst_duration) not in (int, float)
+                or not math.isfinite(burst_duration) or burst_duration <= 0):
+            raise ValueError("element burst duration must be finite and positive")
         requested = max(float(amount), 0.0)
         current = self.value(kind)
         if neutral or immune or self.cooldown_remaining > 0 or requested <= 0:
@@ -428,6 +454,8 @@ class ElementController:
             duration = _ELEMENT_BREAK_DURATION[kind]
             if kind is ElementType.WATER and self.enemy_unit:
                 duration = 8.0
+            if burst_duration is not None:
+                duration = float(burst_duration)
             self.active_break = kind
             self.cooldown_remaining = duration
         return ElementResult(kind, requested, applied, remaining, burst, duration)
@@ -444,10 +472,10 @@ class ElementController:
             self.values[kind] = after
         return after - before
 
-    def tick(self, dt: float) -> ElementType | None:
+    def tick(self, dt: float, *, burst_dt: float | None = None) -> ElementType | None:
         if self.cooldown_remaining > 0:
             ended = self.active_break
-            self.cooldown_remaining = max(0.0, self.cooldown_remaining - dt)
+            self.cooldown_remaining = max(0.0, self.cooldown_remaining - (dt if burst_dt is None else burst_dt))
             if self.cooldown_remaining <= 1e-9:
                 self.values.clear()
                 self.active_break = None
@@ -506,6 +534,7 @@ def apply_damage(
     on_output: Callable[[DamagePacket, Any], None] | None = None,
     on_taking_damage: Callable[[DamagePacket, Any], None] | None = None,
     before_apply: Callable[[DamagePacket, Any], None] | None = None,
+    on_block_damage: Callable[[DamagePacket, Any], None] | None = None,
 ) -> DamageResult:
     """Resolve and apply one packet to an entity with common combat fields."""
     damage_type = packet.normalized_damage_type()
@@ -522,10 +551,8 @@ def apply_damage(
         basic = max(float(packet.amount), 0.0)
         amount = (basic * packet.output_scale * packet.taken_scale
                   * getattr(target, "received_heal_scale", 1.0))
-        missing = max(float(target.max_hp) - float(target.hp), 0.0)
-        healed = min(amount, missing)
-        target.hp += healed
-        return DamageResult(basic, healed, healed, healed=True)
+        healed = gain_hp(target, amount, packet=packet)
+        return DamageResult(basic, healed, healed, healed=True, killed=target.dead)
 
     if (
         (statuses.has(Status.INVINCIBLE) or statuses.has(Status.SLEEP))
@@ -615,6 +642,12 @@ def apply_damage(
     cancelled = False
     evaded = False
 
+    if packet.block_damage and damage_type is not DamageType.LIFE_LOSS:
+        absorbed = amount
+        blocked = True
+        if not packet.ignore_block:
+            amount = 0.0
+
     if not packet.bypass_rules and damage_type is not DamageType.LIFE_LOSS:
         rules: Iterable[DamageRule] = getattr(target, "damage_rules", [])
         ordered = sorted(rules, key=lambda rule: (-rule.priority, rule.acquired_order))
@@ -629,14 +662,17 @@ def apply_damage(
             elif kind is DamageRuleKind.BARRIER and rule.value > 0:
                 used = min(amount, rule.value)
                 rule.value -= used
-                amount -= used
                 absorbed += used
-                blocked = amount <= 1e-9
+                full_block = amount - used <= 1e-9
+                blocked = blocked or full_block
+                if not (full_block and packet.ignore_block):
+                    amount -= used
             elif kind is DamageRuleKind.SHIELD and rule.stacks > 0:
                 rule.stacks -= 1
                 absorbed += amount
-                amount = 0.0
                 blocked = True
+                if not packet.ignore_block:
+                    amount = 0.0
             elif kind is DamageRuleKind.EVADE:
                 if rule.stacks > 0:
                     rule.stacks -= 1
@@ -662,14 +698,16 @@ def apply_damage(
                 amount = 0.0
                 cancelled = True
 
+    if blocked and on_block_damage is not None:
+        on_block_damage(packet, target)
     amount = max(amount * packet.taken_scale, 0.0)
     if not packet.lethal:
-        amount = min(amount, max(float(target.hp) - 1.0, 0.0))
-    if (before_apply is not None and not cancelled and not blocked
+        extra = max(0.0, float(getattr(target, "extra_hp", 0))) if extra_hp_limit(target) > 0 else 0.0
+        amount = min(amount, max(float(target.hp) + extra - 1.0, 0.0))
+    if (before_apply is not None and not cancelled and (not blocked or packet.ignore_block)
             and damage_type is not DamageType.LIFE_LOSS):
         before_apply(packet, target)
-    target.hp -= amount
-    killed = target.hp <= 0
+    killed = lose_hp(target, amount)
     handler = getattr(target, "lethal_handler", None)
     if killed and callable(handler) and handler(packet):
         killed = False
@@ -764,7 +802,8 @@ def enemy_target_key(operator: Any, *, blocked: bool = False) -> tuple[Any, ...]
 def _status(value: Status | str) -> Status:
     if isinstance(value, Status):
         return value
-    return Status(str(value).upper())
+    name = str(value).upper()
+    return Status("STUNNED" if name == "STUN" else name)
 
 
 def _element(value: ElementType | str) -> ElementType:

@@ -108,7 +108,7 @@ class EditorServer(ThreadingHTTPServer):
             raise ValueError("回放与原方案的随机种子不一致")
         for field, option in (("spawnTiming", "spawn_timing"), ("enemyAttackTiming", "enemy_attack_timing"),
                               ("enemyMuzzle", "enemy_muzzle"), ("enemyTurning", "enemy_turning"),
-                              ("optionalRunes", "optional_runes")):
+                              ("optionalRunes", "optional_runes"), ("battleBuffs", "battle_buffs")):
             recorded = replay.get(field, case.get(field))
             if recorded is not None and recorded != original["options"][option]:
                 raise ValueError("回放与原方案的模拟选项不一致")
@@ -248,7 +248,7 @@ class EditorServer(ThreadingHTTPServer):
 
     def _run(self, job_id: str, folder: Path, project: dict, continuation: bool = False) -> None:
         opts = project["options"]
-        command = [sys.executable, str(ROOT / "tools/simulate.py"), "--data-dir", str(self.data.data_dir),
+        command = [sys.executable, "-B", str(ROOT / "tools/simulate.py"), "--data-dir", str(self.data.data_dir),
                    "--stage", project["stage"], "--plan", str(folder / ("original-plan.json" if continuation else "plan.json")),
                    "--squad", str(folder / "squad.json"),
                    "--spawn-timing", opts["spawn_timing"], "--enemy-attack-timing", opts["enemy_attack_timing"],
@@ -264,6 +264,8 @@ class EditorServer(ThreadingHTTPServer):
                 command.append("--" + key.replace("_", "-"))
         for rune in opts.get("optional_runes", []):
             command.extend(["--rune", rune])
+        for supply in opts.get("battle_buffs", []):
+            command.extend(["--buff", supply])
         try:
             result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, encoding="utf-8",
                                     errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -327,7 +329,7 @@ class EditorHandler(BaseHTTPRequestHandler):
             if url.path == "/api/catalog":
                 return self.respond({**self.server.data.catalog(), "engineVersion": __version__})
             if url.path == "/api/stage":
-                return self.respond(self.server.data.stage(params.get("id", [""])[0], params.get("rune", [])))
+                return self.respond(self.server.data.stage(params.get("id", [""])[0], params.get("rune", []), params.get("buff", [])))
             if url.path == "/api/operator":
                 return self.respond(self.server.data.operator(params.get("id", [""])[0]))
             if url.path == "/api/draft":

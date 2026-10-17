@@ -28,12 +28,13 @@ TALENT_INDICES = {
 
 def resolve_squad(plan: list[Any], squad: list[Any] | None, characters: dict,
                   skills: dict, modules: dict, module_index: dict,
-                  favor_table: dict) -> tuple[list[Any], set[str]]:
+                  favor_table: dict, predefined_ids: set[str] | None = None) -> tuple[list[Any], set[str]]:
     from .operator_skills import TOKEN_SKILLS, token_builds
     carried, ambiguous = {}, set()
+    predefined_ids = predefined_ids or set()
     if squad is None:
         for item in sorted(plan, key=lambda item: item.time):
-            if item.action != "DEPLOY" or item.char_id in TOKEN_SKILLS:
+            if item.action != "DEPLOY" or item.char_id in TOKEN_SKILLS or item.char_id in predefined_ids:
                 continue
             previous = carried.setdefault(item.char_id, item)
             if any(getattr(previous, key) != getattr(item, key) for key in BUILD_FIELDS):
@@ -49,6 +50,8 @@ def resolve_squad(plan: list[Any], squad: list[Any] | None, characters: dict,
             raise ValueError(f"squad item {index}: {error}") from error
     tokens = token_builds([vars(item) for item in carried.values()], characters)
     for item in plan:
+        if item.char_id in predefined_ids:
+            continue
         if item.char_id in TOKEN_SKILLS:
             expected = tokens.get(item.char_id)
             if expected is None:

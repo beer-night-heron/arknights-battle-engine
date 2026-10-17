@@ -5,7 +5,7 @@ the fixed-frame handoff remains a candidate until compared with a live battle.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from typing import Any
 
@@ -36,6 +36,7 @@ class MakotoS3:
     allout_members: list[Any] = field(default_factory=list)
     aura_rules: dict[int, tuple[Any, DamageRule]] = field(default_factory=dict)
     events: list[dict[str, Any]] = field(default_factory=list)
+    component_rebuild: list[Any] = field(default_factory=list)
 
     def __post_init__(self):
         timing = self.profile.get("body_attack", {})
@@ -92,6 +93,16 @@ class MakotoS3:
     def _reset(self):
         op, battle = self.owner, self.battle
         self._clear_aura()
+        if op.component_listeners:
+            self.component_rebuild = list(op.component_listeners)
+            battle._dispatch_component_lifecycle(op, "ON_BUFF_FINISH")
+            battle.component_catalog.detach(op)
+        # End real instances, including their precise cross-container children.
+        # Intrinsic component definitions are rebuilt at the existing handoff;
+        # external buffs must not return with them.
+        for instance in (*op.buffs.active, *op.buffs.pending_add):
+            op.buffs.finish(instance)
+        op.buffs.commit()
         op.pending_attack = None
         op.attack_cd = 0
         op.attack_chain_active = False
@@ -205,6 +216,15 @@ class MakotoS3:
         battle._squad_field_signature = None
         battle._sync_squad_effects()
         op.hp = op.max_hp
+        if self.component_rebuild:
+            for old in self.component_rebuild:
+                record = {**old.record, "state": "attached", "recreated_after_form": self.mode}
+                listener = replace(old, board=dict(old.board), record=record,
+                                   instance=None, started=False, finished=False)
+                op.component_listeners.append(listener)
+                battle.component_status.append(record)
+            self.component_rebuild.clear()
+            battle._dispatch_component_lifecycle(op, "ON_BUFF_START")
         battle.initialize_operator_target_selector(op, first_search_frame=battle.frame_index + 1)
         self.record("ENTER_" + self.mode)
 

@@ -17,6 +17,7 @@ from .assumptions import DEFAULT_ASSUMPTIONS
 from .loadout import resolve_plan
 from .squad import BUILD_FIELDS, resolve_squad
 from .runes import select_stage_runes
+from .vecbreak import select_supplies, predefined_builds, normalize_predefined
 from .battle import (
     ENEMY_ATTACK_TIMING_FLOAT,
     ENEMY_ATTACK_TIMING_MORTAR_FRAMES,
@@ -45,9 +46,21 @@ def build_config(
     squad_path: str | Path | None = None,
     difficulty: str | None = None,
     optional_runes: list[str] | None = None,
+    battle_buffs: list[str] | None = None,
 ) -> dict[str, Any]:
     """Shared input loading for summary and replay commands."""
     D.set_data_dir(data_dir)
+    stages = D.load_stages()
+    level = select_stage_runes(stages, stage, D.load_level(resolve_level_file(stages, stage)), optional_runes, difficulty)
+    level = select_supplies(level, stage, battle_buffs, D.load_vecbreak_data())
+    if stage == "act15d0_ex08":
+        level["mansfieldStage"] = stage
+    if stage in {"act18d0_ex03", "act18d0_ex03#f#"}:
+        level["wdExStage"] = stage
+    if stage == "act25side_ex03":
+        level["cwStage"] = stage
+    if stage == "main_09-10":
+        level["dublinStage"] = stage
     plan = load_plan(str(plan_path))
     characters = D.load_characters()
     skills = D.load_skills()
@@ -56,15 +69,13 @@ def build_config(
     favor_table = D.load_favor_table()
     for index, item in enumerate(plan, 1):
         try:
-            plan[index - 1] = resolve_plan(item, characters, skills, equips, module_index, favor_table)
+            plan[index - 1] = resolve_plan(normalize_predefined(item, level), characters, skills, equips, module_index, favor_table)
         except ValueError as error:
             raise ValueError(f"plan item {index}: {error}") from error
     squad = None
     if squad_path is not None:
         squad, _ = resolve_squad(plan, load_squad(squad_path), characters, skills,
-                                 equips, module_index, favor_table)
-    stages = D.load_stages()
-    level = select_stage_runes(stages, stage, D.load_level(resolve_level_file(stages, stage)), optional_runes, difficulty)
+                                 equips, module_index, favor_table, set(predefined_builds(level)))
     return {
         "level": level,
         "enemy_index": D.build_enemy_index(D.load_enemy_database()),
@@ -73,7 +84,7 @@ def build_config(
         "plan": plan,
         "squad": squad,
         "skills": skills,
-        "attack_timing": D.load_attack_timing(),
+        "attack_timing": D.load_attack_timing(stage),
         "operator_forms": D.load_operator_forms(),
         "operator_graphics": D.load_operator_graphics(),
         "behavior_templates": D.load_behavior_templates(),
@@ -202,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stage", required=True, help="stage ID from stage_table.json")
     parser.add_argument("--plan", required=True, help="path to a plan JSON file")
     parser.add_argument("--squad", help="carried operator builds, including undeployed operators")
-    parser.add_argument("--difficulty", choices=("NORMAL", "SIX_STAR"), help="override stage rune difficulty")
+    parser.add_argument("--difficulty", choices=("NORMAL", "FOUR_STAR", "SIX_STAR"), help="override stage rune difficulty")
     parser.add_argument("--rune", action="append", default=[], help="optional rune ID or level key; repeat for each selection")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
@@ -233,6 +244,7 @@ def main(argv: list[str] | None = None) -> int:
         default=ENEMY_ATTACK_TIMING_FLOAT,
         help="float enemy cooldowns or optional integer-frame mortar cooldowns",
     )
+    parser.add_argument("--buff", action="append", default=[], help="explicit battle supply ID; repeat up to the stage limit")
     args = parser.parse_args(argv)
     if args.runs <= 0:
         parser.error("--runs must be positive")
@@ -252,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
             squad_path=args.squad,
             difficulty=args.difficulty,
             optional_runes=args.rune,
+            battle_buffs=args.buff,
         )
     except (OSError, ValueError, KeyError) as error:
         parser.error(f"cannot load simulation inputs: {error}")

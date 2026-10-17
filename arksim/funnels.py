@@ -49,7 +49,8 @@ class Whitw2S1Runtime(OperatorSkillRuntime):
     def valid_funnel_target(self, enemy, *, stationary=False, locked=False):
         return (enemy is not None and self.b._enemy_is_attackable(enemy)
                 and self.b._enemy_targetable(enemy)
-                and (locked or not enemy.statuses.has(Status.CAMOUFLAGE))
+                and (locked or not self.b._enemy_camouflaged(enemy))
+                and (locked or self.b._operator_can_see(self.op, enemy))
                 and (not stationary or self.stationary(enemy)))
 
     def select_funnel_target(self, index):

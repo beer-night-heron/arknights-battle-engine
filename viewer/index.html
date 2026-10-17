@@ -418,6 +418,10 @@
       for(let r=0;r<map.height;r++) for(let c=0;c<map.width;c++){
         const tile=map.cells[r][c], [fill,stroke]=tileStyle(tile), x=g.ox+c*g.cell, y=g.oy+(map.height-r-1)*g.cell;
         ctx.fillStyle=fill; ctx.fillRect(x+1,y+1,g.cell-2,g.cell-2); ctx.strokeStyle=stroke; ctx.lineWidth=1; ctx.strokeRect(x+1.5,y+1.5,g.cell-3,g.cell-3);
+        if(frame.vecBreak?.pollutedTiles.some(tile=>tile[0]===r&&tile[1]===c)){
+          ctx.fillStyle='#b0527a66';ctx.fillRect(x+2,y+2,g.cell-4,g.cell-4);
+          ctx.fillStyle='#f2b6d1';ctx.font=`${Math.max(9,g.cell*.17)}px sans-serif`;ctx.fillText('躁乱',x+5,y+g.cell-6);
+        }
         if(tile.height==='HIGHLAND' && tile.build==='RANGED'){
           ctx.strokeStyle='#f4b94222'; ctx.beginPath(); ctx.moveTo(x+5,y+g.cell-5); ctx.lineTo(x+g.cell-5,y+5); ctx.stroke();
         }
@@ -440,7 +444,7 @@
       }
       for(const enemy of frame.enemies){if(enemy.hidden)continue;const [x,y]=xy(enemy.r,enemy.c,g),color=enemyColor(enemy),radius=Math.max(5,g.cell*.135);ctx.fillStyle='#07100fdd';ctx.strokeStyle=color;ctx.lineWidth=enemy.taunt?3:1.5;ctx.beginPath();ctx.arc(x,y,radius,0,Math.PI*2);ctx.fill();ctx.stroke();const ratio=Math.max(0,enemy.hp/enemy.max);ctx.strokeStyle=ratio>.5?COLORS.green:ratio>.2?COLORS.amber:COLORS.red;ctx.lineWidth=2;ctx.beginPath();ctx.arc(x,y,radius+3,-Math.PI/2,-Math.PI/2+Math.PI*2*ratio);ctx.stroke();if(state.ids){ctx.fillStyle=COLORS.ink;ctx.font='9px Consolas';ctx.textAlign='center';ctx.fillText(enemy.id,x,y+3);}if(state.selected.type==='enemy'&&state.selected.id===enemy.id){ctx.strokeStyle='#fff';ctx.lineWidth=1;ctx.strokeRect(x-radius-7,y-radius-7,(radius+7)*2,(radius+7)*2);}}
       for(const projectile of frame.projectiles||[]){const [x,y0]=xy(projectile.r,projectile.c,g),y=y0-projectile.arc*g.cell*.55,color=projectile.side==='ENEMY'?COLORS.red:COLORS.cyan,radius=Math.max(2.5,g.cell*.045);if(projectile.arc){ctx.fillStyle='#0008';ctx.beginPath();ctx.ellipse(x,y0,g.cell*.055,g.cell*.025,0,0,Math.PI*2);ctx.fill();}ctx.shadowColor=color;ctx.shadowBlur=8;ctx.fillStyle=color;ctx.beginPath();ctx.arc(x,y,radius,0,Math.PI*2);ctx.fill();ctx.shadowBlur=0;}
-      for(const op of frame.operators){const [x,y]=xy(op.r,op.c,g),s=Math.max(9,g.cell*.18);ctx.save();ctx.translate(x,y);ctx.rotate(Math.PI/4);ctx.fillStyle=op.dead?'#4b4030':COLORS.amber;ctx.strokeStyle='#fff2';ctx.fillRect(-s,-s,s*2,s*2);ctx.strokeRect(-s,-s,s*2,s*2);ctx.restore();const hp=Math.max(0,op.hp/op.max);ctx.fillStyle='#101715';ctx.fillRect(x-g.cell*.3,y+s+7,g.cell*.6,4);ctx.fillStyle=hp>.5?COLORS.green:hp>.2?COLORS.amber:COLORS.red;ctx.fillRect(x-g.cell*.3,y+s+7,g.cell*.6*hp,4);ctx.fillStyle=COLORS.ink;ctx.font='10px Consolas';ctx.textAlign='center';ctx.fillText(op.starting?'SKILL / BEGIN':op.active?'SKILL / ACTIVE':`SP ${fmt(op.sp)}`,x,y-s-8);}
+      for(const op of frame.operators){const [x,y]=xy(op.r,op.c,g),s=Math.max(9,g.cell*.18);ctx.save();ctx.translate(x,y);ctx.rotate(Math.PI/4);ctx.fillStyle=op.dead?'#4b4030':COLORS.amber;ctx.strokeStyle='#fff2';ctx.fillRect(-s,-s,s*2,s*2);ctx.strokeRect(-s,-s,s*2,s*2);ctx.restore();const hp=Math.max(0,op.hp/op.max);ctx.fillStyle='#101715';ctx.fillRect(x-g.cell*.3,y+s+7,g.cell*.6,4);ctx.fillStyle=hp>.5?COLORS.green:hp>.2?COLORS.amber:COLORS.red;ctx.fillRect(x-g.cell*.3,y+s+7,g.cell*.6*hp,4);if((op.minusHp??0)>0&&op.minusHpMax>0){ctx.fillStyle='#802e43';ctx.fillRect(x-g.cell*.3,y+s+7,g.cell*.6*Math.min(1,op.minusHp/op.minusHpMax),4);}ctx.fillStyle=COLORS.ink;ctx.font='10px Consolas';ctx.textAlign='center';ctx.fillText(op.starting?'SKILL / BEGIN':op.active?'SKILL / ACTIVE':`SP ${fmt(op.sp)}`,x,y-s-8);}
       const nearEvents=currentCase().events.filter(e=>!hiddenEventKinds.has(e.kind) && Math.abs(e.t-frame.t)<.18 && (e.r!==undefined));
       for(const event of nearEvents){const [x,y]=xy(event.r,event.c,g);ctx.strokeStyle=eventColor(event.kind);ctx.lineWidth=2;ctx.globalAlpha=.75;ctx.beginPath();ctx.arc(x,y,g.cell*.27,0,Math.PI*2);ctx.stroke();ctx.globalAlpha=1;}
       drawMuzzles(frame,g);
@@ -515,6 +519,7 @@
         if(entity){
           const attrs=entity.attributes||{};
           rows=[['ID',entity.id],['坐标',`${entity.r}, ${entity.c}`],['HP',`${fmt(entity.hp)} / ${fmt(entity.max)}`],['攻击力',attributeText(attrs.atk)],['防御力',attributeText(attrs.def)],['法术抗性',attributeText(attrs.res)],['攻击间隔',attributeText(attrs.attackInterval,' s')],['阻挡',`${entity.blocked} / ${attributeText(attrs.blockCapacity)}`],['技能',entity.starting?'开启动画':entity.active?'生效中':'未开启'],['已用技能',`${entity.casts} 次`],['状态',entity.dead?'倒下':'在场']];
+          if((entity.minusHpMax??0)>0)rows.splice(3,0,['负生命',`${fmt(entity.minusHp??0)} / ${fmt(entity.minusHpMax)}`]);
           rows.push(['出手挂点',hasMuzzle(entity)?`${entity.muzzle.r.toFixed(4)}, ${entity.muzzle.c.toFixed(4)}`:'未记录']);
           renderSp(entity);
           if(entity.form)rows.push(['形态',formName(entity.form)]);
@@ -528,7 +533,10 @@
         entity=frame.enemies.find(enemy=>enemy.id===state.selected.id);
         if(entity)rows=[['ID',entity.id],['类型',enemyCategory(entity)],['HP',`${fmt(entity.hp)} / ${fmt(entity.max)}`],['坐标',`${entity.r}, ${entity.c}`],['路线',`${entity.route}:${entity.routePoint}`],['阻挡者',entity.blocked??'—'],['稳定阻挡点',entity.blockStable?entity.blockStable.join(', '):'—'],['偏移剩余',entity.blockShift?`${fmt(entity.blockShift)} s`:'—'],['嘲讽',entity.taunt],['状态',entity.hidden?'消失':'可见']];
         if(entity)rows.push(['出手挂点',hasMuzzle(entity)?`${entity.muzzle.r.toFixed(4)}, ${entity.muzzle.c.toFixed(4)}`:'未记录']);
+        if(entity?.vecPhase!==undefined)rows.push(['Touch 阶段',entity.vecPhase===0?'重生中':entity.vecPhase],['减伤层数',entity.shieldStacks]);
       }
+      if((entity?.extraHpMax??0)>0)rows.push(['额外生命',`${fmt(entity.extraHp??0)} / ${fmt(entity.extraHpMax)}`]);
+      if(state.selected.type==='enemy'&&(entity?.minusHpMax??0)>0)rows.push(['负生命',`${fmt(entity.minusHp??0)} / ${fmt(entity.minusHpMax)}`]);
       el('entityName').textContent=entity?.name||entity?.key||entity?.char||'未选择实体';
       el('entityGrid').innerHTML=entity?rows.map(([label,value])=>`<div class="entity-field"><span>${label}</span><b>${value}</b></div>`).join(''):'<span>点击地图单位或待部署卡片</span>';
     }
@@ -542,7 +550,7 @@
       el('spawned').textContent=frame.spawned;
       el('frameIndex').textContent=`f${frame.fixedFrame??Math.round(frame.t*30)} / f${c.frames.at(-1).fixedFrame??Math.round(c.frames.at(-1).t*30)}`;
       const status=state.playing?'PLAY':state.frameIndex<c.frames.length-1?'PAUSED':c.result.win?'ALL CLEAR':'FINISHED / FAILED';
-      el('statusLine').textContent=`${status} · ${state.speed}× · ${logicFps} 帧/秒`;
+      el('statusLine').textContent=`${status} · ${state.speed}× · ${logicFps} 帧/秒${frame.vecBreak?` · 战备补给 ${frame.vecBreak.selectedBattleBuffs.length} 项`:''}`;
       el('timeline').value=state.frameIndex;
     }
     function drawMarkers(){const rect=resizeCanvas(markerCanvas,markerCtx),end=currentCase().frames.at(-1).t;markerCtx.clearRect(0,0,rect.width,rect.height);for(const event of currentCase().events){if(!['deploy','skill_cast','operator_death','leak'].includes(event.kind))continue;const x=end>0?event.t/end*rect.width:0;markerCtx.strokeStyle=eventColor(event.kind);markerCtx.beginPath();markerCtx.moveTo(x,2);markerCtx.lineTo(x,13);markerCtx.stroke();}}

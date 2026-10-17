@@ -52,6 +52,7 @@ class DynamicWaveScheduler:
             event.time += self.offset
             event.nominal_time += self.offset
             event.wave_start_time += self.wave_offsets[group.wave]
+            event.fragment_start_time += self.offset
             if event.logic_frame is not None:
                 event.logic_frame += round(self.offset * 30)
 

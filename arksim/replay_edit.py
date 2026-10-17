@@ -20,7 +20,7 @@ def runtime_signature(data_dir: Path, level_file: str) -> str:
              "projectile_data.json", "buff_template_data.json", "enemy_graphics.json", "operator_forms.json", "operator_graphics.json",
              "enemy_buff_abilities.json", "battle_equip_table.json", "uniequip_table.json", "favor_table.json",
              "behavior_components.json", "skill_behavior_components.json", "operator_behavior_components.json",
-             "operator_behavior_components_v2.json"}
+             "operator_behavior_components_v2.json", "vecbreak_data.json", "stage_attack_timing.json"}
     digest = hashlib.sha256()
     for name in sorted(files):
         path = data_dir / name

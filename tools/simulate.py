@@ -40,6 +40,10 @@ def compact_enemy(enemy: Any, battle: Battle) -> dict[str, Any]:
         "r": round(enemy.position_row, 4),
         "c": round(enemy.position_col, 4),
         "hp": round(enemy.hp, 2),
+        "extraHp": round(enemy.extra_hp, 2),
+        "extraHpMax": round(enemy.max_extra_hp_ratio * enemy.max_hp, 2),
+        "minusHp": round(enemy.minus_hp, 2),
+        "minusHpMax": round(enemy.max_minus_hp_ratio * enemy.max_hp, 2),
         "max": round(enemy.max_hp, 2),
         "blocked": (
             enemy.blocked_by.deployment_index if enemy.blocked_by else None
@@ -60,8 +64,21 @@ def compact_enemy(enemy: Any, battle: Battle) -> dict[str, Any]:
     }
     if enemy.facing is not None:
         state["facing"] = round(enemy.facing.value_at(battle.time), 4)
+    if battle.vecbreak.enabled:
+        state["statuses"] = sorted(s.value for s in enemy.statuses.active_statuses())
+        boss = battle.vecbreak.bosses.get(enemy.enemy_index)
+        if boss: state["vecPhase"], state["shieldStacks"] = boss["phase"], boss["stacks"]
+    if battle.mansfield.enabled:
+        runtime = battle.mansfield.states.get(enemy.enemy_index)
+        state["statuses"] = sorted(s.value for s in enemy.statuses.active_statuses())
+        if runtime:
+            state["mansfieldMode"] = runtime["mode"]
+            state["mansfieldPhase"] = runtime["phase"]
     if enemy.wisdel_remnant_source is not None and not enemy.wisdel_remnant_source.dead:
         state["remnantSource"] = enemy.wisdel_remnant_source.deployment_index
+    if battle.wdex.enabled and enemy.enemy_index in battle.wdex.states:
+        state["wdExMode"] = enemy.mode_index
+        state["statuses"] = sorted(s.value for s in enemy.statuses.active_statuses())
     muzzle = battle.enemy_muzzle_position_v3(enemy)
     if muzzle is not None:
         state["muzzle"] = {"r": round(muzzle[0], 4), "c": round(muzzle[1], 4), "z": round(muzzle[2], 4)}
@@ -92,6 +109,10 @@ def compact_operator(operator: Any, battle: Battle) -> dict[str, Any]:
         "r": operator.tile[0],
         "c": operator.tile[1],
         "hp": round(operator.hp, 2),
+        "minusHp": round(operator.minus_hp, 2),
+        "minusHpMax": round(operator.max_minus_hp_ratio * operator.max_hp, 2),
+        "extraHp": round(operator.extra_hp, 2),
+        "extraHpMax": round(operator.max_extra_hp_ratio * operator.max_hp, 2),
         "max": round(operator.max_hp, 2),
         "sp": round(operator.sp, 2),
         "spMax": round(operator.sp_max, 2),
@@ -185,7 +206,7 @@ def export_roster(battle: Battle) -> list[dict[str, Any]]:
             },
         })
     for operator in battle.operators:
-        if not hasattr(operator, "summoner"):
+        if not hasattr(operator, "summoner") and not hasattr(operator, "stage_alias"):
             continue
         roster.append({"profile": -operator.deployment_index, "char": operator.char_id,
                        "planned": False, "reserveEligible": False, "name": operator.name,
@@ -220,6 +241,11 @@ def reserve_state(battle: Battle, roster: list[dict[str, Any]]) -> list[dict[str
 def capture_state(battle: Battle, roster: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     dp_progress = min(1.0, max(0.0, battle.dp_timer / battle.cost_increase_time)) if battle.cost_increase_time > 0 else 0.0
     return {
+        "vecBreak": battle.vecbreak.snapshot() if battle.vecbreak.enabled else None,
+        "mansfield": battle.mansfield.snapshot() if battle.mansfield.enabled else None,
+        "wdEx": battle.wdex.snapshot() if battle.wdex.enabled else None,
+        "cw": battle.cw.snapshot() if battle.cw.enabled else None,
+        "dublin": battle.dublin.snapshot() if battle.dublin.enabled else None,
         "time": round(battle.time, 4),
         "dp": battle.dp,
         "dpDisplay": round(min(battle.max_cost, battle.dp + dp_progress), 4),
@@ -261,6 +287,11 @@ def capture_state(battle: Battle, roster: list[dict[str, Any]] | None = None) ->
 
 def snapshot(state: dict[str, Any]) -> dict[str, Any]:
     return {
+        **({"vecBreak": state["vecBreak"]} if state.get("vecBreak") else {}),
+        **({"mansfield": state["mansfield"]} if state.get("mansfield") else {}),
+        **({"wdEx": state["wdEx"]} if state.get("wdEx") else {}),
+        **({"cw": state["cw"]} if state.get("cw") else {}),
+        **({"dublin": state["dublin"]} if state.get("dublin") else {}),
         "t": round(state["time"], 3),
         "fixedFrame": round(state["time"] * 30),
         "dp": state["dp"],
@@ -456,7 +487,7 @@ def run_case(
         if battle.life_points <= 0:
             battle.end_reason = "life_points_depleted"
             break
-        if battle.all_spawns_finished() and not battle.enemies:
+        if battle.all_spawns_finished() and battle.all_counted_enemies_finished():
             battle.end_reason = "all_clear"
             break
     if not battle.end_reason:
@@ -467,6 +498,11 @@ def run_case(
         battle.rng.assert_consumed()
     events.extend(battle.operation_log.events)
     events.extend(battle.wave_scheduler.events)
+    events.extend(battle.vecbreak.events)
+    events.extend(battle.mansfield.events)
+    events.extend(battle.cw.events)
+    events.extend(battle.dublin.events)
+    events.extend(battle.wdex.events)
     for op in battle.operators:
         if op.form_runtime is not None:
             events.extend(make_event(item["time"], "form_change", target=op.deployment_index,
@@ -496,6 +532,7 @@ def run_case(
         "squad": [item.char_id for item in battle.squad],
         "difficulty": battle.level.get("selectedDifficulty", "NORMAL"),
         "optionalRunes": battle.level.get("selectedOptionalRunes", []),
+        "battleBuffs": battle.level.get("selectedBattleBuffs", []),
         "frames": frames,
         "events": events,
         "result": asdict(battle.result()),
@@ -544,8 +581,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stage", required=True)
     parser.add_argument("--plan", required=True)
     parser.add_argument("--squad", help="carried operator builds, including undeployed operators")
-    parser.add_argument("--difficulty", choices=("NORMAL", "SIX_STAR"))
+    parser.add_argument("--difficulty", choices=("NORMAL", "FOUR_STAR", "SIX_STAR"))
     parser.add_argument("--rune", action="append", default=[], help="optional rune ID or level key; repeat for each selection")
+    parser.add_argument("--buff", action="append", default=[], help="explicit battle supply ID; repeat up to the stage limit")
     parser.add_argument("--label", default="模拟")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--sample-interval", type=float, default=1 / 30)
@@ -606,6 +644,7 @@ def main(argv: list[str] | None = None) -> int:
             squad_path=args.squad,
             difficulty=args.difficulty,
             optional_runes=args.rune,
+            battle_buffs=args.buff,
         )
     except (OSError, ValueError, KeyError) as error:
         parser.error(f"cannot load simulation inputs: {error}")
@@ -648,7 +687,7 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("续编原编队与运行输入不一致")
         actual_options = {"seed": args.seed, "spawn_timing": args.spawn_timing,
                           "enemy_attack_timing": args.enemy_attack_timing, "enemy_muzzle": args.enemy_muzzle,
-                          "enemy_turning": args.enemy_turning, "optional_runes": args.rune}
+                          "enemy_turning": args.enemy_turning, "optional_runes": args.rune, "battle_buffs": args.buff}
         if actual_options != original["options"] or not context["edits"]:
             raise ValueError("续编选项或记录与运行输入不一致")
         previous_frame = -1
@@ -677,6 +716,7 @@ def main(argv: list[str] | None = None) -> int:
         "stage": args.stage, "spawnTiming": args.spawn_timing,
         "difficulty": shared["level"].get("selectedDifficulty", "NORMAL"),
         "optionalRunes": shared["level"].get("selectedOptionalRunes", []),
+        "battleBuffs": shared["level"].get("selectedBattleBuffs", []),
         "enemyAttackTiming": args.enemy_attack_timing,
         "enemyMuzzle": args.enemy_muzzle, "enemyTurning": args.enemy_turning,
         "map": export_map(shared["level"]), "cases": [case],
@@ -705,6 +745,7 @@ def main(argv: list[str] | None = None) -> int:
         "stage": args.stage, "plan": Path(args.plan).name, "seed": args.seed,
         "difficulty": shared["level"].get("selectedDifficulty", "NORMAL"),
         "optionalRunes": shared["level"].get("selectedOptionalRunes", []),
+        "battleBuffs": shared["level"].get("selectedBattleBuffs", []),
         "squad": Path(args.squad).name if args.squad else None,
         "sampleInterval": args.sample_interval,
         "spawnTiming": args.spawn_timing, "enemyAttackTiming": args.enemy_attack_timing,

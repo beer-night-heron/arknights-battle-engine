@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -39,11 +40,18 @@ def load_stages() -> dict[str, Any]:
     return _load("stage_table.json")
 
 
+def load_vecbreak_data() -> dict[str, Any]:
+    try:
+        return _load("vecbreak_data.json")
+    except FileNotFoundError:
+        return {}
+
+
 def load_enemy_database() -> dict[str, Any]:
     return _load("enemy_database.json")
 
 
-def load_attack_timing() -> dict[str, Any]:
+def load_attack_timing(stage: str | None = None) -> dict[str, Any]:
     try:
         timing = _load("enemy_attack_timing.json")
     except FileNotFoundError:
@@ -52,6 +60,13 @@ def load_attack_timing() -> dict[str, Any]:
         timing.update(_load("operator_attack_timing.json"))
     except FileNotFoundError:
         pass
+    if stage is not None:
+        try:
+            scoped = _load("stage_attack_timing.json").get("stages", {}).get(stage, {})
+        except FileNotFoundError:
+            scoped = {}
+        for key, entry in scoped.items():
+            timing[key] = {**timing.get(key, {}), **entry}
     return timing
 
 
@@ -67,6 +82,21 @@ def load_behavior_templates() -> dict[str, Any]:
     """Load client behaviour trees when they were exported with the data set."""
     try:
         return _load("buff_template_data.json")
+    except FileNotFoundError:
+        return {}
+
+
+def load_element_break_buffs() -> dict[str, Any]:
+    """Optional native element-break key directory from the selected data revision."""
+    try:
+        return _load("ep_breakbuff_table.json")
+    except FileNotFoundError:
+        return {}
+
+
+def load_buff_database() -> dict[str, Any]:
+    try:
+        return _load("buff_table.json")
     except FileNotFoundError:
         return {}
 
@@ -186,6 +216,32 @@ def mdef(value: Any, default: Any) -> Any:
             return value.get("m_value", default)
         return default
     return default if value is None else value
+
+
+def merge_enemy_data(target: dict, overlay: dict | None) -> dict:
+    """Keep defined variants/level overrides without mutating shared tables."""
+    for key, value in (overlay or {}).items():
+        if isinstance(value, dict):
+            if "m_defined" in value:
+                if value["m_defined"]:
+                    target[key] = deepcopy(value)
+            else:
+                merge_enemy_data(target.setdefault(key, {}), value)
+        elif key == "talentBlackboard" and value is not None:
+            board = {item["key"]: deepcopy(item) for item in target.get(key) or []}
+            board.update({item["key"]: deepcopy(item) for item in value})
+            target[key] = list(board.values())
+        elif value is not None:
+            target[key] = deepcopy(value)
+    return target
+
+
+def enemy_data_for_level(index: dict, key: str, level: dict) -> dict:
+    ref = next((item for item in level.get("enemyDbRefs", []) if item["id"] == key), {})
+    result = deepcopy(enemy_data_at(index, key, level=0))
+    if ref.get("level", 0):
+        merge_enemy_data(result, enemy_data_at(index, key, level=ref["level"]))
+    return merge_enemy_data(result, ref.get("overwrittenData"))
 
 
 def _interpolate_attributes(

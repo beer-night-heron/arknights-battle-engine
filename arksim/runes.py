@@ -22,15 +22,16 @@ def select_stage_runes(stages: dict[str, Any], stage: str, level: dict[str, Any]
         group_keys = {stages["sixStarRuneData"][key]["runeKey"] for key in group}
         if sum(key in group_keys for key in keys) > 1:
             raise ValueError("choose at most one optional rune per difficulty group")
-    selected = difficulty or ("SIX_STAR" if meta.get("difficulty") == "SIX_STAR" else "NORMAL")
+    selected = difficulty or (meta["difficulty"] if meta.get("difficulty") in
+                              {"NORMAL", "FOUR_STAR", "SIX_STAR"} else "NORMAL")
     return select_runes(level, selected, keys)
 
 
 def select_runes(level: dict[str, Any], difficulty: str = "NORMAL",
                  optional_keys: list[str] | None = None) -> dict[str, Any]:
     difficulty = difficulty.upper()
-    if difficulty not in {"NORMAL", "SIX_STAR"}:
-        raise ValueError("difficulty must be NORMAL or SIX_STAR")
+    if difficulty not in {"NORMAL", "FOUR_STAR", "SIX_STAR"}:
+        raise ValueError("difficulty must be NORMAL, FOUR_STAR or SIX_STAR")
     result = deepcopy(level)
     active = [r for r in (result.get("runes") or [])
               if r.get("difficultyMask", "ALL") in ("ALL", difficulty)]
@@ -80,7 +81,7 @@ def blackboard(rune: dict[str, Any]) -> dict[str, Any]:
 
 
 def forbidden_locations(level: dict[str, Any]) -> set[tuple[int, int]]:
-    cells = {(int(p["row"]), int(p["col"])) for p in level.get("tilesDisallowToLocate", [])}
+    cells = {(int(p["row"]), int(p["col"])) for p in level.get("tilesDisallowToLocate") or []}
     for rune in level.get("runes", []):
         if rune.get("key") == "global_forbid_location":
             value = str(blackboard(rune).get("location", ""))

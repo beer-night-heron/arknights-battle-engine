@@ -22,6 +22,8 @@
 | 文件 | 用途 / 缺失时的限制 |
 | --- | --- |
 | `buff_template_data.json` | 技能与 Buff 行为模板；缺失会限制数据驱动技能覆盖 |
+| `buff_table.json` | `loadFromDB` 的 Buff 定义，源路径为 `gamedata/buff_table.json`；缺失或缺条目时拒绝对应引用，不按引用处占位参数猜效果 |
+| `ep_breakbuff_table.json` | 元素爆发的精确 Buff 键、敌我持续时间；正常导出包含此表，缺失时保留旧持续时间回退并记录自动标记缺口 |
 | `battle_equip_table.json` | 模组属性和效果参数；使用 `module_id` 时需提供对应条目和等级 |
 | `uniequip_table.json` | 模组所属角色、解锁阶段/等级/信赖条件；装备模组时必需 |
 | `favor_table.json` | 将模组的信赖点门槛换算为信赖百分数；有非零门槛时必需 |
@@ -33,6 +35,8 @@
 | `behavior_components.json` | 模组的可选组件目录，关联已选资源与最终配装黑板；缺失保留既有兼容入口 |
 | `skill_behavior_components.json` | 技能的可选组件目录，关联技能资源与实际附加能力；复杂主动作仍由已有适配器处理 |
 | `operator_behavior_components_v2.json`、`operator_behavior_components.json` | 基础天赋与实际模式的可选组件目录，优先新版，旧版不重复合并；复杂绑定仍记录缺口 |
+| `vecbreak_data.json` | 同源活动战备补给，含 `activities` 与来源修订；缺失时不提供补给选项 |
+| `stage_attack_timing.json` | `stages[关卡ID][敌人ID]` 形式的专属动作时序，按关卡合入对应条目；其他关卡不读取该覆盖 |
 
 `levels_meta.json` 可随基础数据一起保存，当前主运行入口不依赖它。可选文件能省略不等于相应机制已有完整替代实现；需要精细模拟时应提供完整、相互兼容的数据。基础表格中有某角色或某技能，也不代表引擎已覆盖它的所有机制。
 
@@ -110,6 +114,16 @@ python tools/export_data.py --repo "你的本地数据仓库路径" --only-level
 `--level` 可重复使用；也可在导入基础表格的同时传入关卡。没有 `--level` 时只导入表格，不暗中指定示例关卡。`--out` 可更换目标目录，默认 `local/data/`；`--only-behaviors` 只更新行为模板。
 
 工具默认读取该数据仓库的 `HEAD`；用 `--ref "本地已有的修订号"` 可选另一版数据，无需切换该仓库的工作区。工具不会自动更新数据仓库或判断哪一版最新。同名目标文件会被更新，需保留原版本时先另存一个目录，或用 `--out` 导入新目录，检查后再选择它。工具不会生成引擎专用的攻击时序、弹体或敌方加成配置；这些文件需自行在本地提供。更换数据后需重启编辑器服务以读取新表格。
+
+## 战备补给与关卡动作资源
+
+完整表格导入同时将同一修订的 `activity_table.json` 中 `VEC_BREAK_V2` 转换为 `vecbreak_data.json`，不包含玩家概率实验。只补活动补给时可使用：
+
+```powershell
+python tools/export_data.py --repo "你的本地数据仓库路径" --ref "本地已有的修订号" --only-battle-supplies --out "新的本地数据目录"
+```
+
+仍需按前面的 `--level` 方法导入目标地图，并自行提供对应动作资源。专属技能覆盖从关卡 `enemyDbRefs` 读取，不应把某一关的技能初始冷却改成共享敌人表的默认值。新增配置及地图只留在本地数据目录。
 
 ## 版本管理
 

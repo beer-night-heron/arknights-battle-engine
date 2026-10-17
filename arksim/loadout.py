@@ -13,9 +13,9 @@ if TYPE_CHECKING:
     from .battle import OperatorPlan
 
 
-def deployment_position(char: dict[str, Any]) -> str:
-    """Hookmasters retain their trait's melee/highland placement permission."""
-    return "ALL" if char.get("subProfessionId") == "hookmaster" else str(char.get("position", "RANGED"))
+def deployment_position(char: dict[str, Any], character_id: str | None = None) -> str:
+    """Hookmasters and the predefined cleanse card allow both tile types."""
+    return "ALL" if char.get("subProfessionId") == "hookmaster" or character_id == "trap_339_tchray" else str(char.get("position", "RANGED"))
 
 
 def deployment_tile_matches(position: str, buildable_type: str) -> bool:
@@ -174,11 +174,22 @@ def _merge_candidate(base: dict | None, override: dict) -> dict:
 
 def select_abilities(char: dict, elite: int, level: int, potential_rank: int,
                      module: dict | None, *, game_tags: tuple[str, ...] = (),
-                     map_tags: tuple[str, ...] = ()) -> tuple[dict | None, dict[int, dict], list[str]]:
+                     map_tags: tuple[str, ...] = (), mode: int | None = None) -> tuple[dict | None, dict[int, dict], list[str]]:
+    if mode is not None and (type(mode) is not int or mode < 0):
+        raise ValueError("mode must be a nonnegative integer")
+    def valid_mode(candidate):
+        modes = candidate.get("validModeIndices")
+        if mode is None or modes is None:
+            return True
+        if not isinstance(modes, list) or any(type(index) is not int or index < 0 for index in modes):
+            raise ValueError("validModeIndices must contain nonnegative integers")
+        return mode in modes
+    def valid_candidates(candidates):
+        return [c for c in candidates or [] if valid_mode(c)]
     trait = select_candidate((char.get("trait") or {}).get("candidates"), elite, level, potential_rank)
     talents = {}
     for index, bundle in enumerate(char.get("talents") or []):
-        candidate = select_candidate(bundle.get("candidates"), elite, level, potential_rank)
+        candidate = select_candidate(valid_candidates((bundle or {}).get("candidates")), elite, level, potential_rank)
         if candidate is not None:
             talents[index] = candidate
     deferred = []
@@ -196,8 +207,11 @@ def select_abilities(char: dict, elite: int, level: int, potential_rank: int,
         groups: dict[tuple[int, str | None], list[dict]] = {}
         for candidate in (part.get("addOrOverrideTalentDataBundle") or {}).get("candidates") or []:
             if candidate.get("validModeIndices") is not None:
-                deferred.append(f"part:{index}:mode_condition")
-                continue
+                if mode is None:
+                    deferred.append(f"part:{index}:mode_condition")
+                    continue
+                if not valid_mode(candidate):
+                    continue
             if "talentIndex" not in candidate:
                 deferred.append(f"part:{index}:missing_talent_index")
                 continue

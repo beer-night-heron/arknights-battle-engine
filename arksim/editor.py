@@ -12,10 +12,11 @@ from .skill_controls import skill_controls
 from .squad import BUILD_FIELDS
 from .runes import select_stage_runes, forbidden_locations
 from .operator_skills import TOKEN_SKILLS, token_builds
+from .vecbreak import select_supplies, supply_catalog, predefined_builds
 
 OP_FIELDS = {"char_id", "time", "action", "tile", "facing", "on_failure", "mode"}
 DEFAULT_OPTIONS = {"spawn_timing": "fast", "enemy_attack_timing": "float", "seed": 0,
-                   "enemy_muzzle": False, "enemy_turning": False, "optional_runes": []}
+                   "enemy_muzzle": False, "enemy_turning": False, "optional_runes": [], "battle_buffs": []}
 
 # Prefer carried squad bonuses for new members; saved builds remain explicit.
 CARRIED_MODULE_DEFAULTS = {
@@ -40,6 +41,7 @@ class EditorData:
         self.module_index = D.load_module_index()
         self.favor = D.load_favor_table()
         self.stages = D.load_stages()
+        self.vecbreak_data = D.load_vecbreak_data()
 
     def catalog(self) -> dict:
         stages = []
@@ -48,15 +50,16 @@ class EditorData:
                 stages.append({"id": key, "code": value.get("code") or key,
                                "name": value.get("name") or key, "difficulty": value.get("difficulty")})
         operators = [{"id": k, "name": v.get("name", k), "position": v.get("position"),
-                      "buildablePosition": deployment_position(v),
+                      "buildablePosition": deployment_position(v, k),
                       "profession": v.get("profession"), "rarity": v.get("rarity")}
                      for k, v in self.characters.items() if k.startswith("char_")]
         return {"stages": stages, "operators": operators}
 
-    def stage(self, key: str, optional_runes: list[str] | None = None) -> dict:
+    def stage(self, key: str, optional_runes: list[str] | None = None, battle_buffs: list[str] | None = None) -> dict:
         from tools.simulate import export_map
         filename = resolve_level_file(self.stages, key)
         level = select_stage_runes(self.stages, key, D.load_level(filename), optional_runes)
+        level = select_supplies(level, key, battle_buffs, self.vecbreak_data)
         grid = export_map(level)
         for r, c in forbidden_locations(level):
             if 0 <= r < grid["height"] and 0 <= c < grid["width"]:
@@ -64,7 +67,11 @@ class EditorData:
         meta = self.stages["stages"][key]
         groups = [[{"id": rid, "description": self.stages["sixStarRuneData"][rid]["runeDesc"]}
                    for rid in meta.get(field) or []] for field in ("advancedRuneIdList1", "advancedRuneIdList2")]
-        return {"id": key, "map": grid, "options": level.get("options", {}), "runeGroups": groups}
+        cards = [{"build": build, "detail": {"id": cid, "name": self.characters[cid]["name"],
+                  "position": "ALL", "buildablePosition": "ALL", "skills": [], "modules": [], "tokens": []}}
+                 for cid, build in predefined_builds(level).items()]
+        return {"id": key, "map": grid, "options": level.get("options", {}), "runeGroups": groups,
+                "battleBuffs": supply_catalog(key, self.vecbreak_data), "predefinedCards": cards}
 
     def operator(self, key: str) -> dict:
         char = self.characters.get(key)
@@ -105,7 +112,7 @@ class EditorData:
                             "unlock": {"phase": meta.get("unlockEvolvePhase", 0),
                                        "level": meta.get("unlockLevel", 1)}, "trust": trust})
         return {"id": key, "name": char.get("name", key), "position": char.get("position"),
-                "buildablePosition": deployment_position(char),
+                "buildablePosition": deployment_position(char, key),
                 "maxLevels": [p.get("maxLevel", 1) for p in char.get("phases", [])],
                 "maxPotential": char.get("maxPotentialLevel", 0), "skills": skills, "modules": modules,
                 "defaultModuleId": CARRIED_MODULE_DEFAULTS.get(key),
@@ -163,7 +170,8 @@ class EditorData:
             raise ValueError("挂点和转身开关须为布尔值")
         if not isinstance(options["optional_runes"], list) or any(not isinstance(key, str) for key in options["optional_runes"]):
             raise ValueError("关卡附加条件须为字符串数组")
-        stage = self.stage(stage_id, options["optional_runes"])
+        stage = self.stage(stage_id, options["optional_runes"], options["battle_buffs"])
+        builds.update({card["build"]["char_id"]: card["build"] for card in stage["predefinedCards"]})
         operations = project.get("operations")
         if not isinstance(operations, list) or len(operations) > 10000:
             raise ValueError("操作须为数组，最多10000条")
@@ -181,7 +189,7 @@ class EditorData:
                     grid = stage["map"]
                     if not (r < grid["height"] and c < grid["width"]):
                         raise ValueError("部署坐标超出地图")
-                    required = deployment_position(self.characters[key])
+                    required = deployment_position(self.characters[key], key)
                     if not deployment_tile_matches(required, grid["cells"][r][c]["build"]):
                         raise ValueError("此干员不能部署在所选格子")
                 elif item.action in ("SKILL", "SKILL_END", "SWITCH_MODE"):
@@ -215,7 +223,7 @@ class EditorData:
         builds, operations = {}, []
         for item in plans:
             fields = asdict(item)
-            if item.action == "DEPLOY" and item.char_id not in TOKEN_SKILLS:
+            if item.action == "DEPLOY" and item.char_id not in TOKEN_SKILLS and not item.char_id.startswith("trap_"):
                 config, _ = self.build({k: v for k, v in fields.items() if k in BUILD_FIELDS})
                 previous = builds.get(item.char_id)
                 if previous is not None and previous != config:
